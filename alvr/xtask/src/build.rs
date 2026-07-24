@@ -4,7 +4,7 @@ use std::{
     env,
     fmt::{self, Display, Formatter},
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     vec,
 };
 use xshell::{cmd, Shell};
@@ -69,6 +69,97 @@ pub fn build_server_lib(profile: Profile, root: Option<String>, reproducible: bo
 
     let out = build_dir.join("alvr_server_core.h");
     cmd!(sh, "cbindgen --output {out}").run().unwrap();
+}
+
+/// Build the standalone OpenXR runtime (no SteamVR) and assemble a package under
+/// `build/alvr_openxr_runtime_[platform]` with the runtime DLL + native deps.
+pub fn build_streamer_openxr(profile: Profile, gpl: bool, reproducible: bool) {
+    let sh = Shell::new().unwrap();
+
+    let mut flags = vec![];
+    match profile {
+        Profile::Distribution => {
+            flags.push("--profile");
+            flags.push("distribution");
+        }
+        Profile::Release => flags.push("--release"),
+        Profile::Debug => (),
+    }
+    if reproducible {
+        flags.push("--locked");
+    }
+    let gpl_flag = if gpl {
+        vec!["--features", "gpl"]
+    } else {
+        vec![]
+    };
+    let flags_ref = &flags;
+
+    let artifacts_dir = afs::target_dir().join(profile.to_string());
+    let build_dir = afs::build_dir().join("alvr_openxr_runtime_windows");
+    let bin_dir = build_dir.join("bin/win64");
+
+    sh.remove_path(&build_dir).ok();
+    sh.create_dir(&bin_dir).unwrap();
+
+    {
+        let _push_guard = sh.push_dir(afs::crate_dir("server_openxr"));
+        cmd!(sh, "cargo build {flags_ref...} {gpl_flag...}")
+            .run()
+            .unwrap();
+    }
+
+    sh.copy_file(
+        artifacts_dir.join(afs::dynlib_fname("alvr_server_openxr")),
+        &bin_dir,
+    )
+    .unwrap();
+
+    // Registration helper (self-elevating). Placed next to the DLL.
+    sh.copy_file(
+        artifacts_dir.join(afs::exec_fname("alvr_openxr_register")),
+        &bin_dir,
+    )
+    .unwrap();
+
+    // Persistent server_core host. Keeps headset connection alive when the
+    // OpenXR app (and therefore the runtime DLL process) exits.
+    sh.copy_file(
+        artifacts_dir.join(afs::exec_fname("alvr_openxr_host")),
+        &bin_dir,
+    )
+    .unwrap();
+
+    // Dashboard, placed next to the DLL so it shares session.json and can
+    // auto-run the registration helper on startup.
+    {
+        let _push_guard = sh.push_dir(afs::crate_dir("dashboard"));
+        cmd!(sh, "cargo build {flags_ref...}").run().unwrap();
+    }
+    sh.copy_file(
+        artifacts_dir.join(afs::exec_fname("alvr_dashboard")),
+        &bin_dir,
+    )
+    .unwrap();
+
+    // Native encoder deps (mirrors the streamer package layout).
+    if gpl {
+        for lib_path in sh
+            .read_dir(afs::deps_dir().join("windows/ffmpeg/bin"))
+            .unwrap()
+            .into_iter()
+            .filter(|path| path.extension().is_some_and(|e| e == "dll"))
+        {
+            sh.copy_file(lib_path, &bin_dir).unwrap();
+        }
+    }
+    // Intel VPL (Quick Sync) is optional and not part of the v20 encoder set
+    // (VideoEncoderVPL.cpp is absent, so the runtime never links libvpl). Only
+    // bundle the DLL when it was actually fetched; skip otherwise.
+    let libvpl_dll = afs::deps_dir().join("windows/libvpl/alvr_build/bin/libvpl.dll");
+    if libvpl_dll.exists() {
+        sh.copy_file(libvpl_dll, &bin_dir).unwrap();
+    }
 }
 
 pub fn build_streamer(
@@ -308,7 +399,7 @@ pub fn build_launcher(profile: Profile, reproducible: bool) {
 fn build_android_lib_impl(dir_name: &str, profile: Profile, link_stdcpp: bool, all_targets: bool) {
     let sh = Shell::new().unwrap();
 
-    let mut ndk_flags = vec!["--no-strip", "-p", "26", "-t", "arm64-v8a"];
+    let mut ndk_flags = vec!["--platform", "26", "-t", "arm64-v8a"];
 
     if all_targets {
         ndk_flags.extend(["-t", "armeabi-v7a", "-t", "x86_64", "-t", "x86"]);
@@ -349,6 +440,113 @@ pub fn build_android_client_core_lib(profile: Profile, link_stdcpp: bool, all_ta
 
 pub fn build_android_client_openxr_lib(profile: Profile, link_stdcpp: bool) {
     build_android_lib_impl("client_openxr", profile, link_stdcpp, false)
+}
+
+fn add_android_vendor_runtime(sh: &Shell, apk_path: &Path, profile: Profile, keystore_path: &Path) {
+    let sdk_lib_dir = afs::workspace_dir()
+        .join("build/temp_download/vr-sdks/QiyuNativeSDK-v1.0.0/QiyuNativeSDK/Lib");
+    if !sdk_lib_dir.exists() {
+        panic!("QiYu SDK not found at {}", sdk_lib_dir.display());
+    }
+
+    let variant = if matches!(profile, Profile::Debug) {
+        "debug"
+    } else {
+        "release"
+    };
+    let aar_names = ["sxrApi", "qiyivrsdkcore", "qiyuapi"];
+    let work_dir = afs::build_dir().join("alvr_client_android/qiyu_java");
+    sh.remove_path(&work_dir).ok();
+    sh.create_dir(&work_dir).unwrap();
+
+    let mut jars = Vec::new();
+    for name in aar_names {
+        let aar_path = sdk_lib_dir.join(format!("{name}-v8a-{variant}.aar"));
+        let extract_dir = work_dir.join(name);
+        sh.create_dir(&extract_dir).unwrap();
+        cmd!(sh, "tar -xf {aar_path} -C {extract_dir} classes.jar")
+            .run()
+            .unwrap();
+        jars.push(extract_dir.join("classes.jar"));
+    }
+
+    let hvr_bridge = afs::workspace_dir()
+        .join("build/temp_download/vr-sdks/HVRsdkDemo/openXRsdk/libs/hvrbridge.jar");
+    if !hvr_bridge.exists() {
+        panic!("Huawei VR bridge not found at {}", hvr_bridge.display());
+    }
+    jars.push(hvr_bridge);
+
+    let core_aar = sdk_lib_dir.join(format!("qiyivrsdkcore-v8a-{variant}.aar"));
+    let asset_extract_dir = work_dir.join("asset_extract");
+    sh.create_dir(&asset_extract_dir).unwrap();
+    cmd!(
+        sh,
+        "tar -xf {core_aar} -C {asset_extract_dir} assets/qiyu_recenter.png"
+    )
+    .run()
+    .unwrap();
+
+    let android_home = PathBuf::from(env::var("ANDROID_HOME").expect("ANDROID_HOME not set"));
+    let build_tools_dir = android_home.join("build-tools/32.0.0");
+    let java = PathBuf::from(env::var("JAVA_HOME").expect("JAVA_HOME not set"))
+        .join("bin")
+        .join(afs::exec_fname("java"));
+    let d8_jar = build_tools_dir.join("lib/d8.jar");
+    let aapt = build_tools_dir.join(afs::exec_fname("aapt"));
+    let zipalign = build_tools_dir.join(afs::exec_fname("zipalign"));
+    let apksigner = build_tools_dir.join(if cfg!(windows) {
+        "apksigner.bat"
+    } else {
+        "apksigner"
+    });
+    let android_jar = android_home.join("platforms/android-32/android.jar");
+    let dex_dir = work_dir.join("dex");
+    sh.create_dir(&dex_dir).unwrap();
+    let jars_ref = &jars;
+    cmd!(
+        sh,
+        "{java} -cp {d8_jar} com.android.tools.r8.D8 --min-api 26 --lib {android_jar} --output {dex_dir} {jars_ref...}"
+    )
+    .run()
+    .unwrap();
+
+    let package_dir = work_dir.join("package");
+    let assets_dir = package_dir.join("assets");
+    sh.create_dir(&assets_dir).unwrap();
+    sh.copy_file(dex_dir.join("classes.dex"), package_dir.join("classes.dex"))
+        .unwrap();
+    sh.copy_file(
+        asset_extract_dir.join("assets/qiyu_recenter.png"),
+        assets_dir.join("qiyu_recenter.png"),
+    )
+    .unwrap();
+
+    {
+        let _push_guard = sh.push_dir(&package_dir);
+        cmd!(
+            sh,
+            "{aapt} remove {apk_path} classes.dex assets/qiyu_recenter.png"
+        )
+        .run()
+        .ok();
+        cmd!(
+            sh,
+            "{aapt} add {apk_path} classes.dex assets/qiyu_recenter.png"
+        )
+        .run()
+        .unwrap();
+    }
+
+    let aligned_apk = work_dir.join("alvr_client_qiyu_aligned.apk");
+    let signed_apk = work_dir.join("alvr_client_qiyu_signed.apk");
+    cmd!(sh, "{zipalign} -f 4 {apk_path} {aligned_apk}")
+        .run()
+        .unwrap();
+    cmd!(sh, "{apksigner} sign --ks {keystore_path} --ks-pass pass:alvrclient --out {signed_apk} {aligned_apk}")
+        .run()
+        .unwrap();
+    fs::copy(signed_apk, apk_path).unwrap();
 }
 
 pub fn build_android_client(profile: Profile) {
@@ -418,11 +616,13 @@ pub fn build_android_client(profile: Profile) {
     .run()
     .unwrap();
 
-    sh.copy_file(
-        afs::target_dir()
-            .join(profile.to_string())
-            .join("apk/alvr_client_openxr.apk"),
-        build_dir.join(format!("{ARTIFACT_NAME}.apk")),
-    )
-    .unwrap();
+    let apk_path = afs::target_dir()
+        .join(profile.to_string())
+        .join("apk/alvr_client_openxr.apk");
+    if !matches!(profile, Profile::Debug) {
+        add_android_vendor_runtime(&sh, &apk_path, profile, &build_dir.join("debug.keystore"));
+    }
+
+    sh.copy_file(apk_path, build_dir.join(format!("{ARTIFACT_NAME}.apk")))
+        .unwrap();
 }

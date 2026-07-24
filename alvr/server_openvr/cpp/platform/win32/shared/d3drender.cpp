@@ -230,6 +230,25 @@ ID3D11Texture2D *CD3DRender::GetSharedTexture( HANDLE hSharedTexture )
 	}
 
 	ID3D11Texture2D *pTexture;
+	// Vulkan-backed swapchains share their D3D11 textures with NT handles
+	// (CreateSharedHandle), which must be opened with OpenSharedResource1 on an
+	// ID3D11Device1. Try that first; fall back to the legacy KMT path
+	// (OpenSharedResource) used by the D3D11 / OpenGL swapchains.
+	ID3D11Device1 *pDevice1 = nullptr;
+	if ( SUCCEEDED( m_pD3D11Device->QueryInterface(
+		__uuidof( ID3D11Device1 ), ( void ** )&pDevice1 ) ) )
+	{
+		HRESULT hr = pDevice1->OpenSharedResource1(
+			hSharedTexture, __uuidof( ID3D11Texture2D ), ( void ** )&pTexture );
+		pDevice1->Release();
+		if ( SUCCEEDED( hr ) )
+		{
+			SharedTextureEntry_t entry { hSharedTexture, pTexture };
+			m_SharedTextureCache.push_back( entry );
+			return pTexture;
+		}
+	}
+
 	if ( SUCCEEDED( m_pD3D11Device->OpenSharedResource(
 		hSharedTexture, __uuidof( ID3D11Texture2D ), ( void ** )&pTexture ) ) )
 	{

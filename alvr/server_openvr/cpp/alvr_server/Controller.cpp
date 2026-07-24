@@ -10,10 +10,10 @@
 
 Controller::Controller(uint64_t deviceID, vr::EVRSkeletalTrackingLevel skeletonLevel)
     : TrackedDevice(
-          deviceID,
-          Settings::Instance().m_controllerIsTracker ? vr::TrackedDeviceClass_GenericTracker
-                                                     : vr::TrackedDeviceClass_Controller
-      )
+        deviceID,
+        Settings::Instance().m_controllerIsTracker ? vr::TrackedDeviceClass_GenericTracker
+                                                   : vr::TrackedDeviceClass_Controller
+    )
     , m_skeletonLevel(skeletonLevel) {
     Debug("Controller::constructor deviceID=%llu", deviceID);
 }

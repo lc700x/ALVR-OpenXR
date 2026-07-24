@@ -52,6 +52,10 @@ pub struct StreamRenderer {
     staging_renderer: StagingRenderer,
     pipeline: RenderPipeline,
     views_objects: [ViewObjects; 2],
+    // Retained so the Huawei deferred path can rebuild render targets once the runtime supplies
+    // valid (non-zero) GL swapchain handles in-frame.
+    target_view_resolution: UVec2,
+    target_format: wgpu::TextureFormat,
 }
 
 impl StreamRenderer {
@@ -185,6 +189,16 @@ impl StreamRenderer {
 
         let mut view_objects = vec![];
         let mut staging_textures_gl = vec![];
+
+        // Some legacy runtimes (Huawei) return zero GL swapchain texture handles from
+        // xrEnumerateSwapchainImages until the images have been acquired/waited inside an active
+        // frame. Wrapping a zero handle into a wgpu texture panics (NonZeroU32). If any handle is
+        // zero, defer render-target creation; the client re-supplies valid handles in-frame via
+        // set_swapchain_textures().
+        let all_handles_valid = swapchain_textures
+            .iter()
+            .all(|view| !view.is_empty() && view.iter().all(|&h| h != 0));
+
         for target_swapchain in &swapchain_textures {
             let staging_texture = super::create_texture(device, staging_resolution, target_format);
 
@@ -214,12 +228,16 @@ impl StreamRenderer {
                 ],
             });
 
-            let render_target = super::create_gl_swapchain(
-                device,
-                target_swapchain,
-                target_view_resolution,
-                target_format,
-            );
+            let render_target = if all_handles_valid {
+                super::create_gl_swapchain(
+                    device,
+                    target_swapchain,
+                    target_view_resolution,
+                    target_format,
+                )
+            } else {
+                Vec::new()
+            };
 
             view_objects.push(ViewObjects {
                 bind_group,
@@ -240,7 +258,36 @@ impl StreamRenderer {
             staging_renderer,
             pipeline,
             views_objects: view_objects.try_into().unwrap(),
+            target_view_resolution,
+            target_format,
         }
+    }
+
+    /// Whether the swapchain render targets have been created. When false (Huawei deferred path),
+    /// the caller must supply valid swapchain texture handles via `set_swapchain_textures` before
+    /// rendering.
+    pub fn render_targets_ready(&self) -> bool {
+        self.views_objects
+            .iter()
+            .all(|view| !view.render_target.is_empty())
+    }
+
+    /// (Re)builds the wgpu render targets from freshly enumerated swapchain texture handles. Used
+    /// by the Huawei deferred path once the runtime has populated valid (non-zero) GL handles.
+    pub fn set_swapchain_textures(&mut self, swapchain_textures: [Vec<u32>; 2]) {
+        let device = &self.context.device;
+        for (view, textures) in self.views_objects.iter_mut().zip(swapchain_textures.iter()) {
+            view.render_target = super::create_gl_swapchain(
+                device,
+                textures,
+                self.target_view_resolution,
+                self.target_format,
+            );
+        }
+    }
+
+    pub fn finish(&self) {
+        self.context.finish();
     }
 
     /// # Safety
@@ -251,6 +298,12 @@ impl StreamRenderer {
         view_params: [StreamViewParams; 2],
         passthrough: Option<&PassthroughMode>,
     ) {
+        // Deferred-render-target path (Huawei): skip until valid swapchain handles have been
+        // supplied via set_swapchain_textures. Rendering with no targets would index an empty Vec.
+        if !self.render_targets_ready() {
+            return;
+        }
+
         // if hardware_buffer is available copy stream to staging texture
         if !hardware_buffer.is_null() {
             self.staging_renderer.render(hardware_buffer);

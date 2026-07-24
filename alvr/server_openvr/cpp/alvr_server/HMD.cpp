@@ -33,10 +33,10 @@ vr::HmdRect2_t fov_to_projection(FfiFov fov) {
 
 Hmd::Hmd()
     : TrackedDevice(
-          HEAD_ID,
-          Settings::Instance().m_TrackingRefOnly ? vr::TrackedDeviceClass_TrackingReference
-                                                 : vr::TrackedDeviceClass_HMD
-      )
+        HEAD_ID,
+        Settings::Instance().m_TrackingRefOnly ? vr::TrackedDeviceClass_TrackingReference
+                                               : vr::TrackedDeviceClass_HMD
+    )
     , m_baseComponentsInitialized(false)
     , m_streamComponentsInitialized(false) {
     Debug("Hmd::constructor");

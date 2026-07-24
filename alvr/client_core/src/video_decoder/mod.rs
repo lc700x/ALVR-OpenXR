@@ -3,7 +3,41 @@ mod android;
 
 use alvr_common::anyhow::Result;
 use alvr_session::{CodecType, MediacodecProperty};
+#[cfg(any(target_os = "android", test))]
+use alvr_system_info::Platform;
 use std::time::Duration;
+
+#[cfg(any(target_os = "android", test))]
+const DEFAULT_DECODER_MAX_IMAGES: i32 = 10;
+#[cfg(any(target_os = "android", test))]
+const HVR_DECODER_MAX_IMAGES: i32 = 3;
+
+#[cfg(any(target_os = "android", test))]
+fn decoder_max_images_for_platform(platform: Platform) -> i32 {
+    if platform == Platform::Hvr {
+        HVR_DECODER_MAX_IMAGES
+    } else {
+        DEFAULT_DECODER_MAX_IMAGES
+    }
+}
+
+#[cfg(target_os = "android")]
+fn decoder_max_images() -> i32 {
+    decoder_max_images_for_platform(alvr_system_info::platform())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hvr_uses_triple_buffered_decoder_surface() {
+        assert_eq!(decoder_max_images_for_platform(Platform::Hvr), 3);
+        assert_eq!(decoder_max_images_for_platform(Platform::Quest2), 10);
+        assert_eq!(decoder_max_images_for_platform(Platform::Pico4), 10);
+        assert_eq!(decoder_max_images_for_platform(Platform::Qiyu), 10);
+    }
+}
 
 #[derive(Clone, Default, PartialEq)]
 pub struct VideoDecoderConfig {

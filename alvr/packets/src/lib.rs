@@ -22,6 +22,7 @@ pub const HAPTICS: u16 = 1;
 pub const AUDIO: u16 = 2;
 pub const VIDEO: u16 = 3;
 pub const STATISTICS: u16 = 4;
+pub const ALPHA_MASK: u16 = 5;
 
 // todo: use simple string
 #[derive(Serialize, Deserialize, Clone)]
@@ -285,6 +286,17 @@ pub struct FaceData {
 pub struct VideoPacketHeader {
     pub timestamp: Duration,
     pub is_idr: bool,
+}
+
+// Passthrough alpha side-channel: a low-resolution grayscale coverage mask
+// paired to a video frame by timestamp. Payload is raw single-channel bytes,
+// row-major, `width` * `height` in length. Kept small (quarter-res) so it can
+// ride alongside the existing single video encoder without a second NVENC.
+#[derive(Serialize, Deserialize)]
+pub struct AlphaMaskHeader {
+    pub timestamp: Duration,
+    pub width: u16,
+    pub height: u16,
 }
 
 // Note: face_data does not respect target_timestamp.

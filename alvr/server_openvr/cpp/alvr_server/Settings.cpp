@@ -14,6 +14,15 @@ using namespace std;
 
 extern uint64_t g_DriverTestMode;
 
+template <typename T>
+static void ensureConfigValue(picojson::object& config, const char* key, T fallback) {
+    const auto it = config.find(key);
+    if (it == config.end() || !it->second.is<T>()) {
+        Error("session openvr_config missing/wrong type: %s; using default\n", key);
+        config[key] = picojson::value(fallback);
+    }
+}
+
 Settings Settings::m_Instance;
 
 Settings::Settings()
@@ -36,7 +45,115 @@ void Settings::Load() {
             return;
         }
 
+        // The OpenXR runtime resolves the session.json path from the install dir,
+        // which can be empty/invalid before ALVR is registered. In that case the
+        // file is missing and `json` is empty, so `v` is a null value. Calling
+        // `.get(key)` on a non-object picojson value dereferences an absent
+        // object and raises an access violation that propagates into the host.
+        // Guard both the root and the openvr_config node before reading fields;
+        // if either is not an object, keep the defaults and return.
+        if (!v.is<picojson::object>()) {
+            Error("session config (%s) is not a JSON object; using defaults\n", g_sessionPath);
+            return;
+        }
+
         auto config = v.get("openvr_config");
+        if (!config.is<picojson::object>()) {
+            Error("session config (%s) missing openvr_config; using defaults\n", g_sessionPath);
+            return;
+        }
+
+        // picojson's `value::get(key).get<T>()` assumes both the key and type
+        // exist. In release builds a missing/wrong-typed field can become an
+        // access violation instead of a C++ exception. Supply typed defaults
+        // before assigning members. Valid fields still load even when an older
+        // session file lacks one optional encoder setting.
+        auto& object = config.get<picojson::object>();
+        const char* integerKeys[] = {
+            "refresh_rate",
+            "eye_resolution_width",
+            "eye_resolution_height",
+            "target_eye_resolution_width",
+            "target_eye_resolution_height",
+            "adapter_index",
+            "codec",
+            "h264_profile",
+            "rate_control_mode",
+            "entropy_coding",
+            "amf_preproc_sigma",
+            "amf_preproc_tor",
+            "encoder_quality_preset",
+            "nvenc_quality_preset",
+            "sw_thread_count",
+            "nvenc_tuning_preset",
+            "nvenc_multi_pass",
+            "nvenc_adaptive_quantization_mode",
+            "nvenc_low_delay_key_frame_scale",
+            "nvenc_refresh_rate",
+            "intra_refresh_period",
+            "intra_refresh_count",
+            "max_num_ref_frames",
+            "gop_length",
+            "p_frame_strategy",
+            "nvenc_rate_control_mode",
+            "rc_buffer_size",
+            "rc_initial_delay",
+            "rc_max_bitrate",
+            "rc_average_bitrate",
+            "minimum_idr_interval_ms",
+        };
+        const char* numberKeys[] = {
+            "foveation_center_size_x",
+            "foveation_center_size_y",
+            "foveation_center_shift_x",
+            "foveation_center_shift_y",
+            "foveation_edge_ratio_x",
+            "foveation_edge_ratio_y",
+            "brightness",
+            "contrast",
+            "saturation",
+            "gamma",
+            "sharpening",
+            "encoding_gamma",
+        };
+        const char* booleanKeys[] = {
+            "enable_foveated_encoding",
+            "enable_color_correction",
+            "filler_data",
+            "use_10bit_encoder",
+            "use_full_range_encoding",
+            "enable_hdr",
+            "force_hdr_srgb_correction",
+            "clamp_hdr_extended_range",
+            "enable_amf_pre_analysis",
+            "enable_vbaq",
+            "enable_amf_hmqb",
+            "use_amf_preproc",
+            "amd_bitrate_corruption_fix",
+            "force_sw_encoding",
+            "enable_intra_refresh",
+            "nvenc_enable_weighted_prediction",
+            "enable_vive_tracker_proxy",
+            "tracking_ref_only",
+            "linux_async_compute",
+            "linux_async_reprojection",
+            "controllers_enabled",
+            "controller_is_tracker",
+            "body_tracking_vive_enabled",
+            "body_tracking_has_legs",
+            "use_separate_hand_trackers",
+        };
+
+        for (const auto key : integerKeys) {
+            ensureConfigValue<int64_t>(object, key, 0);
+        }
+        for (const auto key : numberKeys) {
+            ensureConfigValue<double>(object, key, 0.0);
+        }
+        for (const auto key : booleanKeys) {
+            ensureConfigValue<bool>(object, key, false);
+        }
+        ensureConfigValue<std::string>(object, "capture_frame_dir", "");
 
         m_refreshRate = (int)config.get("refresh_rate").get<int64_t>();
         m_renderWidth = config.get("eye_resolution_width").get<int64_t>() * 2;

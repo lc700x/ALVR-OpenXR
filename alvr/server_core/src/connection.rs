@@ -807,9 +807,18 @@ fn connection_pipeline(
     if session_manager_lock.session().openvr_config != new_openvr_config {
         session_manager_lock.session_mut().openvr_config = new_openvr_config;
 
-        control_sender.send(&ServerControlPacket::Restarting).ok();
+        // ALVR-OpenXR: in the driverless standalone OpenXR runtime there is no
+        // SteamVR driver process to restart. The updated openvr_config is now
+        // persisted to session.json; the runtime reloads settings fresh when it
+        // starts the encoder on ClientConnected, so the correct resolution is
+        // applied in-place. Requesting a driver restart here would abort the
+        // just-established connection and destabilize the reconnect. Only do the
+        // legacy restart dance when an actual driver/dashboard is present.
+        if crate::is_openvr_driver_present() {
+            control_sender.send(&ServerControlPacket::Restarting).ok();
 
-        crate::notify_restart_driver();
+            crate::notify_restart_driver();
+        }
     }
 
     dbg_connection!("connection_pipeline: Send StartStream packet");
@@ -843,6 +852,10 @@ fn connection_pipeline(
     };
 
     dbg_connection!("connection_pipeline: StreamSocket connect_to_client");
+    info!(
+        "[alvr-diag] connecting stream socket to {client_ip} port {}",
+        initial_settings.connection.stream_port
+    );
     let mut stream_socket = StreamSocketBuilder::connect_to_client(
         HANDSHAKE_ACTION_TIMEOUT,
         client_ip,
@@ -853,6 +866,7 @@ fn connection_pipeline(
         initial_settings.connection.server_recv_buffer_bytes,
         initial_settings.connection.packet_size as _,
     )?;
+    info!("[alvr-diag] stream socket connected");
 
     let mut video_sender = stream_socket.request_stream(VIDEO);
     let game_audio_sender: alvr_sockets::StreamSender<()> = stream_socket.request_stream(AUDIO);
@@ -1172,27 +1186,31 @@ fn connection_pipeline(
 
                 match packet {
                     ClientControlPacket::PlayspaceSync(packet) => {
-                        if !initial_settings.headset.tracking_ref_only {
+                        if !initial_settings.headset.tracking_ref_only
+                            && crate::is_openvr_driver_present()
+                        {
                             let session_manager_lock = SESSION_MANAGER.read();
                             let config = &session_manager_lock.settings().headset;
                             ctx.tracking_manager.write().recenter(
                                 config.position_recentering_mode,
                                 config.rotation_recentering_mode,
                             );
+                        }
 
-                            let area = packet.unwrap_or(Vec2::new(2.0, 2.0));
-                            let wh = area.x * area.y;
-                            if wh.is_finite() && wh > 0.0 {
-                                info!("Received new playspace with size: {}", area);
-                                ctx.events_sender
-                                    .send(ServerCoreEvent::PlayspaceSync(area))
-                                    .ok();
-                            } else {
-                                warn!("Received invalid playspace size: {}", area);
-                                ctx.events_sender
-                                    .send(ServerCoreEvent::PlayspaceSync(Vec2::new(2.0, 2.0)))
-                                    .ok();
-                            }
+                        // Driverless OpenXR must still receive the recenter event;
+                        // only the SteamVR tracking-space rewrite above is skipped.
+                        let area = packet.unwrap_or(Vec2::new(2.0, 2.0));
+                        let wh = area.x * area.y;
+                        if wh.is_finite() && wh > 0.0 {
+                            info!("Received new playspace with size: {}", area);
+                            ctx.events_sender
+                                .send(ServerCoreEvent::PlayspaceSync(area))
+                                .ok();
+                        } else {
+                            warn!("Received invalid playspace size: {}", area);
+                            ctx.events_sender
+                                .send(ServerCoreEvent::PlayspaceSync(Vec2::new(2.0, 2.0)))
+                                .ok();
                         }
                     }
                     ClientControlPacket::RequestIdr => {
@@ -1414,6 +1432,7 @@ fn connection_pipeline(
         ClientListAction::SetConnectionState(ConnectionState::Streaming),
     );
 
+    info!("[alvr-diag] emitting ClientConnected -> encoder should start");
     ctx.events_sender
         .send(ServerCoreEvent::ClientConnected)
         .ok();

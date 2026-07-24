@@ -13,7 +13,7 @@
     ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
 #define DRM_FORMAT_ARGB8888 fourcc_code('A', 'R', '2', '4')
 #define DRM_FORMAT_ABGR8888 fourcc_code('A', 'B', '2', '4')
-#define fourcc_mod_code(vendor, val) ((((uint64_t)vendor) << 56) | ((val) & 0x00ffffffffffffffULL))
+#define fourcc_mod_code(vendor, val) ((((uint64_t)vendor) << 56) | ((val)&0x00ffffffffffffffULL))
 #define DRM_FORMAT_MOD_INVALID fourcc_mod_code(0, ((1ULL << 56) - 1))
 #define DRM_FORMAT_MOD_LINEAR fourcc_mod_code(0, 0)
 #define DRM_FORMAT_MOD_VENDOR_AMD 0x02

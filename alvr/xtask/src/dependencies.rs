@@ -74,6 +74,26 @@ pub fn prepare_ffmpeg_windows(deps_path: &Path) {
     .unwrap();
 }
 
+/// Vendor the Khronos Vulkan-Headers into `deps/windows/vulkan-headers` so the
+/// server_openxr encoder C++ (which includes `<vulkan/vulkan.h>` transitively
+/// via protocol.h / VulkanAMF.h) compiles without a full Vulkan SDK install.
+pub fn prepare_vulkan_headers_windows(deps_path: &Path) {
+    const VERSION: &str = "1.3.280";
+    let extracted = deps_path.join(format!("Vulkan-Headers-{VERSION}"));
+    let destination = deps_path.join("vulkan-headers");
+
+    command::download_and_extract_zip(
+        &format!(
+            "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v{VERSION}.zip"
+        ),
+        deps_path,
+    )
+    .unwrap();
+
+    fs::remove_dir_all(&destination).ok();
+    fs::rename(extracted, destination).unwrap();
+}
+
 pub fn prepare_windows_deps(skip_admin_priv: bool) {
     let sh = Shell::new().unwrap();
 
@@ -91,6 +111,7 @@ pub fn prepare_windows_deps(skip_admin_priv: bool) {
 
     prepare_x264_windows(&deps_path);
     prepare_ffmpeg_windows(&deps_path);
+    prepare_vulkan_headers_windows(&deps_path);
 }
 
 pub fn prepare_linux_deps(enable_nvenc: bool) {

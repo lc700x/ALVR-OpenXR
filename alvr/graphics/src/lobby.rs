@@ -224,6 +224,7 @@ pub struct LobbyViewParams {
 
 pub struct LobbyRenderer {
     context: Rc<GraphicsContext>,
+    view_resolution: UVec2,
     quad_pipeline: RenderPipeline,
     line_pipeline: RenderPipeline,
     hud_texture: Texture,
@@ -306,13 +307,37 @@ impl LobbyRenderer {
             ],
         });
 
-        let render_targets = [
-            super::create_gl_swapchain(device, &swapchain_textures[0], view_resolution, SDR_FORMAT),
-            super::create_gl_swapchain(device, &swapchain_textures[1], view_resolution, SDR_FORMAT),
-        ];
+        // Some legacy runtimes (Huawei) return zero GL swapchain texture handles from
+        // xrEnumerateSwapchainImages until the images have been acquired/waited inside an active
+        // frame. Wrapping a zero handle into a wgpu texture panics (NonZeroU32). If any handle is
+        // zero, defer render-target creation; the client re-supplies valid handles in-frame via
+        // set_swapchain_textures().
+        let all_handles_valid = swapchain_textures
+            .iter()
+            .all(|view| !view.is_empty() && view.iter().all(|&h| h != 0));
+
+        let render_targets = if all_handles_valid {
+            [
+                super::create_gl_swapchain(
+                    device,
+                    &swapchain_textures[0],
+                    view_resolution,
+                    SDR_FORMAT,
+                ),
+                super::create_gl_swapchain(
+                    device,
+                    &swapchain_textures[1],
+                    view_resolution,
+                    SDR_FORMAT,
+                ),
+            ]
+        } else {
+            [Vec::new(), Vec::new()]
+        };
 
         let this = Self {
             context,
+            view_resolution,
             quad_pipeline,
             line_pipeline,
             hud_texture,
@@ -325,7 +350,57 @@ impl LobbyRenderer {
         this
     }
 
-    pub fn update_hud_message(&self, message: &str) {
+    /// Whether the swapchain render targets have been created. When false (Huawei deferred path),
+    /// the caller must supply valid swapchain texture handles via `set_swapchain_textures` before
+    /// rendering.
+    pub fn render_targets_ready(&self) -> bool {
+        !self.render_targets[0].is_empty() && !self.render_targets[1].is_empty()
+    }
+
+    /// (Re)builds the wgpu render targets from freshly enumerated swapchain texture handles. Used
+    /// by the Huawei deferred path once the runtime has populated valid (non-zero) GL handles.
+    pub fn set_swapchain_textures(&mut self, swapchain_textures: [Vec<u32>; 2]) {
+        for (eye, textures) in swapchain_textures.iter().enumerate() {
+            if let Some(&texture) = textures.first() {
+                match self.context.gl_texture_status(texture) {
+                    Ok((is_texture, status)) => alvr_common::info!(
+                        "[HVR-DIAG] eye {eye} GL texture {texture}: is_texture={is_texture}, \
+                         framebuffer_status={status:#x}"
+                    ),
+                    Err(error) => alvr_common::warn!(
+                        "[HVR-DIAG] eye {eye} GL texture {texture} validation failed: {error}"
+                    ),
+                }
+            }
+        }
+
+        let device = &self.context.device;
+        self.render_targets = [
+            super::create_gl_swapchain(
+                device,
+                &swapchain_textures[0],
+                self.view_resolution,
+                SDR_FORMAT,
+            ),
+            super::create_gl_swapchain(
+                device,
+                &swapchain_textures[1],
+                self.view_resolution,
+                SDR_FORMAT,
+            ),
+        ];
+    }
+
+    pub fn finish(&self) {
+        self.context.finish();
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn ensure_hvr_current(&self) -> Result<bool, String> {
+        self.context.ensure_hvr_current()
+    }
+
+    fn update_hud_message_inner(&self, message: &str, translucent_background: bool) {
         let ubuntu_font =
             FontRef::try_from_slice(include_bytes!("../resources/Ubuntu-Medium.ttf")).unwrap();
 
@@ -351,6 +426,11 @@ impl LobbyRenderer {
         let scaled_font = ubuntu_font.as_scaled(FONT_SIZE);
 
         let mut buffer = vec![0; HUD_TEXTURE_SIDE * HUD_TEXTURE_SIDE * 4];
+        if translucent_background {
+            for pixel in buffer.chunks_exact_mut(4) {
+                pixel[3] = 128;
+            }
+        }
 
         for section_glyph in section_glyphs {
             if let Some(outlined) = scaled_font.outline_glyph(section_glyph.glyph) {
@@ -371,6 +451,7 @@ impl LobbyRenderer {
                         buffer[coord] = value;
                         buffer[coord + 1] = value;
                         buffer[coord + 2] = value;
+                        buffer[coord + 3] = u8::max(buffer[coord + 3], value);
 
                         // Render opacity with border
                         for offset in &FAST_BORDER_OFFSETS {
@@ -405,6 +486,14 @@ impl LobbyRenderer {
         );
     }
 
+    pub fn update_hud_message(&self, message: &str) {
+        self.update_hud_message_inner(message, false);
+    }
+
+    pub fn update_hud_message_hvr(&self, message: &str) {
+        self.update_hud_message_inner(message, true);
+    }
+
     #[expect(clippy::too_many_arguments)]
     pub fn render(
         &self,
@@ -416,6 +505,13 @@ impl LobbyRenderer {
         render_background: bool,
         show_velocities: bool,
     ) {
+        // Deferred-render-target path (Huawei): skip drawing until valid swapchain handles have
+        // been supplied via set_swapchain_textures. Rendering with no targets would index an empty
+        // vec and panic.
+        if !self.render_targets_ready() {
+            return;
+        }
+
         let mut encoder = self
             .context
             .device

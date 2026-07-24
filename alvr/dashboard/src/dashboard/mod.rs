@@ -233,17 +233,9 @@ impl eframe::App for Dashboard {
                         |ui| {
                             ui.add_space(5.0);
 
-                            if connected_to_server {
-                                if ui.button("Restart SteamVR").clicked() {
-                                    self.restart_steamvr(&mut requests);
-                                }
-                            } else if ui.button("Launch SteamVR").clicked() {
-                                crate::steamvr_launcher::LAUNCHER.lock().launch_steamvr();
-                            }
-
                             ui.horizontal(|ui| {
                                 ui.add_space(5.0);
-                                ui.label(RichText::new("SteamVR:").size(13.0));
+                                ui.label(RichText::new("Streamer:").size(13.0));
                                 ui.add_space(-10.0);
                                 if connected_to_server {
                                     ui.label(

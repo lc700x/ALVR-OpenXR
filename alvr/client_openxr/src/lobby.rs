@@ -32,7 +32,9 @@ impl Lobby {
         view_resolution: UVec2,
         initial_hud_message: &str,
     ) -> Self {
-        let reference_space_type = if xr_session.instance().exts().ext_local_floor.is_some() {
+        let reference_space_type = if platform == Platform::Hvr {
+            xr::ReferenceSpaceType::LOCAL
+        } else if xr_session.instance().exts().ext_local_floor.is_some() {
             xr::ReferenceSpaceType::LOCAL_FLOOR_EXT
         } else {
             // The Quest 1 doesn't support LOCAL_FLOOR_EXT, recentering is required for AppLab, but
@@ -40,11 +42,29 @@ impl Lobby {
             xr::ReferenceSpaceType::STAGE
         };
 
-        let reference_space = interaction::get_reference_space(&xr_session, reference_space_type);
+        let reference_space = if platform == Platform::Hvr {
+            interaction::get_hvr_floor_reference_space(&xr_session)
+        } else {
+            interaction::get_reference_space(&xr_session, reference_space_type)
+        };
 
         let swapchains = [
-            graphics::create_swapchain(&xr_session, &gfx_ctx, view_resolution, SDR_FORMAT_GL, None),
-            graphics::create_swapchain(&xr_session, &gfx_ctx, view_resolution, SDR_FORMAT_GL, None),
+            graphics::create_swapchain(
+                &xr_session,
+                &gfx_ctx,
+                view_resolution,
+                SDR_FORMAT_GL,
+                None,
+                platform,
+            ),
+            graphics::create_swapchain(
+                &xr_session,
+                &gfx_ctx,
+                view_resolution,
+                SDR_FORMAT_GL,
+                None,
+                platform,
+            ),
         ];
 
         let renderer = LobbyRenderer::new(
@@ -80,12 +100,19 @@ impl Lobby {
     }
 
     pub fn update_reference_space(&mut self) {
-        self.reference_space =
-            interaction::get_reference_space(&self.xr_session, self.reference_space_type);
+        self.reference_space = if self.platform == Platform::Hvr {
+            interaction::get_hvr_floor_reference_space(&self.xr_session)
+        } else {
+            interaction::get_reference_space(&self.xr_session, self.reference_space_type)
+        };
     }
 
     pub fn update_hud_message(&self, message: &str) {
-        self.renderer.update_hud_message(message);
+        if self.platform == Platform::Hvr {
+            self.renderer.update_hud_message_hvr(message);
+        } else {
+            self.renderer.update_hud_message(message);
+        }
     }
 
     pub fn render(&mut self, vsync_time: Duration) -> ProjectionLayerBuilder {
@@ -179,15 +206,90 @@ impl Lobby {
             }
         };
 
-        let left_swapchain_idx = self.swapchains[0].acquire_image().unwrap();
-        let right_swapchain_idx = self.swapchains[1].acquire_image().unwrap();
+        // Huawei's legacy runtime returns non-success codes from the swapchain image calls but
+        // still functions; its official demo ignores all these return codes. On HVR we tolerate
+        // errors (defaulting the image index to 0) instead of panicking. Other platforms keep the
+        // strict unwrap.
+        let is_hvr = self.platform == Platform::Hvr;
+        let acquire = |swapchain: &mut xr::Swapchain<xr::OpenGlEs>| -> u32 {
+            let result = if is_hvr {
+                graphics::hvr_acquire_image(swapchain)
+            } else {
+                swapchain.acquire_image()
+            };
+            match result {
+                Ok(idx) => idx,
+                Err(e) if is_hvr => {
+                    alvr_common::warn!("[HVR-DIAG] lobby acquire_image returned {e:?}; using 0");
+                    0
+                }
+                Err(e) => panic!("acquire_image failed: {e:?}"),
+            }
+        };
+        let left_swapchain_idx = acquire(&mut self.swapchains[0]);
+        let right_swapchain_idx = acquire(&mut self.swapchains[1]);
 
-        self.swapchains[0]
-            .wait_image(xr::Duration::INFINITE)
-            .unwrap();
-        self.swapchains[1]
-            .wait_image(xr::Duration::INFINITE)
-            .unwrap();
+        for swapchain in &mut self.swapchains {
+            let result = if is_hvr {
+                graphics::hvr_wait_image(swapchain)
+            } else {
+                swapchain.wait_image(xr::Duration::INFINITE)
+            };
+            if let Err(e) = result {
+                if is_hvr {
+                    alvr_common::warn!("[HVR-DIAG] lobby wait_image returned {e:?}; continuing");
+                } else {
+                    panic!("wait_image failed: {e:?}");
+                }
+            }
+        }
+
+        #[cfg(target_os = "android")]
+        if is_hvr && !self.renderer.render_targets_ready() {
+            match self.renderer.ensure_hvr_current() {
+                Ok(true) => alvr_common::info!(
+                    "[HVR-DIAG] restored Huawei EGL context after swapchain wait"
+                ),
+                Ok(false) => {}
+                Err(error) => alvr_common::warn!("[HVR-DIAG] {error}"),
+            }
+        }
+
+        // Huawei deferred swapchain path: the runtime only populates valid GL texture handles once
+        // the images have been acquired/waited inside an active frame. Now that the first
+        // acquire/wait has happened, re-enumerate and hand the (hopefully non-zero) handles to the
+        // renderer so it can build its wgpu render targets. Runs once. HVR only.
+        if self.platform == Platform::Hvr && !self.renderer.render_targets_ready() {
+            match (
+                self.swapchains[0].enumerate_images(),
+                self.swapchains[1].enumerate_images(),
+            ) {
+                (Ok(left_handles), Ok(right_handles)) => {
+                    alvr_common::info!(
+                        "[HVR-DIAG] lobby in-frame swapchain handles: left={left_handles:?}, \
+                         right={right_handles:?}"
+                    );
+                    if left_handles.iter().all(|&h| h != 0) && right_handles.iter().all(|&h| h != 0)
+                    {
+                        self.renderer
+                            .set_swapchain_textures([left_handles, right_handles]);
+                        alvr_common::info!(
+                            "[HVR-DIAG] lobby render targets built from in-frame handles"
+                        );
+                    } else {
+                        alvr_common::warn!(
+                            "[HVR-DIAG] in-frame swapchain handles still contain zeros; \
+                             lobby will not render this frame"
+                        );
+                    }
+                }
+                (left, right) => {
+                    alvr_common::warn!(
+                        "[HVR-DIAG] in-frame enumerate_images failed: left={left:?}, right={right:?}"
+                    );
+                }
+            }
+        }
 
         self.renderer.render(
             [
@@ -206,12 +308,30 @@ impl Lobby {
             additional_motions,
             body_skeleton,
             body_tracking_type,
-            false,
+            // Huawei VR Glass has no passthrough camera, so a transparent lobby renders as black.
+            // Draw the opaque background/ground on HVR so the HUD and environment are visible.
+            is_hvr,
             cfg!(debug_assertions),
         );
 
-        self.swapchains[0].release_image().unwrap();
-        self.swapchains[1].release_image().unwrap();
+        if is_hvr {
+            self.renderer.finish();
+        }
+
+        for swapchain in &mut self.swapchains {
+            let result = if is_hvr {
+                graphics::hvr_release_image(swapchain)
+            } else {
+                swapchain.release_image()
+            };
+            if let Err(e) = result {
+                if is_hvr {
+                    alvr_common::warn!("[HVR-DIAG] lobby release_image returned {e:?}; continuing");
+                } else {
+                    panic!("release_image failed: {e:?}");
+                }
+            }
+        }
 
         let rect = xr::Rect2Di {
             offset: xr::Offset2Di { x: 0, y: 0 },

@@ -22,6 +22,74 @@ use std::{collections::HashMap, time::Duration};
 use xr::SpaceLocationFlags;
 
 const IPD_CHANGE_EPS: f32 = 0.001;
+const HVR_CONTROLLER_PROFILE_PATH: &str = "/interaction_profiles/huawei/6dof_controller";
+
+fn hvr_binding_path(standard_path: &str) -> Option<String> {
+    if standard_path.ends_with("/thumbrest/touch") {
+        None
+    } else if standard_path == "/user/hand/right/input/system/click" {
+        Some("/user/hand/right/input/home/click".into())
+    } else {
+        Some(standard_path.replace("/squeeze/", "/grip/"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{adjust_hvr_thumbsticks, hvr_binding_path};
+
+    use alvr_common::{
+        LEFT_THUMBSTICK_X_ID, LEFT_THUMBSTICK_Y_ID, RIGHT_THUMBSTICK_X_ID, RIGHT_THUMBSTICK_Y_ID,
+    };
+    use alvr_packets::ButtonValue;
+    use std::collections::HashMap;
+
+    #[test]
+    fn hvr_bindings_match_official_profile() {
+        assert_eq!(
+            hvr_binding_path("/user/hand/left/input/squeeze/value").as_deref(),
+            Some("/user/hand/left/input/grip/value")
+        );
+        assert_eq!(
+            hvr_binding_path("/user/hand/right/input/system/click").as_deref(),
+            Some("/user/hand/right/input/home/click")
+        );
+        assert_eq!(
+            hvr_binding_path("/user/hand/left/input/trigger/value").as_deref(),
+            Some("/user/hand/left/input/trigger/value")
+        );
+        assert!(hvr_binding_path("/user/hand/left/input/thumbrest/touch").is_none());
+    }
+
+    #[test]
+    fn hvr_thumbsticks_match_wolvic() {
+        let mut values = HashMap::from([
+            (*LEFT_THUMBSTICK_X_ID, (ButtonValue::Scalar(0.10), false)),
+            (*LEFT_THUMBSTICK_Y_ID, (ButtonValue::Scalar(0.15), false)),
+            (*RIGHT_THUMBSTICK_X_ID, (ButtonValue::Scalar(0.20), false)),
+            (*RIGHT_THUMBSTICK_Y_ID, (ButtonValue::Scalar(0.10), false)),
+        ]);
+
+        adjust_hvr_thumbsticks(&mut values, true);
+
+        assert!(matches!(
+            values.get(&*LEFT_THUMBSTICK_X_ID),
+            Some((ButtonValue::Scalar(value), _)) if *value == 0.0
+        ));
+        assert!(matches!(
+            values.get(&*LEFT_THUMBSTICK_Y_ID),
+            Some((ButtonValue::Scalar(value), _)) if *value == 0.0
+        ));
+        assert!(matches!(
+            values.get(&*RIGHT_THUMBSTICK_X_ID),
+            Some((ButtonValue::Scalar(value), _)) if *value == 0.20
+        ));
+        assert!(matches!(
+            values.get(&*RIGHT_THUMBSTICK_Y_ID),
+            Some((ButtonValue::Scalar(value), _)) if *value == -0.10
+        ));
+    }
+}
 
 // Most OpenXR runtime, including Meta's one, do not follow perfectly the specification regarding
 // controller pose. The Z axis should point down through the center of the controller grip, the X
@@ -56,6 +124,12 @@ fn get_controller_offset(platform: Platform, is_right_hand: bool) -> Pose {
         p if p.is_vive() => Pose {
             position: Vec3::new(0.0, 0.0, -0.02),
             orientation: Quat::IDENTITY,
+        },
+        // HVR exposes only aim/pose. The grip action is bound to that pose;
+        // invert VDXR's grip→aim calibration to recover canonical grip.
+        Platform::Hvr => Pose {
+            position: Vec3::new(0.0, -0.03, 0.095),
+            orientation: Quat::from_rotation_x(60.0 * DEG_TO_RAD),
         },
         _ => Pose::default(),
     };
@@ -103,6 +177,7 @@ pub enum ButtonAction {
 pub struct HandInteraction {
     pub controllers_profile_id: u64,
     pub pose_offset: Pose,
+    pub subaction_path: xr::Path,
 
     pub grip_action: xr::Action<xr::Posef>,
     pub grip_space: xr::Space,
@@ -171,6 +246,7 @@ pub struct InteractionContext {
     pub action_set: xr::ActionSet,
     pub button_actions: HashMap<u64, ButtonAction>,
     pub hands_interaction: [HandInteraction; 2],
+    pub hvr_position_tracking: bool,
     multimodal_handle: Option<MultimodalMeta>,
     pub multimodal_hands_enabled: bool,
     pub face_sources: FaceSources,
@@ -186,9 +262,31 @@ impl InteractionContext {
     ) -> Self {
         let xr_instance = xr_session.instance();
 
+        let hvr_position_tracking = if platform == Platform::Hvr {
+            let supported = xr_instance
+                .system_properties(xr_system)
+                .map(|properties| properties.tracking_properties.position_tracking)
+                .unwrap_or(false);
+            info!("[HVR-DIAG] position tracking supported: {supported}");
+            supported
+        } else {
+            false
+        };
+
         let action_set = xr_instance
             .create_action_set("alvr_interaction", "ALVR interaction", 0)
             .unwrap();
+
+        // Huawei's legacy runtime requires every controller action to declare the same hand
+        // subaction path used by its suggested binding and action space. The official HVR sample
+        // does this for all actions; using an empty subaction list makes HVR reject every binding
+        // with "Rejected! SUB PATH" and leaves the session in an invalid state.
+        let hvr_hand_paths = (platform == Platform::Hvr).then(|| {
+            [
+                xr_instance.string_to_path("/user/hand/left").unwrap(),
+                xr_instance.string_to_path("/user/hand/right").unwrap(),
+            ]
+        });
 
         let mut bindings = vec![];
 
@@ -207,7 +305,15 @@ impl InteractionContext {
             p if p.is_pico() => PICO4S_CONTROLLER_PROFILE_PATH,
             p if p.is_vive() => FOCUS3_CONTROLLER_PROFILE_PATH,
             p if p.is_yvr() => YVR_CONTROLLER_PROFILE_PATH,
+            // Reuse Touch button inventory for server-side mapping. Bindings are
+            // suggested against Huawei's actual interaction profile below.
+            Platform::Hvr => QUEST_CONTROLLER_PROFILE_PATH,
             _ => QUEST_CONTROLLER_PROFILE_PATH,
+        };
+        let interaction_profile_path = if platform == Platform::Hvr {
+            HVR_CONTROLLER_PROFILE_PATH
+        } else {
+            controllers_profile_path
         };
         let controllers_profile_id = alvr_common::hash_string(controllers_profile_path);
 
@@ -227,43 +333,82 @@ impl InteractionContext {
                 name[0..1].to_uppercase(),
                 name[1..].replace('_', " ")
             );
+            let subaction_paths = hvr_hand_paths
+                .as_ref()
+                .map(|paths| {
+                    if info.path.starts_with("/user/hand/left/") {
+                        &paths[0..1]
+                    } else {
+                        &paths[1..2]
+                    }
+                })
+                .unwrap_or(&[]);
 
             let action = match info.button_type {
                 ButtonType::Binary => ButtonAction::Binary(
-                    action_set.create_action(&name, &display_name, &[]).unwrap(),
+                    action_set
+                        .create_action(&name, &display_name, subaction_paths)
+                        .unwrap(),
                 ),
                 ButtonType::Scalar => ButtonAction::Scalar(
-                    action_set.create_action(&name, &display_name, &[]).unwrap(),
+                    action_set
+                        .create_action(&name, &display_name, subaction_paths)
+                        .unwrap(),
                 ),
             };
             button_actions.insert(*button_id, action);
         }
 
+        let left_subaction_paths = hvr_hand_paths
+            .as_ref()
+            .map_or(&[][..], |paths| &paths[0..1]);
+        let right_subaction_paths = hvr_hand_paths
+            .as_ref()
+            .map_or(&[][..], |paths| &paths[1..2]);
+
         let left_grip_action = action_set
-            .create_action("left_grip_pose", "Left grip pose", &[])
+            .create_action("left_grip_pose", "Left grip pose", left_subaction_paths)
             .unwrap();
         let right_grip_action = action_set
-            .create_action("right_grip_pose", "Right grip pose", &[])
+            .create_action("right_grip_pose", "Right grip pose", right_subaction_paths)
             .unwrap();
 
         let left_aim_action = action_set
-            .create_action("left_aim_pose", "Left aim pose", &[])
+            .create_action("left_aim_pose", "Left aim pose", left_subaction_paths)
             .unwrap();
         let right_aim_action = action_set
-            .create_action("right_aim_pose", "Right aim pose", &[])
+            .create_action("right_aim_pose", "Right aim pose", right_subaction_paths)
             .unwrap();
 
         let left_vibration_action = action_set
-            .create_action("left_hand_vibration", "Left hand vibration", &[])
+            .create_action(
+                "left_hand_vibration",
+                "Left hand vibration",
+                left_subaction_paths,
+            )
             .unwrap();
         let right_vibration_action = action_set
-            .create_action("right_hand_vibration", "Right hand vibration", &[])
+            .create_action(
+                "right_hand_vibration",
+                "Right hand vibration",
+                right_subaction_paths,
+            )
             .unwrap();
 
         // Create action bindings:
 
         for (id, action) in &button_actions {
-            let path = &BUTTON_INFO.get(id).unwrap().path;
+            let standard_path = BUTTON_INFO.get(id).unwrap().path;
+            let hvr_path;
+            let path = if platform == Platform::Hvr {
+                let Some(path) = hvr_binding_path(standard_path) else {
+                    continue;
+                };
+                hvr_path = path;
+                &hvr_path
+            } else {
+                standard_path
+            };
             match action {
                 ButtonAction::Binary(action) => {
                     bindings.push(binding(action, path));
@@ -274,14 +419,18 @@ impl InteractionContext {
             }
         }
 
-        bindings.push(binding(
-            &left_grip_action,
-            "/user/hand/left/input/grip/pose",
-        ));
-        bindings.push(binding(
-            &right_grip_action,
-            "/user/hand/right/input/grip/pose",
-        ));
+        let left_grip_path = if platform == Platform::Hvr {
+            "/user/hand/left/input/aim/pose"
+        } else {
+            "/user/hand/left/input/grip/pose"
+        };
+        let right_grip_path = if platform == Platform::Hvr {
+            "/user/hand/right/input/aim/pose"
+        } else {
+            "/user/hand/right/input/grip/pose"
+        };
+        bindings.push(binding(&left_grip_action, left_grip_path));
+        bindings.push(binding(&right_grip_action, right_grip_path));
 
         bindings.push(binding(&left_aim_action, "/user/hand/left/input/aim/pose"));
         bindings.push(binding(
@@ -335,14 +484,42 @@ impl InteractionContext {
         }
 
         // Apply bindings:
-        xr_instance
-            .suggest_interaction_profile_bindings(
-                xr_instance
-                    .string_to_path(controllers_profile_path)
-                    .unwrap(),
-                &bindings,
-            )
-            .unwrap();
+        let bindings_result = xr_instance.suggest_interaction_profile_bindings(
+            xr_instance
+                .string_to_path(interaction_profile_path)
+                .unwrap(),
+            &bindings,
+        );
+        if platform == Platform::Hvr {
+            if let Err(error) = bindings_result {
+                // Huawei's legacy runtime rejects the whole suggestion atomically if any single
+                // path is unsupported, which would leave the pose actions unbound and make
+                // xrCreateActionSpace fail with ERROR_PATH_INVALID (crashing startup). Retry with
+                // only the pose/haptic bindings so head/controller poses still work.
+                warn!(
+                    "[HVR-DIAG] controller bindings rejected: {error}; retrying with pose-only set"
+                );
+                let pose_only_bindings = [
+                    binding(&left_grip_action, left_grip_path),
+                    binding(&right_grip_action, right_grip_path),
+                    binding(&left_aim_action, "/user/hand/left/input/aim/pose"),
+                    binding(&right_aim_action, "/user/hand/right/input/aim/pose"),
+                ];
+                let pose_result = xr_instance.suggest_interaction_profile_bindings(
+                    xr_instance
+                        .string_to_path(interaction_profile_path)
+                        .unwrap(),
+                    &pose_only_bindings,
+                );
+                if let Err(error) = pose_result {
+                    warn!("[HVR-DIAG] pose-only bindings also rejected: {error}");
+                } else {
+                    info!("[HVR-DIAG] pose-only bindings accepted");
+                }
+            }
+        } else {
+            bindings_result.unwrap();
+        }
 
         // Pico headsets require calling get_system_properties to test for extensions, because all
         // extensions function pointers are available even if the feature is not supported by the
@@ -386,19 +563,40 @@ impl InteractionContext {
 
         xr_session.attach_action_sets(&[&action_set]).unwrap();
 
-        let left_grip_space = left_grip_action
-            .create_space(xr_session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
-            .unwrap();
-        let right_grip_space = right_grip_action
-            .create_space(xr_session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
-            .unwrap();
+        // Huawei's legacy runtime can reject controller interaction bindings entirely, which then
+        // makes xrCreateActionSpace fail with ERROR_PATH_INVALID and crashes startup (dark screen).
+        // To keep the lobby rendering, fall back to a LOCAL reference space placeholder when the
+        // controller action space cannot be created. This preserves head tracking / rendering; real
+        // controller tracking is unavailable until Huawei accepts the bindings.
+        let create_pose_space = |action: &xr::Action<xr::Posef>,
+                                 subaction_path: xr::Path|
+         -> xr::Space {
+            match action.create_space(xr_session.clone(), subaction_path, xr::Posef::IDENTITY) {
+                Ok(space) => space,
+                Err(error) if platform == Platform::Hvr => {
+                    warn!(
+                        "[HVR-DIAG] controller action space rejected: {error}; \
+                         using LOCAL reference space placeholder"
+                    );
+                    xr_session
+                        .create_reference_space(xr::ReferenceSpaceType::LOCAL, xr::Posef::IDENTITY)
+                        .unwrap()
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
 
-        let left_aim_space = left_aim_action
-            .create_space(xr_session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
-            .unwrap();
-        let right_aim_space = right_aim_action
-            .create_space(xr_session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
-            .unwrap();
+        let left_subaction_path = hvr_hand_paths
+            .as_ref()
+            .map_or(xr::Path::NULL, |paths| paths[0]);
+        let right_subaction_path = hvr_hand_paths
+            .as_ref()
+            .map_or(xr::Path::NULL, |paths| paths[1]);
+        let left_grip_space = create_pose_space(&left_grip_action, left_subaction_path);
+        let right_grip_space = create_pose_space(&right_grip_action, right_subaction_path);
+
+        let left_aim_space = create_pose_space(&left_aim_action, left_subaction_path);
+        let right_aim_space = create_pose_space(&right_aim_action, right_subaction_path);
 
         let left_hand_tracker = create_ext_object("HandTracker (left)", Some(true), || {
             xr_session.create_hand_tracker(xr::Hand::LEFT)
@@ -435,6 +633,7 @@ impl InteractionContext {
                 HandInteraction {
                     controllers_profile_id,
                     pose_offset: get_controller_offset(platform, false),
+                    subaction_path: left_subaction_path,
                     grip_action: left_grip_action,
                     grip_space: left_grip_space,
                     aim_action: left_aim_action,
@@ -445,6 +644,7 @@ impl InteractionContext {
                 HandInteraction {
                     controllers_profile_id,
                     pose_offset: get_controller_offset(platform, true),
+                    subaction_path: right_subaction_path,
                     grip_action: right_grip_action,
                     grip_space: right_grip_space,
                     aim_action: right_aim_action,
@@ -453,6 +653,7 @@ impl InteractionContext {
                     skeleton_tracker: right_hand_tracker,
                 },
             ],
+            hvr_position_tracking,
             multimodal_handle,
             multimodal_hands_enabled: false,
             face_sources: FaceSources {
@@ -628,6 +829,27 @@ pub fn get_reference_space(
         .unwrap()
 }
 
+// Huawei VR only exposes a LOCAL reference space, whose origin sits at the headset's initial
+// (eye-level) pose rather than the floor. ALVR's lobby and world assume a floor-level origin
+// (STAGE / LOCAL_FLOOR semantics), so without compensation the ground is drawn at eye height.
+// Push the origin down by an average standing eye height so the floor lands under the user's feet.
+const HVR_EYE_HEIGHT_METERS: f32 = 1.5;
+
+pub fn get_hvr_floor_reference_space(xr_session: &xr::Session<xr::OpenGlEs>) -> xr::Space {
+    let floor_pose = xr::Posef {
+        orientation: xr::Quaternionf::IDENTITY,
+        position: xr::Vector3f {
+            x: 0.0,
+            y: -HVR_EYE_HEIGHT_METERS,
+            z: 0.0,
+        },
+    };
+
+    xr_session
+        .create_reference_space(xr::ReferenceSpaceType::LOCAL, floor_pose)
+        .unwrap()
+}
+
 pub fn get_head_data(
     xr_session: &xr::Session<xr::OpenGlEs>,
     platform: Platform,
@@ -751,11 +973,15 @@ pub fn get_hand_data(
 ) -> (Option<DeviceMotion>, Option<[Pose; 26]>) {
     let xr_time = crate::to_xr_time(time);
 
-    let controller_motion = if hand_source
-        .grip_action
-        .is_active(xr_session, xr::Path::NULL)
-        .unwrap_or(false)
-    {
+    // Huawei's legacy runtime can report a pose action inactive even while xrLocateSpace returns a
+    // fully tracked controller pose. Its official sample locates the action spaces independently
+    // of isActive, so accept valid space locations on HVR and let the location flags decide.
+    let pose_active = platform == Platform::Hvr
+        || hand_source
+            .grip_action
+            .is_active(xr_session, hand_source.subaction_path)
+            .unwrap_or(false);
+    let controller_motion = if pose_active {
         if let Ok((location, velocity)) = hand_source.grip_space.relate(reference_space, xr_time) {
             let orientation_valid = location
                 .location_flags
@@ -863,37 +1089,107 @@ pub fn get_hand_data(
     (controller_motion, hand_joints)
 }
 
+fn adjust_hvr_thumbsticks(values: &mut HashMap<u64, (ButtonValue, bool)>, position_tracking: bool) {
+    const HVR_THUMBSTICK_DEADZONE: f32 = 0.16;
+
+    for (x_id, y_id) in [
+        (*LEFT_THUMBSTICK_X_ID, *LEFT_THUMBSTICK_Y_ID),
+        (*RIGHT_THUMBSTICK_X_ID, *RIGHT_THUMBSTICK_Y_ID),
+    ] {
+        let Some((ButtonValue::Scalar(x), _)) = values.get(&x_id).copied() else {
+            continue;
+        };
+        let Some((ButtonValue::Scalar(y), _)) = values.get(&y_id).copied() else {
+            continue;
+        };
+
+        let (x, y) = if x.abs() < HVR_THUMBSTICK_DEADZONE && y.abs() < HVR_THUMBSTICK_DEADZONE {
+            (0.0, 0.0)
+        } else if position_tracking {
+            (x, -y)
+        } else {
+            (x, y)
+        };
+
+        values.get_mut(&x_id).unwrap().0 = ButtonValue::Scalar(x);
+        values.get_mut(&y_id).unwrap().0 = ButtonValue::Scalar(y);
+    }
+}
+
+fn button_value_changed(previous: Option<&ButtonValue>, current: ButtonValue) -> bool {
+    match (previous, current) {
+        (Some(ButtonValue::Binary(previous)), ButtonValue::Binary(current)) => *previous != current,
+        (Some(ButtonValue::Scalar(previous)), ButtonValue::Scalar(current)) => *previous != current,
+        _ => true,
+    }
+}
+
 pub fn update_buttons(
     xr_session: &xr::Session<xr::OpenGlEs>,
     button_actions: &HashMap<u64, ButtonAction>,
+    platform: Platform,
+    hvr_position_tracking: bool,
+    hvr_last_values: &mut HashMap<u64, ButtonValue>,
 ) -> Vec<ButtonEntry> {
-    let mut button_entries = Vec::with_capacity(2);
+    let mut values = HashMap::with_capacity(button_actions.len());
     for (id, action) in button_actions {
+        let subaction_path = if platform == Platform::Hvr {
+            let path = BUTTON_INFO.get(id).unwrap().path;
+            xr_session
+                .instance()
+                .string_to_path(if path.starts_with("/user/hand/left/") {
+                    "/user/hand/left"
+                } else {
+                    "/user/hand/right"
+                })
+                .unwrap()
+        } else {
+            xr::Path::NULL
+        };
         match action {
             ButtonAction::Binary(action) => {
-                let Ok(state) = action.state(xr_session, xr::Path::NULL) else {
+                let Ok(state) = action.state(xr_session, subaction_path) else {
                     continue;
                 };
-
-                if state.changed_since_last_sync {
-                    button_entries.push(ButtonEntry {
-                        path_id: *id,
-                        value: ButtonValue::Binary(state.current_state),
-                    });
-                }
+                values.insert(
+                    *id,
+                    (
+                        ButtonValue::Binary(state.current_state),
+                        state.changed_since_last_sync,
+                    ),
+                );
             }
             ButtonAction::Scalar(action) => {
-                let Ok(state) = action.state(xr_session, xr::Path::NULL) else {
+                let Ok(state) = action.state(xr_session, subaction_path) else {
                     continue;
                 };
-
-                if state.changed_since_last_sync {
-                    button_entries.push(ButtonEntry {
-                        path_id: *id,
-                        value: ButtonValue::Scalar(state.current_state),
-                    });
-                }
+                values.insert(
+                    *id,
+                    (
+                        ButtonValue::Scalar(state.current_state),
+                        state.changed_since_last_sync,
+                    ),
+                );
             }
+        }
+    }
+
+    if platform == Platform::Hvr {
+        adjust_hvr_thumbsticks(&mut values, hvr_position_tracking);
+    }
+
+    let mut button_entries = Vec::with_capacity(2);
+    for (id, (value, changed_since_last_sync)) in values {
+        let changed = if platform == Platform::Hvr {
+            button_value_changed(hvr_last_values.get(&id), value)
+        } else {
+            changed_since_last_sync
+        };
+        if changed {
+            button_entries.push(ButtonEntry { path_id: id, value });
+        }
+        if platform == Platform::Hvr {
+            hvr_last_values.insert(id, value);
         }
     }
 

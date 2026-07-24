@@ -507,8 +507,7 @@ void SetButton(unsigned long long buttonID, FfiButtonValue value) {
         if (g_driver_provider.left_hand_tracker) {
             g_driver_provider.left_hand_tracker->SetButton(buttonID, value);
         }
-    } else if (RIGHT_CONTROLLER_BUTTON_MAPPING.find(buttonID)
-               != RIGHT_CONTROLLER_BUTTON_MAPPING.end()) {
+    } else if (RIGHT_CONTROLLER_BUTTON_MAPPING.find(buttonID) != RIGHT_CONTROLLER_BUTTON_MAPPING.end()) {
         if (g_driver_provider.right_controller) {
             g_driver_provider.right_controller->SetButton(buttonID, value);
         }

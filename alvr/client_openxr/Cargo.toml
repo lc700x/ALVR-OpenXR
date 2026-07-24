@@ -9,6 +9,9 @@ license.workspace = true
 [lib]
 crate-type = ["cdylib"]
 
+[build-dependencies]
+cc = "1"
+
 [dependencies]
 alvr_common.workspace = true
 alvr_client_core.workspace = true
@@ -71,6 +74,16 @@ name = "android.permission.WAKE_LOCK"
 name = "org.khronos.openxr.permission.OPENXR"
 [[package.metadata.android.uses_permission]]
 name = "org.khronos.openxr.permission.OPENXR_SYSTEM"
+[[package.metadata.android.uses_permission]]
+name = "com.huawei.vrhandle.permission.DEVICE_MANAGER"
+[[package.metadata.android.uses_permission]]
+name = "com.huawei.android.permission.VR"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.MODIFY_AUDIO_SETTINGS"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_EXTERNAL_STORAGE"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.WRITE_EXTERNAL_STORAGE"
 
 [[package.metadata.android.queries.intent]]
 actions = ["org.khronos.openxr.OpenXRRuntimeService"]
@@ -83,6 +96,8 @@ debuggable = false
 theme = "@android:style/Theme.Black.NoTitleBar.Fullscreen"
 icon = "@mipmap/ic_launcher"
 label = "ALVR"
+has_code = true
+extract_native_libs = true
 
 [package.metadata.android.application.activity]
 config_changes = "density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|uiMode"
@@ -141,6 +156,34 @@ value = "HIGH"
 [[package.metadata.android.application.meta_data]]
 name = "com.oculus.handtracking.version"
 value = "V2.0"
+
+# Huawei VR entries
+[[package.metadata.android.queries.package]]
+name = "com.huawei.hvrsdkserverapp"
+[[package.metadata.android.application.meta_data]]
+name = "com.huawei.android.vr.application.mode"
+value = "vr_only"
+[[package.metadata.android.application.meta_data]]
+name = "com.huawei.vr.application.freeDegree"
+value = "6dof"
+[[package.metadata.android.application.meta_data]]
+name = "android.max_aspect"
+value = "2.1"
+[[package.metadata.android.application.meta_data]]
+name = "native-sdk-version"
+value = "1.0.0"
+[[package.metadata.android.application.meta_data]]
+name = "vrsdk-core-version"
+value = "1.2.0"
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["com.huawei.android.vr.action.MAIN"]
+categories = ["android.intent.category.DEFAULT"]
+
+# QiYu entries
+[[package.metadata.android.queries.package]]
+name = "com.qiyu.vraio.home"
+[[package.metadata.android.queries.package]]
+name = "com.qiyu.vraio.settings"
 
 # Vive entries
 [[package.metadata.android.uses_feature]]

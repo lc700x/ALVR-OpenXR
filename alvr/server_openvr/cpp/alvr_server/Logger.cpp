@@ -1,6 +1,7 @@
 #include "Logger.h"
 
 #include <cstdarg>
+#include <cstdio>
 
 #include "bindings.h"
 #include "driverlog.h"
@@ -13,7 +14,17 @@ void _log(const char* format, va_list args, void (*logFn)(const char*), bool dri
     if (count > 0 && buf[count - 1] == '\n')
         buf[count - 1] = '\0';
 
-    logFn(buf);
+    // OpenXR can load Settings before Rust installs the reused OpenVR logging
+    // callbacks. Calling a null callback while reporting a malformed/missing
+    // session field caused the access violation seen during
+    // xrEnumerateViewConfigurationViews. Fall back to stderr until callbacks
+    // are ready; never let diagnostics crash the host process.
+    if (logFn) {
+        logFn(buf);
+    } else {
+        fprintf(stderr, "[alvr] %s\n", buf);
+        fflush(stderr);
+    }
 
     if (driverLog)
         DriverLog(buf);
@@ -72,7 +83,12 @@ void LogPeriod(const char* tag, const char* format, ...) {
     if (count > 0 && buf[count - 1] == '\n')
         buf[count - 1] = '\0';
 
-    LogPeriodically(tag, buf);
+    if (LogPeriodically) {
+        LogPeriodically(tag, buf);
+    } else {
+        fprintf(stderr, "[alvr] %s: %s\n", tag, buf);
+        fflush(stderr);
+    }
 
     va_end(args);
 }

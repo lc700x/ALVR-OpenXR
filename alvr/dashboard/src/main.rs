@@ -51,6 +51,43 @@ fn main() {
 
     data_sources::clean_session();
 
+    // If the standalone OpenXR runtime is installed next to the dashboard, make
+    // ALVR the active OpenXR runtime automatically (silent when already set).
+    // This is a no-op for normal SteamVR-driver installs (helper absent).
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let register_exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("alvr_openxr_register.exe")));
+        if let Some(exe) = register_exe {
+            if exe.exists() {
+                std::process::Command::new(exe)
+                    .args(["--watch", &std::process::id().to_string()])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .spawn()
+                    .ok();
+            }
+        }
+
+        // Persistent driverless host. It stays idle until an OpenXR app connects
+        // over IPC; the headset connection then follows that app's lifetime.
+        let host_exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("alvr_openxr_host.exe")));
+        if let Some(exe) = host_exe {
+            if exe.exists() {
+                std::process::Command::new(exe)
+                    .args(["--parent", &std::process::id().to_string()])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .spawn()
+                    .ok();
+            }
+        }
+    }
+
     if data_sources::get_read_only_local_session()
         .settings()
         .extra

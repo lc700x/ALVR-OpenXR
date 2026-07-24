@@ -2,6 +2,81 @@ use alvr_common::glam::UVec2;
 use alvr_graphics::GraphicsContext;
 use alvr_session::ClientsidePostProcessingConfig;
 use openxr as xr;
+use std::ptr;
+
+fn hvr_result(result: xr::sys::Result) -> xr::Result<()> {
+    if result.into_raw() >= 0 {
+        Ok(())
+    } else {
+        Err(result)
+    }
+}
+
+// Huawei's legacy runtime validates these input pointers even though newer OpenXR runtimes accept
+// NULL for empty input structs. The pinned openxr crate passes NULL; use explicit typed structs on
+// HVR, exactly like Huawei's official sample.
+pub fn hvr_wait_frame(session: &xr::Session<xr::OpenGlEs>) -> xr::Result<xr::FrameState> {
+    let info = xr::sys::FrameWaitInfo {
+        ty: xr::sys::FrameWaitInfo::TYPE,
+        next: ptr::null(),
+    };
+    let state = unsafe {
+        let mut state = xr::sys::FrameState::out(ptr::null_mut());
+        let result =
+            (session.instance().fp().wait_frame)(session.as_raw(), &info, state.as_mut_ptr());
+        hvr_result(result)?;
+        state.assume_init()
+    };
+
+    Ok(xr::FrameState {
+        predicted_display_time: state.predicted_display_time,
+        predicted_display_period: state.predicted_display_period,
+        should_render: state.should_render.into(),
+    })
+}
+
+pub fn hvr_begin_frame(session: &xr::Session<xr::OpenGlEs>) -> xr::Result<()> {
+    let info = xr::sys::FrameBeginInfo {
+        ty: xr::sys::FrameBeginInfo::TYPE,
+        next: ptr::null(),
+    };
+    hvr_result(unsafe { (session.instance().fp().begin_frame)(session.as_raw(), &info) })
+}
+
+pub fn hvr_acquire_image(swapchain: &xr::Swapchain<xr::OpenGlEs>) -> xr::Result<u32> {
+    let info = xr::sys::SwapchainImageAcquireInfo {
+        ty: xr::sys::SwapchainImageAcquireInfo::TYPE,
+        next: ptr::null(),
+    };
+    let mut index = 0;
+    let result = unsafe {
+        (swapchain.instance().fp().acquire_swapchain_image)(swapchain.as_raw(), &info, &mut index)
+    };
+    hvr_result(result)?;
+
+    Ok(index)
+}
+
+pub fn hvr_wait_image(swapchain: &xr::Swapchain<xr::OpenGlEs>) -> xr::Result<()> {
+    let info = xr::sys::SwapchainImageWaitInfo {
+        ty: xr::sys::SwapchainImageWaitInfo::TYPE,
+        next: ptr::null(),
+        timeout: xr::Duration::INFINITE,
+    };
+    hvr_result(unsafe {
+        (swapchain.instance().fp().wait_swapchain_image)(swapchain.as_raw(), &info)
+    })
+}
+
+pub fn hvr_release_image(swapchain: &xr::Swapchain<xr::OpenGlEs>) -> xr::Result<()> {
+    let info = xr::sys::SwapchainImageReleaseInfo {
+        ty: xr::sys::SwapchainImageReleaseInfo::TYPE,
+        next: ptr::null(),
+    };
+    hvr_result(unsafe {
+        (swapchain.instance().fp().release_swapchain_image)(swapchain.as_raw(), &info)
+    })
+}
 
 #[allow(unused)]
 pub fn session_create_info(ctx: &GraphicsContext) -> xr::opengles::SessionCreateInfo {
@@ -35,6 +110,7 @@ pub fn create_swapchain(
     resolution: UVec2,
     format: u32,
     foveation: Option<&xr::FoveationProfileFB>,
+    platform: alvr_system_info::Platform,
 ) -> xr::Swapchain<xr::OpenGlEs> {
     gfx_ctx.make_current();
 
@@ -50,7 +126,30 @@ pub fn create_swapchain(
         mip_count: 1,
     };
 
-    session.create_swapchain(&swapchain_info).unwrap()
+    let is_hvr = platform == alvr_system_info::Platform::Hvr;
+
+    if is_hvr {
+        if let Ok(formats) = session.enumerate_swapchain_formats() {
+            alvr_common::info!(
+                "[HVR-DIAG] create_swapchain: requested format {format:#x} ({}x{}); \
+                 runtime-supported formats: {formats:x?}",
+                resolution.x,
+                resolution.y
+            );
+        }
+    }
+
+    let swapchain = session.create_swapchain(&swapchain_info).unwrap();
+
+    if is_hvr {
+        if let Ok(images) = swapchain.enumerate_images() {
+            alvr_common::info!(
+                "[HVR-DIAG] create_swapchain: enumerated GL image handles: {images:?}"
+            );
+        }
+    }
+
+    swapchain
 }
 
 pub struct ProjectionLayerAlphaConfig {

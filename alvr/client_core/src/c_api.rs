@@ -605,6 +605,16 @@ pub extern "C" fn alvr_send_tracking(
     }
 }
 
+#[no_mangle]
+pub extern "C" fn alvr_get_prediction_offset_ns() -> u64 {
+    CLIENT_CORE_CONTEXT
+        .lock()
+        .as_ref()
+        .map(ClientCoreContext::get_total_prediction_offset)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
 /// Safety: `context` must be thread safe and valid until the StreamingStopped event.
 #[no_mangle]
 pub extern "C" fn alvr_set_decoder_input_callback(

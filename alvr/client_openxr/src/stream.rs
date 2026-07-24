@@ -24,6 +24,7 @@ use alvr_session::{
 use alvr_system_info::Platform;
 use openxr as xr;
 use std::{
+    collections::HashMap,
     ptr,
     rc::Rc,
     sync::Arc,
@@ -32,6 +33,22 @@ use std::{
 };
 
 const DECODER_MAX_TIMEOUT_MULTIPLIER: f32 = 0.8;
+
+fn uses_custom_reprojection(platform: Platform) -> bool {
+    platform.is_yvr() || platform == Platform::Hvr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hvr_uses_current_runtime_views_for_projection() {
+        assert!(uses_custom_reprojection(Platform::Hvr));
+        assert!(uses_custom_reprojection(Platform::Yvr));
+        assert!(!uses_custom_reprojection(Platform::Quest2));
+    }
+}
 
 pub struct ParsedStreamConfig {
     pub view_resolution: UVec2,
@@ -91,6 +108,8 @@ pub struct StreamContext {
     core_context: Arc<ClientCoreContext>,
     xr_session: xr::Session<xr::OpenGlEs>,
     interaction_context: Arc<RwLock<InteractionContext>>,
+    platform: Platform,
+    reference_space_type: xr::ReferenceSpaceType,
     stage_reference_space: Arc<xr::Space>,
     view_reference_space: Arc<xr::Space>,
     swapchains: [xr::Swapchain<xr::OpenGlEs>; 2],
@@ -102,6 +121,7 @@ pub struct StreamContext {
     renderer: StreamRenderer,
     decoder: Option<(VideoDecoderConfig, VideoDecoderSource)>,
     use_custom_reprojection: bool,
+    hvr_video_frame_count: u32,
 }
 
 impl StreamContext {
@@ -168,6 +188,7 @@ impl StreamContext {
                 target_view_resolution,
                 format,
                 foveation_profile.as_ref(),
+                platform,
             ),
             graphics::create_swapchain(
                 &xr_session,
@@ -175,6 +196,7 @@ impl StreamContext {
                 target_view_resolution,
                 format,
                 foveation_profile.as_ref(),
+                platform,
             ),
         ];
 
@@ -204,6 +226,13 @@ impl StreamContext {
             config.upscaling.clone(),
         );
 
+        if platform == Platform::Hvr {
+            alvr_common::info!(
+                "[HVR-DIAG] stream renderer created: targets_ready={}",
+                renderer.render_targets_ready()
+            );
+        }
+
         core_ctx.send_active_interaction_profile(
             *HAND_LEFT_ID,
             interaction_ctx.read().hands_interaction[0].controllers_profile_id,
@@ -215,10 +244,12 @@ impl StreamContext {
 
         let input_thread_running = Arc::new(RelaxedAtomic::new(false));
 
-        let stage_reference_space = Arc::new(interaction::get_reference_space(
-            &xr_session,
-            xr::ReferenceSpaceType::STAGE,
-        ));
+        let reference_space_type = crate::tracking_reference_space_type(platform);
+        let stage_reference_space = Arc::new(if platform == Platform::Hvr {
+            interaction::get_hvr_floor_reference_space(&xr_session)
+        } else {
+            interaction::get_reference_space(&xr_session, reference_space_type)
+        });
         let view_reference_space = Arc::new(interaction::get_reference_space(
             &xr_session,
             xr::ReferenceSpaceType::VIEW,
@@ -228,6 +259,8 @@ impl StreamContext {
             core_context: core_ctx,
             xr_session,
             interaction_context: interaction_ctx,
+            platform,
+            reference_space_type,
             stage_reference_space,
             view_reference_space,
             swapchains,
@@ -238,7 +271,8 @@ impl StreamContext {
             target_view_resolution,
             renderer,
             decoder: None,
-            use_custom_reprojection: platform.is_yvr(),
+            use_custom_reprojection: uses_custom_reprojection(platform),
+            hvr_video_frame_count: 0,
         };
 
         this.update_reference_space();
@@ -253,10 +287,11 @@ impl StreamContext {
     pub fn update_reference_space(&mut self) {
         self.input_thread_running.set(false);
 
-        self.stage_reference_space = Arc::new(interaction::get_reference_space(
-            &self.xr_session,
-            xr::ReferenceSpaceType::STAGE,
-        ));
+        self.stage_reference_space = Arc::new(if self.platform == Platform::Hvr {
+            interaction::get_hvr_floor_reference_space(&self.xr_session)
+        } else {
+            interaction::get_reference_space(&self.xr_session, self.reference_space_type)
+        });
         self.view_reference_space = Arc::new(interaction::get_reference_space(
             &self.xr_session,
             xr::ReferenceSpaceType::VIEW,
@@ -264,7 +299,7 @@ impl StreamContext {
 
         self.core_context.send_playspace(
             self.xr_session
-                .reference_space_bounds_rect(xr::ReferenceSpaceType::STAGE)
+                .reference_space_bounds_rect(self.reference_space_type)
                 .unwrap()
                 .map(|a| Vec2::new(a.width, a.height)),
         );
@@ -283,7 +318,31 @@ impl StreamContext {
             let view_reference_space = Arc::clone(&self.view_reference_space);
             let refresh_rate = self.config.refresh_rate_hint;
             let running = Arc::clone(&self.input_thread_running);
+            #[cfg(target_os = "android")]
+            let platform = self.platform;
             move || {
+                // Huawei's OpenXR runtime performs JNI calls (e.g. inside xrSyncActions) on the
+                // calling thread. Unlike the render thread (attached in android_main), this input
+                // thread is not attached to the JVM, so those JNI calls dereference a null
+                // JNIEnv/array and crash in libvrsdk (art::JNI::GetArrayLength). Attach the thread
+                // for the lifetime of the loop; `vm` and `_env` must both stay alive because the
+                // attach guard borrows the vm.
+                #[cfg(target_os = "android")]
+                let vm = (platform == Platform::Hvr)
+                    .then(|| {
+                        let context = ndk_context::android_context();
+                        unsafe { jni::JavaVM::from_raw(context.vm().cast()) }.ok()
+                    })
+                    .flatten();
+                #[cfg(target_os = "android")]
+                let _env = vm.as_ref().and_then(|vm| match vm.attach_current_thread() {
+                    Ok(env) => Some(env),
+                    Err(e) => {
+                        alvr_common::error!("[HVR-DIAG] failed to attach input thread to JVM: {e}");
+                        None
+                    }
+                });
+
                 stream_input_loop(
                     &core_ctx,
                     xr_session,
@@ -363,15 +422,58 @@ impl StreamContext {
                 (vsync_time, self.last_good_view_params, ptr::null_mut())
             };
 
-        let left_swapchain_idx = self.swapchains[0].acquire_image().unwrap();
-        let right_swapchain_idx = self.swapchains[1].acquire_image().unwrap();
+        let is_hvr = self.platform == Platform::Hvr;
 
-        self.swapchains[0]
-            .wait_image(xr::Duration::INFINITE)
-            .unwrap();
-        self.swapchains[1]
-            .wait_image(xr::Duration::INFINITE)
-            .unwrap();
+        if is_hvr && !buffer_ptr.is_null() {
+            self.hvr_video_frame_count += 1;
+            if self.hvr_video_frame_count <= 2 || self.hvr_video_frame_count % 300 == 0 {
+                alvr_common::info!(
+                    "[HVR-DIAG] decoded video frame {}: timestamp={timestamp:?}, vsync={vsync_time:?}",
+                    self.hvr_video_frame_count
+                );
+            }
+        }
+
+        let left_swapchain_idx = if is_hvr {
+            graphics::hvr_acquire_image(&mut self.swapchains[0]).unwrap_or(0)
+        } else {
+            self.swapchains[0].acquire_image().unwrap()
+        };
+        let right_swapchain_idx = if is_hvr {
+            graphics::hvr_acquire_image(&mut self.swapchains[1]).unwrap_or(0)
+        } else {
+            self.swapchains[1].acquire_image().unwrap()
+        };
+
+        if is_hvr {
+            let _ = graphics::hvr_wait_image(&mut self.swapchains[0]);
+            let _ = graphics::hvr_wait_image(&mut self.swapchains[1]);
+        } else {
+            self.swapchains[0]
+                .wait_image(xr::Duration::INFINITE)
+                .unwrap();
+            self.swapchains[1]
+                .wait_image(xr::Duration::INFINITE)
+                .unwrap();
+        }
+
+        // Huawei returns zero swapchain texture handles until the images are acquired/waited inside
+        // an active frame. Now that they have been, re-enumerate and (re)build the render targets.
+        if is_hvr && !self.renderer.render_targets_ready() {
+            if let (Ok(left_handles), Ok(right_handles)) = (
+                self.swapchains[0].enumerate_images(),
+                self.swapchains[1].enumerate_images(),
+            ) {
+                let left: Vec<u32> = left_handles.iter().map(|&h| h as u32).collect();
+                let right: Vec<u32> = right_handles.iter().map(|&h| h as u32).collect();
+                if left.iter().all(|&h| h != 0) && right.iter().all(|&h| h != 0) {
+                    self.renderer.set_swapchain_textures([left, right]);
+                    alvr_common::info!(
+                        "[HVR-DIAG] stream render targets built from in-frame handles"
+                    );
+                }
+            }
+        }
 
         let (flags, maybe_views) = self
             .xr_session
@@ -436,8 +538,16 @@ impl StreamContext {
             )
         };
 
-        self.swapchains[0].release_image().unwrap();
-        self.swapchains[1].release_image().unwrap();
+        if is_hvr {
+            // Huawei's compositor reads the released swapchain image immediately. Ensure both the
+            // decoded-frame copy and wgpu draw have completed before handing the image back.
+            self.renderer.finish();
+            let _ = graphics::hvr_release_image(&mut self.swapchains[0]);
+            let _ = graphics::hvr_release_image(&mut self.swapchains[1]);
+        } else {
+            self.swapchains[0].release_image().unwrap();
+            self.swapchains[1].release_image().unwrap();
+        }
 
         if !buffer_ptr.is_null() {
             if let Some(xr_now) = crate::xr_runtime_now(self.xr_session.instance()) {
@@ -497,6 +607,14 @@ impl StreamContext {
                         } | PassthroughMode::RgbChromaKey(_)
                             | PassthroughMode::HsvChromaKey(_)
                     ),
+                })
+                .or_else(|| {
+                    (self.platform == Platform::Hvr).then_some(ProjectionLayerAlphaConfig {
+                        // Wolvic always sets BLEND_TEXTURE_SOURCE_ALPHA on Huawei projection
+                        // layers. Stream output is opaque (alpha=1), so premultiplication is
+                        // equivalent while preserving Huawei's expected compositor contract.
+                        premultiplied: true,
+                    })
                 }),
             clientside_post_processing,
         );
@@ -526,6 +644,8 @@ fn stream_input_loop(
     let mut last_controller_poses = [Pose::default(); 2];
     let mut last_palm_poses = [Pose::default(); 2];
     let mut last_view_params = [ViewParams::default(); 2];
+    let mut next_hvr_controller_log = Instant::now();
+    let mut hvr_button_values = HashMap::new();
 
     let mut deadline = Instant::now();
     let frame_interval = Duration::from_secs_f32(1.0 / refresh_rate);
@@ -588,6 +708,15 @@ fn stream_input_loop(
             &mut last_palm_poses[1],
         );
 
+        if platform == Platform::Hvr && Instant::now() >= next_hvr_controller_log {
+            alvr_common::info!(
+                "[HVR-DIAG] controller motions: left={}, right={}",
+                left_hand_motion.is_some(),
+                right_hand_motion.is_some()
+            );
+            next_hvr_controller_log = Instant::now() + Duration::from_secs(1);
+        }
+
         // Note: When multimodal input is enabled, we are sure that when free hands are used
         // (not holding controllers) the controller data is None.
         if int_ctx.multimodal_hands_enabled || left_hand_skeleton.is_none() {
@@ -643,7 +772,13 @@ fn stream_input_loop(
             face_data,
         );
 
-        let button_entries = interaction::update_buttons(&xr_session, &int_ctx.button_actions);
+        let button_entries = interaction::update_buttons(
+            &xr_session,
+            &int_ctx.button_actions,
+            platform,
+            int_ctx.hvr_position_tracking,
+            &mut hvr_button_values,
+        );
         if !button_entries.is_empty() {
             core_ctx.send_buttons(button_entries);
         }

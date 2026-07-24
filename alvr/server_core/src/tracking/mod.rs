@@ -51,6 +51,28 @@ struct MotionConfig {
     angular_velocity_cutoff: f32,
 }
 
+fn controller_pose_offset(
+    position: [f32; 3],
+    rotation: [f32; 3],
+    is_right: bool,
+    apply_steamvr_offset: bool,
+) -> Pose {
+    if !apply_steamvr_offset {
+        return Pose::default();
+    }
+
+    let side = if is_right { -1.0 } else { 1.0 };
+    Pose {
+        orientation: Quat::from_euler(
+            EulerRot::XYZ,
+            rotation[0] * DEG_TO_RAD,
+            rotation[1] * side * DEG_TO_RAD,
+            rotation[2] * side * DEG_TO_RAD,
+        ),
+        position: Vec3::new(position[0] * side, position[1], position[2]),
+    }
+}
+
 pub struct TrackingManager {
     last_head_pose: Pose,             // client's reference space
     inverse_recentering_origin: Pose, // client's reference space
@@ -143,19 +165,12 @@ impl TrackingManager {
         if let Switch::Enabled(controllers) = &headset_config.controllers {
             let t = controllers.left_controller_position_offset;
             let r = controllers.left_controller_rotation_offset;
+            let apply_steamvr_offset = crate::is_openvr_driver_present();
 
             device_motion_configs.insert(
                 *HAND_LEFT_ID,
                 MotionConfig {
-                    pose_offset: Pose {
-                        orientation: Quat::from_euler(
-                            EulerRot::XYZ,
-                            r[0] * DEG_TO_RAD,
-                            r[1] * DEG_TO_RAD,
-                            r[2] * DEG_TO_RAD,
-                        ),
-                        position: Vec3::new(t[0], t[1], t[2]),
-                    },
+                    pose_offset: controller_pose_offset(t, r, false, apply_steamvr_offset),
                     linear_velocity_cutoff: controllers.linear_velocity_cutoff,
                     angular_velocity_cutoff: controllers.angular_velocity_cutoff * DEG_TO_RAD,
                 },
@@ -164,15 +179,7 @@ impl TrackingManager {
             device_motion_configs.insert(
                 *HAND_RIGHT_ID,
                 MotionConfig {
-                    pose_offset: Pose {
-                        orientation: Quat::from_euler(
-                            EulerRot::XYZ,
-                            r[0] * DEG_TO_RAD,
-                            -r[1] * DEG_TO_RAD,
-                            -r[2] * DEG_TO_RAD,
-                        ),
-                        position: Vec3::new(-t[0], t[1], t[2]),
-                    },
+                    pose_offset: controller_pose_offset(t, r, true, apply_steamvr_offset),
                     linear_velocity_cutoff: controllers.linear_velocity_cutoff,
                     angular_velocity_cutoff: controllers.angular_velocity_cutoff * DEG_TO_RAD,
                 },
@@ -558,5 +565,26 @@ pub fn tracking_loop(
                 sink.send_tracking(&device_motions);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn driverless_controller_offset_is_identity() {
+        let position = [0.01, -0.02, -0.11];
+        let rotation = [5.0, 6.0, 7.0];
+
+        let driverless = controller_pose_offset(position, rotation, false, false);
+        assert!(driverless.position.abs_diff_eq(Vec3::ZERO, 1e-6));
+        assert!(driverless.orientation.abs_diff_eq(Quat::IDENTITY, 1e-6));
+
+        let left = controller_pose_offset(position, rotation, false, true);
+        let right = controller_pose_offset(position, rotation, true, true);
+        assert_eq!(left.position.x, -right.position.x);
+        assert_eq!(left.position.y, right.position.y);
+        assert_eq!(left.position.z, right.position.z);
     }
 }

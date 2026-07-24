@@ -25,6 +25,7 @@ USAGE:
 SUBCOMMANDS:
     prepare-deps        Download and compile streamer and client external dependencies
     build-streamer      Build streamer, then copy binaries to build folder
+    build-streamer-openxr Build standalone OpenXR runtime (no SteamVR) to build folder
     build-launcher      Build launcher, then copy binaries to build folder
     build-server-lib    Build a C-ABI ALVR server library and header
     build-client        Build client, then copy binaries to build folder
@@ -231,6 +232,7 @@ fn main() {
                 "build-streamer" => {
                     build::build_streamer(profile, gpl, None, false, profiling, keep_config)
                 }
+                "build-streamer-openxr" => build::build_streamer_openxr(profile, gpl, false),
                 "build-launcher" => build::build_launcher(profile, false),
                 "build-server-lib" => build::build_server_lib(profile, None, false),
                 "build-client" => build::build_android_client(profile),

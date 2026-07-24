@@ -54,6 +54,23 @@ use tracking::TrackingManager;
 
 static FILESYSTEM_LAYOUT: OnceLock<afs::Layout> = OnceLock::new();
 
+// Set by the standalone OpenXR runtime to signal there is no SteamVR/OpenVR
+// driver process to restart. When true, the connection pipeline applies
+// negotiated config in-place instead of requesting a driver restart.
+static DRIVERLESS_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Called by the standalone OpenXR runtime at startup to disable the
+/// SteamVR-driver restart handshake (there is no driver process to restart).
+pub fn set_driverless_mode(enabled: bool) {
+    DRIVERLESS_MODE.store(enabled, Ordering::Relaxed);
+}
+
+/// True when a real OpenVR driver/dashboard restart flow should be used.
+/// False in the standalone OpenXR runtime (driverless).
+pub fn is_openvr_driver_present() -> bool {
+    !DRIVERLESS_MODE.load(Ordering::Relaxed)
+}
+
 // This is lazily initialized when initializing logging or ServerCoreContext. So FILESYSTEM_LAYOUT
 // needs to be initialized first using initialize_environment().
 // NB: this must remain a global because only one instance should exist for the whole application
@@ -246,6 +263,10 @@ impl ServerCoreContext {
     pub fn start_connection(&self) {
         dbg_server_core!("start_connection");
 
+        if self.connection_thread.read().is_some() {
+            return;
+        }
+
         // Note: Idle state is not used on the server side
         *self.lifecycle_state.write() = LifecycleState::Resumed;
 
@@ -254,6 +275,15 @@ impl ServerCoreContext {
         *self.connection_thread.write() = Some(thread::spawn(move || {
             connection::handshake_loop(connection_context, lifecycle_state);
         }));
+    }
+
+    pub fn stop_connection(&self) {
+        dbg_server_core!("stop_connection");
+
+        *self.lifecycle_state.write() = LifecycleState::ShuttingDown;
+        if let Some(thread) = self.connection_thread.write().take() {
+            thread.join().ok();
+        }
     }
 
     pub fn get_device_motion(

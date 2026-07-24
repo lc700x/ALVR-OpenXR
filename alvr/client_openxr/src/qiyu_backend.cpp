@@ -1,0 +1,949 @@
+#include "alvr_client_core_ffi.h"
+
+#include <cstring>
+#include <string.h>
+#include <vector>
+
+#include "QiyuApi.h"
+
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES3/gl3.h>
+#include <android/log.h>
+#include <android/native_window.h>
+#include <dlfcn.h>
+#include <jni.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdarg>
+#include <cstdint>
+#include <deque>
+#include <map>
+#include <mutex>
+#include <thread>
+#include <utility>
+
+namespace {
+
+constexpr int kEyeCount = 2;
+constexpr int kSwapchainLength = 3;
+constexpr size_t kMaxTrackingFrames = 360;
+constexpr float kButtonEpsilon = 0.001f;
+constexpr float kDefaultRefreshRate = 72.0f;
+
+void log(int priority, const char *format, ...);
+
+struct QiyuApi {
+    void *library = nullptr;
+    decltype(&qiyu_Init) init = nullptr;
+    decltype(&qiyu_Release) release = nullptr;
+    decltype(&qiyu_StartVR) start_vr = nullptr;
+    decltype(&qiyu_EndVR) end_vr = nullptr;
+    decltype(&qiyu_StartEye) start_eye = nullptr;
+    decltype(&qiyu_EndEye) end_eye = nullptr;
+    decltype(&qiyu_SubmitFrame) submit_frame = nullptr;
+    decltype(&qiyu_Update) update = nullptr;
+    decltype(&qiyu_GetDeviceInfo) get_device_info = nullptr;
+    decltype(&qiyu_GetViewMatrix) get_view_matrix = nullptr;
+    decltype(&qiyu_PredictDisplayTime) predict_display_time = nullptr;
+    decltype(&qiyu_PredictHeadPose) predict_head_pose = nullptr;
+    decltype(&qiyu_PostSetEyeBufferSize) post_eye_buffer_size = nullptr;
+    decltype(&qiyu_SetTrackingOriginMode) set_tracking_origin = nullptr;
+    decltype(&qiyu_IsControllerInit) is_controller_initialized = nullptr;
+    decltype(&qiyu_GetControllerData) get_controller_data = nullptr;
+    decltype(&qiyu_StartControllerVibration) start_vibration = nullptr;
+    decltype(&qiyu_StopControllerVibration) stop_vibration = nullptr;
+    decltype(&qiyu_GetBoundaryDimensions) get_boundary_dimensions = nullptr;
+
+    template <typename T>
+    bool load_symbol(T &function, const char *name) {
+        function = reinterpret_cast<T>(dlsym(library, name));
+        if (function == nullptr) {
+            log(ANDROID_LOG_ERROR, "Missing QiYu SDK symbol %s: %s", name, dlerror());
+            return false;
+        }
+        return true;
+    }
+
+    bool load() {
+        library = dlopen("libqiyuapi.so", RTLD_NOW | RTLD_LOCAL);
+        if (library == nullptr) {
+            log(ANDROID_LOG_ERROR, "Cannot load libqiyuapi.so: %s", dlerror());
+            return false;
+        }
+#define LOAD_QIYU(field, symbol) load_symbol(field, #symbol)
+        return LOAD_QIYU(init, qiyu_Init) &&
+               LOAD_QIYU(release, qiyu_Release) &&
+               LOAD_QIYU(start_vr, qiyu_StartVR) &&
+               LOAD_QIYU(end_vr, qiyu_EndVR) &&
+               LOAD_QIYU(start_eye, qiyu_StartEye) &&
+               LOAD_QIYU(end_eye, qiyu_EndEye) &&
+               LOAD_QIYU(submit_frame, qiyu_SubmitFrame) &&
+               LOAD_QIYU(update, qiyu_Update) &&
+               LOAD_QIYU(get_device_info, qiyu_GetDeviceInfo) &&
+               LOAD_QIYU(get_view_matrix, qiyu_GetViewMatrix) &&
+               LOAD_QIYU(predict_display_time, qiyu_PredictDisplayTime) &&
+               LOAD_QIYU(predict_head_pose, qiyu_PredictHeadPose) &&
+               LOAD_QIYU(post_eye_buffer_size, qiyu_PostSetEyeBufferSize) &&
+               LOAD_QIYU(set_tracking_origin, qiyu_SetTrackingOriginMode) &&
+               LOAD_QIYU(is_controller_initialized, qiyu_IsControllerInit) &&
+               LOAD_QIYU(get_controller_data, qiyu_GetControllerData) &&
+               LOAD_QIYU(start_vibration, qiyu_StartControllerVibration) &&
+               LOAD_QIYU(stop_vibration, qiyu_StopControllerVibration) &&
+               LOAD_QIYU(get_boundary_dimensions, qiyu_GetBoundaryDimensions);
+#undef LOAD_QIYU
+    }
+
+    void unload() {
+        if (library != nullptr) {
+            dlclose(library);
+            library = nullptr;
+        }
+    }
+};
+
+QiyuApi api;
+
+void log(int priority, const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    __android_log_vprint(priority, "ALVR-QIYU", format, args);
+    va_end(args);
+}
+
+struct EglState {
+    EGLDisplay display = EGL_NO_DISPLAY;
+    EGLContext context = EGL_NO_CONTEXT;
+    EGLSurface surface = EGL_NO_SURFACE;
+    EGLConfig config = nullptr;
+};
+
+struct EyeBuffers {
+    std::array<GLuint, kSwapchainLength> textures{};
+    uint32_t index = 0;
+};
+
+struct InputIds {
+    uint64_t head = 0;
+    uint64_t hands[kEyeCount]{};
+    uint64_t haptics[kEyeCount]{};
+    uint64_t profile = 0;
+    uint64_t menu = 0;
+    uint64_t face_click[kEyeCount][2]{};
+    uint64_t face_touch[kEyeCount][2]{};
+    uint64_t squeeze_click[kEyeCount]{};
+    uint64_t squeeze_value[kEyeCount]{};
+    uint64_t trigger_click[kEyeCount]{};
+    uint64_t trigger_value[kEyeCount]{};
+    uint64_t trigger_touch[kEyeCount]{};
+    uint64_t stick_x[kEyeCount]{};
+    uint64_t stick_y[kEyeCount]{};
+    uint64_t stick_click[kEyeCount]{};
+    uint64_t stick_touch[kEyeCount]{};
+};
+
+struct State {
+    JavaVM *java_vm = nullptr;
+    jobject activity = nullptr;
+    EglState egl;
+    ANativeWindow *window = nullptr;
+    std::atomic_bool initialized = false;
+    std::atomic_bool running = false;
+    std::atomic_bool streaming = false;
+    std::atomic<float> refresh_rate = kDefaultRefreshRate;
+    std::atomic<float> tracking_offset = 0.0f;
+    std::thread tracking_thread;
+    EyeBuffers lobby[kEyeCount];
+    EyeBuffers stream[kEyeCount];
+    uint32_t view_width = 1;
+    uint32_t view_height = 1;
+    uint32_t stream_width = 1;
+    uint32_t stream_height = 1;
+    uint64_t last_frame_time_ns = 0;
+    bool decoder_initialized = false;
+    bool controller_connected[kEyeCount]{};
+    int last_controller_battery[kEyeCount] = {-1, -1};
+    InputIds ids;
+    std::map<uint64_t, AlvrButtonValue> button_states;
+    std::deque<std::pair<uint64_t, qiyu_HeadPoseState>> tracking_frames;
+    std::mutex tracking_mutex;
+};
+
+State state;
+
+uint64_t clock_ns() {
+    timespec time{};
+    clock_gettime(CLOCK_BOOTTIME, &time);
+    return uint64_t(time.tv_sec) * 1'000'000'000ULL + uint64_t(time.tv_nsec);
+}
+
+bool initialize_egl() {
+    state.egl.display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (state.egl.display == EGL_NO_DISPLAY ||
+        !eglInitialize(state.egl.display, nullptr, nullptr)) {
+        log(ANDROID_LOG_ERROR, "eglInitialize failed: 0x%x", eglGetError());
+        return false;
+    }
+
+    constexpr EGLint attributes[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT_KHR,
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT | EGL_WINDOW_BIT,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_DEPTH_SIZE, 0,
+        EGL_STENCIL_SIZE, 0,
+        EGL_SAMPLES, 0,
+        EGL_NONE,
+    };
+    EGLint config_count = 0;
+    if (!eglChooseConfig(state.egl.display, attributes, &state.egl.config, 1,
+                         &config_count) || config_count == 0) {
+        log(ANDROID_LOG_ERROR, "eglChooseConfig failed: 0x%x", eglGetError());
+        return false;
+    }
+
+    constexpr EGLint context_attributes[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+    state.egl.context = eglCreateContext(state.egl.display, state.egl.config,
+                                         EGL_NO_CONTEXT, context_attributes);
+    constexpr EGLint surface_attributes[] = {EGL_WIDTH, 16, EGL_HEIGHT, 16, EGL_NONE};
+    state.egl.surface = eglCreatePbufferSurface(state.egl.display, state.egl.config,
+                                                surface_attributes);
+    if (state.egl.context == EGL_NO_CONTEXT || state.egl.surface == EGL_NO_SURFACE ||
+        !eglMakeCurrent(state.egl.display, state.egl.surface, state.egl.surface,
+                        state.egl.context)) {
+        log(ANDROID_LOG_ERROR, "EGL context creation failed: 0x%x", eglGetError());
+        return false;
+    }
+
+    return true;
+}
+
+void destroy_egl() {
+    if (state.egl.display == EGL_NO_DISPLAY) {
+        return;
+    }
+    eglMakeCurrent(state.egl.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    if (state.egl.surface != EGL_NO_SURFACE) {
+        eglDestroySurface(state.egl.display, state.egl.surface);
+    }
+    if (state.egl.context != EGL_NO_CONTEXT) {
+        eglDestroyContext(state.egl.display, state.egl.context);
+    }
+    eglTerminate(state.egl.display);
+    state.egl = {};
+}
+
+bool create_buffers(EyeBuffers (&buffers)[kEyeCount], uint32_t width, uint32_t height) {
+    for (auto &eye : buffers) {
+        glGenTextures(kSwapchainLength, eye.textures.data());
+        eye.index = 0;
+        for (GLuint texture : eye.textures) {
+            glBindTexture(GL_TEXTURE_2D, texture);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(width),
+                         static_cast<GLsizei>(height), 0, GL_RGBA,
+                         GL_UNSIGNED_BYTE, nullptr);
+        }
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+    const auto error = glGetError();
+    if (error != GL_NO_ERROR) {
+        log(ANDROID_LOG_ERROR, "Eye texture creation failed: 0x%x", error);
+        return false;
+    }
+    return true;
+}
+
+void destroy_buffers(EyeBuffers (&buffers)[kEyeCount]) {
+    for (auto &eye : buffers) {
+        glDeleteTextures(kSwapchainLength, eye.textures.data());
+        eye = {};
+    }
+}
+
+AlvrFov get_fov(const qiyu_DeviceInfo &device, int eye) {
+    const auto &frustum = eye == 0 ? device.frustumLeftEye : device.frustumRightEye;
+    return {
+        std::atan(frustum.left / frustum.near),
+        std::atan(frustum.right / frustum.near),
+        std::atan(frustum.top / frustum.near),
+        std::atan(frustum.bottom / frustum.near),
+    };
+}
+
+float get_ipd(const qiyu_DeviceInfo &device) {
+    const auto &left = device.frustumLeftEye.position;
+    const auto &right = device.frustumRightEye.position;
+    const float x = right.x - left.x;
+    const float y = right.y - left.y;
+    const float z = right.z - left.z;
+    return std::sqrt(x * x + y * y + z * z);
+}
+
+AlvrQuat head_orientation(const qiyu_Quaternion &rotation) {
+    return {rotation.x, rotation.y, rotation.z, -rotation.w};
+}
+
+AlvrPose head_pose(const qiyu_HeadPoseState &tracking) {
+    AlvrPose pose{};
+    pose.orientation = head_orientation(tracking.pose.rotation);
+    pose.position[0] = -tracking.pose.position.x;
+    pose.position[1] = -tracking.pose.position.y - state.tracking_offset.load();
+    pose.position[2] = -tracking.pose.position.z;
+    return pose;
+}
+
+float matrix_minor(const qiyu_Matrix4 &matrix, int r0, int r1, int r2,
+                   int c0, int c1, int c2) {
+    return matrix.M[r0][c0] *
+               (matrix.M[r1][c1] * matrix.M[r2][c2] -
+                matrix.M[r2][c1] * matrix.M[r1][c2]) -
+           matrix.M[r0][c1] *
+               (matrix.M[r1][c0] * matrix.M[r2][c2] -
+                matrix.M[r2][c0] * matrix.M[r1][c2]) +
+           matrix.M[r0][c2] *
+               (matrix.M[r1][c0] * matrix.M[r2][c1] -
+                matrix.M[r2][c0] * matrix.M[r1][c1]);
+}
+
+qiyu_Matrix4 matrix_inverse(const qiyu_Matrix4 &matrix) {
+    const float inverse_determinant =
+        1.0f / (matrix.M[0][0] * matrix_minor(matrix, 1, 2, 3, 1, 2, 3) -
+                matrix.M[0][1] * matrix_minor(matrix, 1, 2, 3, 0, 2, 3) +
+                matrix.M[0][2] * matrix_minor(matrix, 1, 2, 3, 0, 1, 3) -
+                matrix.M[0][3] * matrix_minor(matrix, 1, 2, 3, 0, 1, 2));
+    qiyu_Matrix4 output{};
+    output.M[0][0] = matrix_minor(matrix, 1, 2, 3, 1, 2, 3) * inverse_determinant;
+    output.M[0][1] = -matrix_minor(matrix, 0, 2, 3, 1, 2, 3) * inverse_determinant;
+    output.M[0][2] = matrix_minor(matrix, 0, 1, 3, 1, 2, 3) * inverse_determinant;
+    output.M[0][3] = -matrix_minor(matrix, 0, 1, 2, 1, 2, 3) * inverse_determinant;
+    output.M[1][0] = -matrix_minor(matrix, 1, 2, 3, 0, 2, 3) * inverse_determinant;
+    output.M[1][1] = matrix_minor(matrix, 0, 2, 3, 0, 2, 3) * inverse_determinant;
+    output.M[1][2] = -matrix_minor(matrix, 0, 1, 3, 0, 2, 3) * inverse_determinant;
+    output.M[1][3] = matrix_minor(matrix, 0, 1, 2, 0, 2, 3) * inverse_determinant;
+    output.M[2][0] = matrix_minor(matrix, 1, 2, 3, 0, 1, 3) * inverse_determinant;
+    output.M[2][1] = -matrix_minor(matrix, 0, 2, 3, 0, 1, 3) * inverse_determinant;
+    output.M[2][2] = matrix_minor(matrix, 0, 1, 3, 0, 1, 3) * inverse_determinant;
+    output.M[2][3] = -matrix_minor(matrix, 0, 1, 2, 0, 1, 3) * inverse_determinant;
+    output.M[3][0] = -matrix_minor(matrix, 1, 2, 3, 0, 1, 2) * inverse_determinant;
+    output.M[3][1] = matrix_minor(matrix, 0, 2, 3, 0, 1, 2) * inverse_determinant;
+    output.M[3][2] = -matrix_minor(matrix, 0, 1, 3, 0, 1, 2) * inverse_determinant;
+    output.M[3][3] = matrix_minor(matrix, 0, 1, 2, 0, 1, 2) * inverse_determinant;
+    return output;
+}
+
+void fill_layout(qiyu_RenderLayer_ScreenPosUV &layout) {
+    constexpr float lower_left[4] = {-1.0f, -1.0f, 0.0f, 1.0f};
+    constexpr float lower_right[4] = {1.0f, -1.0f, 0.0f, 1.0f};
+    constexpr float upper_left[4] = {-1.0f, 1.0f, 0.0f, 1.0f};
+    constexpr float upper_right[4] = {1.0f, 1.0f, 0.0f, 1.0f};
+    constexpr float lower_uv[4] = {0.0f, 0.0f, 1.0f, 0.0f};
+    constexpr float upper_uv[4] = {0.0f, 1.0f, 1.0f, 1.0f};
+    std::memcpy(layout.LowerLeftPos, lower_left, sizeof(lower_left));
+    std::memcpy(layout.LowerRightPos, lower_right, sizeof(lower_right));
+    std::memcpy(layout.UpperLeftPos, upper_left, sizeof(upper_left));
+    std::memcpy(layout.UpperRightPos, upper_right, sizeof(upper_right));
+    std::memcpy(layout.LowerUVs, lower_uv, sizeof(lower_uv));
+    std::memcpy(layout.UpperUVs, upper_uv, sizeof(upper_uv));
+}
+
+void initialize_ids() {
+    auto id = [](const char *path) { return alvr_path_string_to_id(path); };
+    state.ids.head = id("/user/head");
+    state.ids.hands[0] = id("/user/hand/left");
+    state.ids.hands[1] = id("/user/hand/right");
+    state.ids.haptics[0] = id("/user/hand/left/output/haptic");
+    state.ids.haptics[1] = id("/user/hand/right/output/haptic");
+    state.ids.profile = id("/interaction_profiles/oculus/touch");
+    state.ids.menu = id("/user/hand/left/input/menu/click");
+
+    const char *hands[kEyeCount] = {"left", "right"};
+    const char *faces[kEyeCount][2] = {{"x", "y"}, {"a", "b"}};
+    for (int hand = 0; hand < kEyeCount; ++hand) {
+        char path[128];
+        for (int face = 0; face < 2; ++face) {
+            std::snprintf(path, sizeof(path), "/user/hand/%s/input/%s/click",
+                          hands[hand], faces[hand][face]);
+            state.ids.face_click[hand][face] = id(path);
+            std::snprintf(path, sizeof(path), "/user/hand/%s/input/%s/touch",
+                          hands[hand], faces[hand][face]);
+            state.ids.face_touch[hand][face] = id(path);
+        }
+        std::snprintf(path, sizeof(path), "/user/hand/%s/input/squeeze/click", hands[hand]);
+        state.ids.squeeze_click[hand] = id(path);
+        std::snprintf(path, sizeof(path), "/user/hand/%s/input/squeeze/value", hands[hand]);
+        state.ids.squeeze_value[hand] = id(path);
+        std::snprintf(path, sizeof(path), "/user/hand/%s/input/trigger/click", hands[hand]);
+        state.ids.trigger_click[hand] = id(path);
+        std::snprintf(path, sizeof(path), "/user/hand/%s/input/trigger/value", hands[hand]);
+        state.ids.trigger_value[hand] = id(path);
+        std::snprintf(path, sizeof(path), "/user/hand/%s/input/trigger/touch", hands[hand]);
+        state.ids.trigger_touch[hand] = id(path);
+        std::snprintf(path, sizeof(path), "/user/hand/%s/input/thumbstick/x", hands[hand]);
+        state.ids.stick_x[hand] = id(path);
+        std::snprintf(path, sizeof(path), "/user/hand/%s/input/thumbstick/y", hands[hand]);
+        state.ids.stick_y[hand] = id(path);
+        std::snprintf(path, sizeof(path), "/user/hand/%s/input/thumbstick/click", hands[hand]);
+        state.ids.stick_click[hand] = id(path);
+        std::snprintf(path, sizeof(path), "/user/hand/%s/input/thumbstick/touch", hands[hand]);
+        state.ids.stick_touch[hand] = id(path);
+    }
+}
+
+void update_binary(uint64_t path, bool value) {
+    auto &previous = state.button_states[path];
+    if (previous.tag != ALVR_BUTTON_VALUE_BINARY || previous.binary != value) {
+        previous.tag = ALVR_BUTTON_VALUE_BINARY;
+        previous.binary = value;
+        alvr_send_button(path, previous);
+    }
+}
+
+void update_scalar(uint64_t path, float value) {
+    auto &previous = state.button_states[path];
+    if (previous.tag != ALVR_BUTTON_VALUE_SCALAR ||
+        std::abs(previous.scalar - value) > kButtonEpsilon) {
+        previous.tag = ALVR_BUTTON_VALUE_SCALAR;
+        previous.scalar = value;
+        alvr_send_button(path, previous);
+    }
+}
+
+void clear_controller_buttons(int hand) {
+    if (hand == 0) {
+        update_binary(state.ids.menu, false);
+    }
+    for (int face = 0; face < 2; ++face) {
+        update_binary(state.ids.face_click[hand][face], false);
+        update_binary(state.ids.face_touch[hand][face], false);
+    }
+    update_binary(state.ids.squeeze_click[hand], false);
+    update_scalar(state.ids.squeeze_value[hand], 0.0f);
+    update_binary(state.ids.trigger_click[hand], false);
+    update_scalar(state.ids.trigger_value[hand], 0.0f);
+    update_binary(state.ids.trigger_touch[hand], false);
+    update_scalar(state.ids.stick_x[hand], 0.0f);
+    update_scalar(state.ids.stick_y[hand], 0.0f);
+    update_binary(state.ids.stick_click[hand], false);
+    update_binary(state.ids.stick_touch[hand], false);
+}
+
+void update_controller_buttons(const qiyu_ControllerData &controller, int hand) {
+    if (!controller.isConnect) {
+        if (state.controller_connected[hand]) {
+            clear_controller_buttons(hand);
+        }
+        state.controller_connected[hand] = false;
+        return;
+    }
+
+    state.controller_connected[hand] = true;
+    if (hand == 0) {
+        update_binary(state.ids.menu, controller.button & BT_Home_Menu);
+    }
+    update_binary(state.ids.face_click[hand][0], controller.button & BT_A_X);
+    update_binary(state.ids.face_touch[hand][0], controller.buttonTouch & BT_A_X);
+    update_binary(state.ids.face_click[hand][1], controller.button & BT_B_Y);
+    update_binary(state.ids.face_touch[hand][1], controller.buttonTouch & BT_B_Y);
+    update_binary(state.ids.squeeze_click[hand], controller.button & BT_Grip);
+    update_scalar(state.ids.squeeze_value[hand], controller.gripForce);
+    update_binary(state.ids.trigger_click[hand], controller.button & BT_Trigger);
+    update_scalar(state.ids.trigger_value[hand], controller.triggerForce);
+    update_binary(state.ids.trigger_touch[hand], controller.buttonTouch & BT_Trigger);
+    update_scalar(state.ids.stick_x[hand], controller.joyStickPos.x);
+    update_scalar(state.ids.stick_y[hand], controller.joyStickPos.y);
+    update_binary(state.ids.stick_click[hand], controller.button & BT_JoyStick);
+    update_binary(state.ids.stick_touch[hand], controller.buttonTouch & BT_JoyStick);
+}
+
+void send_view_params() {
+    const auto device = api.get_device_info();
+    const float half_ipd = get_ipd(device) * 0.5f;
+    AlvrViewParams views[kEyeCount]{};
+    views[0].pose.orientation.w = 1.0f;
+    views[1].pose.orientation.w = 1.0f;
+    views[0].pose.position[0] = -half_ipd;
+    views[1].pose.position[0] = half_ipd;
+    views[0].fov = get_fov(device, 0);
+    views[1].fov = get_fov(device, 1);
+    alvr_send_view_params(views);
+}
+
+AlvrDeviceMotion controller_motion(const qiyu_ControllerData &controller,
+                                   int hand, float prediction_seconds) {
+    AlvrDeviceMotion motion{};
+    motion.device_id = state.ids.hands[hand];
+    motion.pose.orientation = {
+        controller.rotation.x,
+        controller.rotation.y,
+        controller.rotation.z,
+        controller.rotation.w,
+    };
+    motion.pose.position[0] = controller.position.x + controller.velocity.x * prediction_seconds;
+    motion.pose.position[1] = controller.position.y + controller.velocity.y * prediction_seconds -
+                              state.tracking_offset.load();
+    motion.pose.position[2] = controller.position.z + controller.velocity.z * prediction_seconds;
+    motion.linear_velocity[0] = controller.velocity.x;
+    motion.linear_velocity[1] = controller.velocity.y;
+    motion.linear_velocity[2] = -controller.velocity.z;
+    motion.angular_velocity[0] = controller.angVelocity.x;
+    motion.angular_velocity[1] = controller.angVelocity.y;
+    motion.angular_velocity[2] = -controller.angVelocity.z;
+    return motion;
+}
+
+void tracking_loop() {
+    JNIEnv *jni_env = nullptr;
+    bool attached_to_jvm = false;
+    if (state.java_vm != nullptr) {
+        const jint get_env_result =
+            state.java_vm->GetEnv(reinterpret_cast<void **>(&jni_env), JNI_VERSION_1_6);
+        if (get_env_result == JNI_EDETACHED) {
+            if (state.java_vm->AttachCurrentThread(&jni_env, nullptr) == JNI_OK) {
+                attached_to_jvm = true;
+            } else {
+                log(ANDROID_LOG_ERROR, "Failed to attach QiYu tracking thread to JVM");
+            }
+        } else if (get_env_result != JNI_OK) {
+            log(ANDROID_LOG_ERROR, "Cannot get JNI environment for QiYu tracking thread: %d",
+                get_env_result);
+        }
+    }
+
+    auto next_tick = std::chrono::steady_clock::now();
+    auto next_slow_update = next_tick;
+
+    while (state.running.load()) {
+        const uint64_t prediction_ns = alvr_get_prediction_offset_ns();
+        const uint64_t target_timestamp_ns = clock_ns() + prediction_ns;
+        const auto head = api.predict_head_pose(static_cast<float>(prediction_ns) / 1e6f);
+
+        std::vector<AlvrDeviceMotion> motions;
+        motions.reserve(3);
+        AlvrDeviceMotion head_motion{};
+        head_motion.device_id = state.ids.head;
+        head_motion.pose = head_pose(head);
+        motions.push_back(head_motion);
+
+        {
+            std::lock_guard lock(state.tracking_mutex);
+            state.tracking_frames.push_front({target_timestamp_ns, head});
+            if (state.tracking_frames.size() > kMaxTrackingFrames) {
+                state.tracking_frames.pop_back();
+            }
+        }
+
+        const bool controller_module_ready = api.is_controller_initialized();
+        if (controller_module_ready) {
+            qiyu_ControllerData controllers[kEyeCount]{};
+            api.get_controller_data(&controllers[0], &controllers[1]);
+            const float prediction_seconds = static_cast<float>(prediction_ns) / 1e9f;
+            for (int hand = 0; hand < kEyeCount; ++hand) {
+                update_controller_buttons(controllers[hand], hand);
+                if (controllers[hand].isConnect) {
+                    motions.push_back(controller_motion(controllers[hand], hand,
+                                                        prediction_seconds));
+                }
+            }
+
+            if (std::chrono::steady_clock::now() >= next_slow_update) {
+                log(ANDROID_LOG_INFO,
+                    "Controllers: module=ready left(connect=%d show=%d pos=%.3f,%.3f,%.3f) "
+                    "right(connect=%d show=%d pos=%.3f,%.3f,%.3f)",
+                    controllers[0].isConnect, controllers[0].isShow,
+                    controllers[0].position.x, controllers[0].position.y,
+                    controllers[0].position.z, controllers[1].isConnect,
+                    controllers[1].isShow, controllers[1].position.x,
+                    controllers[1].position.y, controllers[1].position.z);
+                for (int hand = 0; hand < kEyeCount; ++hand) {
+                    const int battery = controllers[hand].batteryLevel;
+                    if (controllers[hand].isConnect &&
+                        battery != state.last_controller_battery[hand]) {
+                        const float gauge = battery <= 1 ? static_cast<float>(battery)
+                                                         : static_cast<float>(battery) / 100.0f;
+                        alvr_send_battery(state.ids.hands[hand],
+                                          std::clamp(gauge, 0.0f, 1.0f), false);
+                        state.last_controller_battery[hand] = battery;
+                    }
+                }
+            }
+        } else {
+            if (std::chrono::steady_clock::now() >= next_slow_update) {
+                log(ANDROID_LOG_WARN, "Controllers: module=not-ready");
+            }
+            for (int hand = 0; hand < kEyeCount; ++hand) {
+                if (state.controller_connected[hand]) {
+                    clear_controller_buttons(hand);
+                    state.controller_connected[hand] = false;
+                }
+            }
+        }
+
+        alvr_send_tracking(target_timestamp_ns, motions.data(), motions.size(), nullptr, nullptr);
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_slow_update) {
+            send_view_params();
+            next_slow_update = now + std::chrono::seconds(1);
+        }
+        const float rate = std::max(state.refresh_rate.load(), 60.0f) * 3.0f;
+        next_tick += std::chrono::nanoseconds(static_cast<int64_t>(1e9f / rate));
+        std::this_thread::sleep_until(next_tick);
+    }
+
+    if (attached_to_jvm) {
+        state.java_vm->DetachCurrentThread();
+    }
+}
+
+void initialize_decoder(AlvrCodec codec) {
+    if (state.decoder_initialized) {
+        alvr_destroy_decoder();
+    }
+    const uint64_t size = alvr_get_decoder_config(nullptr);
+    std::vector<char> config(size);
+    if (size != 0) {
+        alvr_get_decoder_config(config.data());
+    }
+    const AlvrDecoderConfig decoder_config{
+        codec,
+        false,
+        2.0f,
+        0.9f,
+        nullptr,
+        0,
+        reinterpret_cast<const uint8_t *>(config.data()),
+        size,
+    };
+    alvr_create_decoder(decoder_config);
+    state.decoder_initialized = true;
+}
+
+void start_stream(const StreamingStarted_Body &config) {
+    state.stream_width = config.view_width;
+    state.stream_height = config.view_height;
+    state.refresh_rate.store(config.refresh_rate_hint > 0.0f
+                                 ? config.refresh_rate_hint
+                                 : kDefaultRefreshRate);
+
+    EyeBuffers old[kEyeCount] = {state.stream[0], state.stream[1]};
+    state.stream[0] = {};
+    state.stream[1] = {};
+    if (!create_buffers(state.stream, state.stream_width, state.stream_height)) {
+        state.stream[0] = old[0];
+        state.stream[1] = old[1];
+        return;
+    }
+
+    const uint32_t *textures[kEyeCount] = {
+        state.stream[0].textures.data(), state.stream[1].textures.data()};
+    AlvrStreamConfig renderer_config{};
+    renderer_config.view_resolution_width = state.stream_width;
+    renderer_config.view_resolution_height = state.stream_height;
+    renderer_config.swapchain_textures = textures;
+    renderer_config.swapchain_length = kSwapchainLength;
+    alvr_start_stream_opengl(renderer_config);
+
+    for (auto &eye : old) {
+        glDeleteTextures(kSwapchainLength, eye.textures.data());
+    }
+
+    api.post_eye_buffer_size(state.stream_width, state.stream_height);
+    send_view_params();
+    alvr_send_active_interaction_profile(state.ids.hands[0], state.ids.profile);
+    alvr_send_active_interaction_profile(state.ids.hands[1], state.ids.profile);
+    const auto boundary = api.get_boundary_dimensions();
+    alvr_send_playspace(std::max(0.0f, boundary.x * 2.0f),
+                        std::max(0.0f, boundary.z * 2.0f));
+    state.streaming.store(true);
+}
+
+void stop_stream() {
+    state.streaming.store(false);
+    if (state.decoder_initialized) {
+        alvr_destroy_decoder();
+        state.decoder_initialized = false;
+    }
+}
+
+void poll_core_events() {
+    AlvrEvent event{};
+    while (alvr_poll_event(&event)) {
+        switch (event.tag) {
+        case ALVR_EVENT_HUD_MESSAGE_UPDATED: {
+            const uint64_t size = alvr_hud_message(nullptr);
+            std::vector<char> message(size);
+            if (size != 0) {
+                alvr_hud_message(message.data());
+                alvr_update_hud_message_opengl(message.data());
+            }
+            break;
+        }
+        case ALVR_EVENT_STREAMING_STARTED:
+            start_stream(event.STREAMING_STARTED);
+            break;
+        case ALVR_EVENT_STREAMING_STOPPED:
+            stop_stream();
+            break;
+        case ALVR_EVENT_HAPTICS: {
+            const int hand = event.HAPTICS.device_id == state.ids.hands[1] ||
+                                     event.HAPTICS.device_id == state.ids.haptics[1]
+                                 ? 1
+                                 : 0;
+            const auto mask = hand == 0 ? qiyu_ControllerMask::CM_Left
+                                        : qiyu_ControllerMask::CM_Right;
+            api.start_vibration(mask,
+                std::clamp(event.HAPTICS.amplitude, 0.0f, 1.0f),
+                std::max(event.HAPTICS.duration_s, 0.0f));
+            break;
+        }
+        case ALVR_EVENT_DECODER_CONFIG:
+            initialize_decoder(event.DECODER_CONFIG.codec);
+            break;
+        case ALVR_EVENT_REAL_TIME_CONFIG:
+            break;
+        }
+    }
+}
+
+qiyu_HeadPoseState tracking_for_timestamp(uint64_t timestamp_ns) {
+    std::lock_guard lock(state.tracking_mutex);
+    for (const auto &[tracking_timestamp, tracking] : state.tracking_frames) {
+        if (tracking_timestamp <= timestamp_ns) {
+            return tracking;
+        }
+    }
+    return api.predict_head_pose(api.predict_display_time());
+}
+
+void fill_frame_layers(qiyu_FrameParam &frame, EyeBuffers (&buffers)[kEyeCount]) {
+    for (int eye = 0; eye < kEyeCount; ++eye) {
+        auto &layer = frame.renderLayers[eye];
+        layer.imageHandle = static_cast<int32_t>(buffers[eye].textures[buffers[eye].index]);
+        layer.imageType = TT_Texture;
+        fill_layout(layer.imageCoords);
+        layer.eyeMask = eye == 0 ? RL_EyeMask_Left : RL_EyeMask_Right;
+        buffers[eye].index = (buffers[eye].index + 1) % kSwapchainLength;
+    }
+}
+
+bool render_stream(qiyu_FrameParam &frame) {
+    uint64_t timestamp_ns = 0;
+    void *hardware_buffer = nullptr;
+    if (!state.decoder_initialized ||
+        !alvr_get_frame(&timestamp_ns, &hardware_buffer)) {
+        return false;
+    }
+
+    auto tracking = tracking_for_timestamp(timestamp_ns);
+    AlvrViewParams input_views[kEyeCount]{};
+    alvr_report_compositor_start(timestamp_ns, input_views);
+    const auto current_orientation =
+        head_orientation(api.predict_head_pose(api.predict_display_time()).pose.rotation);
+    AlvrStreamViewParams views[kEyeCount]{};
+    for (int eye = 0; eye < kEyeCount; ++eye) {
+        views[eye].swapchain_index = state.stream[eye].index;
+        views[eye].reprojection_rotation =
+            alvr_rotation_delta(input_views[eye].pose.orientation, current_orientation);
+        views[eye].fov = input_views[eye].fov;
+    }
+
+    api.start_eye(false, EYE_Left, TT_Texture);
+    api.start_eye(false, EYE_Right, TT_Texture);
+    alvr_render_stream_opengl(hardware_buffer, views);
+    api.end_eye(false, EYE_Left, TT_Texture);
+    api.end_eye(false, EYE_Right, TT_Texture);
+
+    const float vsync_queue_ms = api.predict_display_time();
+    alvr_report_submit(timestamp_ns,
+                       static_cast<uint64_t>(std::max(0.0f, vsync_queue_ms) * 1e6f));
+    fill_frame_layers(frame, state.stream);
+    frame.headPoseState = tracking;
+    return true;
+}
+
+void render_lobby(qiyu_FrameParam &frame) {
+    const auto device = api.get_device_info();
+    const auto tracking = api.predict_head_pose(api.predict_display_time());
+    qiyu_Matrix4 view_matrices[kEyeCount]{};
+    float tracking_offset = state.tracking_offset.load();
+    api.get_view_matrix(view_matrices[0], view_matrices[1], tracking_offset, tracking,
+                        device.frustumLeftEye.rotation,
+                        device.frustumRightEye.rotation);
+    state.tracking_offset.store(tracking_offset);
+
+    AlvrLobbyViewParams views[kEyeCount]{};
+    for (int eye = 0; eye < kEyeCount; ++eye) {
+        const auto inverse = matrix_inverse(view_matrices[eye]);
+        views[eye].swapchain_index = state.lobby[eye].index;
+        views[eye].pose.orientation = head_orientation(tracking.pose.rotation);
+        views[eye].pose.position[0] = -inverse.M[0][3];
+        views[eye].pose.position[1] = -inverse.M[1][3] - tracking_offset;
+        views[eye].pose.position[2] = -inverse.M[2][3];
+        views[eye].fov = get_fov(device, eye);
+    }
+
+    api.start_eye(false, EYE_Left, TT_Texture);
+    api.start_eye(false, EYE_Right, TT_Texture);
+    alvr_render_lobby_opengl(views, true);
+    api.end_eye(false, EYE_Left, TT_Texture);
+    api.end_eye(false, EYE_Right, TT_Texture);
+    fill_frame_layers(frame, state.lobby);
+    frame.headPoseState = tracking;
+}
+
+} // namespace
+
+extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
+    if (state.initialized.load()) {
+        return true;
+    }
+    state.activity = static_cast<jobject>(activity);
+    state.java_vm = static_cast<JavaVM *>(java_vm);
+    if (!api.load()) {
+        api.unload();
+        return false;
+    }
+    if (!initialize_egl()) {
+        destroy_egl();
+        api.unload();
+        return false;
+    }
+    if (!api.init(state.activity, state.java_vm, qiyu_GraphicsApi::GA_OpenGLES,
+                  qiyu_TrackingOriginMode::TM_Ground, false)) {
+        log(ANDROID_LOG_ERROR, "qiyu_Init failed");
+        destroy_egl();
+        api.unload();
+        return false;
+    }
+
+    const auto device = api.get_device_info();
+    state.view_width = std::max(device.iEyeTargetWidth, 1);
+    state.view_height = std::max(device.iEyeTargetHeight, 1);
+    const float refresh_rates[] = {72.0f, 90.0f};
+    const AlvrClientCapabilities capabilities{
+        state.view_width,
+        state.view_height,
+        refresh_rates,
+        2,
+        true,
+        true,
+        true,
+        false,
+        false,
+        true,
+        1.0f,
+        false,
+    };
+    alvr_initialize_android_context(java_vm, activity);
+    alvr_initialize(capabilities);
+    alvr_initialize_opengl();
+    initialize_ids();
+    api.post_eye_buffer_size(state.view_width, state.view_height);
+    state.initialized.store(true);
+    log(ANDROID_LOG_INFO, "QiYu backend initialized at %ux%u", state.view_width,
+        state.view_height);
+    return true;
+}
+
+extern "C" bool alvr_qiyu_start(void *native_window) {
+    if (!state.initialized.load() || state.running.load() || native_window == nullptr) {
+        return state.running.load();
+    }
+    state.window = static_cast<ANativeWindow *>(native_window);
+    if (!api.start_vr(state.window, PL_System, PL_System)) {
+        log(ANDROID_LOG_ERROR, "qiyu_StartVR failed");
+        state.window = nullptr;
+        return false;
+    }
+    api.set_tracking_origin(qiyu_TrackingOriginMode::TM_Ground);
+    if (!create_buffers(state.lobby, state.view_width, state.view_height)) {
+        api.end_vr();
+        state.window = nullptr;
+        return false;
+    }
+    const uint32_t *textures[kEyeCount] = {
+        state.lobby[0].textures.data(), state.lobby[1].textures.data()};
+    alvr_resume_opengl(state.view_width, state.view_height, textures,
+                       kSwapchainLength);
+    api.post_eye_buffer_size(state.view_width, state.view_height);
+    state.last_frame_time_ns = clock_ns();
+    state.running.store(true);
+    state.tracking_thread = std::thread(tracking_loop);
+    alvr_resume();
+    return true;
+}
+
+extern "C" void alvr_qiyu_stop() {
+    if (!state.running.exchange(false)) {
+        return;
+    }
+    if (state.tracking_thread.joinable()) {
+        state.tracking_thread.join();
+    }
+    stop_stream();
+    for (int hand = 0; hand < kEyeCount; ++hand) {
+        clear_controller_buttons(hand);
+        api.stop_vibration(hand == 0 ? qiyu_ControllerMask::CM_Left
+                         : qiyu_ControllerMask::CM_Right);
+    }
+    alvr_pause();
+    alvr_pause_opengl();
+    destroy_buffers(state.stream);
+    destroy_buffers(state.lobby);
+    {
+        std::lock_guard lock(state.tracking_mutex);
+        state.tracking_frames.clear();
+    }
+    api.end_vr();
+    state.window = nullptr;
+}
+
+extern "C" void alvr_qiyu_render_frame() {
+    if (!state.running.load()) {
+        return;
+    }
+    poll_core_events();
+
+    const uint64_t now_ns = clock_ns();
+    const float delta_seconds = state.last_frame_time_ns == 0
+                                    ? 0.0f
+                                    : static_cast<float>(now_ns - state.last_frame_time_ns) / 1e9f;
+    state.last_frame_time_ns = now_ns;
+    api.update(std::clamp(delta_seconds, 0.0f, 0.1f));
+
+    qiyu_FrameParam frame{};
+    frame.minVsyncs = 1;
+    if (state.streaming.load()) {
+        if (!render_stream(frame)) {
+            return;
+        }
+    } else {
+        render_lobby(frame);
+    }
+    if (!api.submit_frame(frame)) {
+        log(ANDROID_LOG_WARN, "qiyu_SubmitFrame failed");
+    }
+}
+
+extern "C" void alvr_qiyu_destroy() {
+    if (!state.initialized.exchange(false)) {
+        return;
+    }
+    alvr_qiyu_stop();
+    api.release();
+    alvr_destroy_opengl();
+    alvr_destroy();
+    destroy_egl();
+    api.unload();
+}

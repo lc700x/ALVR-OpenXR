@@ -153,7 +153,15 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         if pc.passthrough_mode == 3 { // HSV mode
             current = rgb_to_hsv(color);
         }
-        let mask = chroma_key_mask(current);
+        let raw_mask = chroma_key_mask(current);
+
+        // H.264/HEVC YUV420 spreads green matte chroma into foreground edges.
+        // Tighten the key, then remove every green-channel excess before
+        // premultiplication. Chroma-key mode already reserves green as the
+        // transparent color; this guarantees no green-dominant halo survives.
+        let mask = smoothstep(0.04, 0.16, raw_mask);
+        let green_spill = max(color.g - max(color.r, color.b), 0.0);
+        color.g = max(color.g - green_spill, 0.0);
 
         // Note: because of this calculation, we require premultiplied alpha option in the XR layer
         color = max(color * mask, vec3f(0.0));
