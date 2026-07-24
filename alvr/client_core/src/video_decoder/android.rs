@@ -201,34 +201,29 @@ fn decoder_lifecycle(
 ) -> Result<()> {
     // 2x: keep the target buffering in the middle of the max amount of queuable frames
     let available_buffering_frames = (2. * config.max_buffering_frames).ceil() as usize;
-    let is_hvr = alvr_system_info::platform() == alvr_system_info::Platform::Hvr;
+    let acquired_frame_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     image_reader.set_image_listener(Box::new({
         let image_queue = Arc::clone(&image_queue);
+        let acquired_frame_count = Arc::clone(&acquired_frame_count);
         move |image_reader| {
             let mut image_queue_lock = image_queue.lock();
-
-            if is_hvr {
-                // Huawei exposes only two consumer images. Keep the image currently rendered,
-                // but drop every older unconsumed image before acquiring the newest decoder frame.
-                while image_queue_lock.back().is_some_and(|image| !image.in_use) {
-                    image_queue_lock.pop_back();
-                }
-            }
 
             if image_queue_lock.len() > available_buffering_frames {
                 warn!("Video frame queue overflow!");
                 image_queue_lock.pop_front();
             }
 
-            let result = if is_hvr {
-                image_reader.acquire_latest_image()
-            } else {
-                image_reader.acquire_next_image()
-            };
+            let result = image_reader.acquire_next_image();
             match result {
                 Ok(AcquireResult::Image(image)) => {
                     let timestamp = Duration::from_nanos(image.timestamp().unwrap() as u64);
+
+                    let n =
+                        acquired_frame_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n == 1 || n % 120 == 0 {
+                        info!("[HVR-DIAG] decoder frames acquired by consumer: {n}");
+                    }
 
                     if let Some(callback) = frame_result_callback.upgrade() {
                         callback(Ok(timestamp));
