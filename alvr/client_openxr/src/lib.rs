@@ -422,6 +422,7 @@ pub fn entry_point() {
             .select_sources(&lobby_interaction_sources);
 
         let mut logged_first_frame = false;
+        let mut hvr_stream_frame_diag_count: u32 = 0;
         let mut stream_context = None::<StreamContext>;
         let environment_blend_mode = environment_blend_mode(platform);
 
@@ -604,6 +605,18 @@ pub fn entry_point() {
             } else {
                 xr_frame_stream.begin()
             };
+
+            // Visible (error-level) diagnostic for the first stream frames: info! is filtered out
+            // of Huawei's logcat, so use error! to confirm whether the stream frame loop stalls in
+            // wait/begin. Rate-limited to the first frames after streaming starts.
+            if is_hvr && stream_context.is_some() && hvr_stream_frame_diag_count < 10 {
+                hvr_stream_frame_diag_count += 1;
+                error!(
+                    "[HVR-DIAG] stream frame {hvr_stream_frame_diag_count}: should_render={}, begin_result={begin_result:?}",
+                    frame_state.should_render
+                );
+            }
+
             match begin_result {
                 Ok(()) => {}
                 Err(e) if is_hvr => {
@@ -632,7 +645,14 @@ pub fn entry_point() {
 
             // todo: allow rendering lobby and stream layers at the same time and add cross fade
             let (layer, display_time) = if let Some(stream) = &mut stream_context {
-                stream.render(frame_interval, vsync_time)
+                if is_hvr && hvr_stream_frame_diag_count < 10 {
+                    error!("[HVR-DIAG] entering stream.render (frame diag {hvr_stream_frame_diag_count})");
+                }
+                let out = stream.render(frame_interval, vsync_time);
+                if is_hvr && hvr_stream_frame_diag_count < 10 {
+                    error!("[HVR-DIAG] returned from stream.render (frame diag {hvr_stream_frame_diag_count})");
+                }
+                out
             } else {
                 (lobby.render(vsync_time), vsync_time)
             };
