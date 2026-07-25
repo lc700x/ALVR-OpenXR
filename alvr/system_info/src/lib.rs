@@ -143,7 +143,9 @@ fn android_platform(manufacturer: &str, model: &str, device: &str, product: &str
         ("Play For Dream", _, _, _) => Platform::PlayForDreamMR,
         ("Lynx Mixed Reality", _, _, _) => Platform::Lynx,
         ("HUAWEI" | "Huawei", _, _, _) => Platform::Hvr,
-        (_, "iQIYI-A5" | "iQIYI-A6-B", _, _) => Platform::Qiyu,
+        ("iQIYI", "A091", _, _)
+        | (_, "iQIYI-A5" | "iQIYI-A6-B", _, _)
+        | (_, _, _, "kona") => Platform::Qiyu,
         _ => Platform::AndroidUnknown,
     }
 }
@@ -214,6 +216,7 @@ mod tests {
         assert!(android_platform("HUAWEI", "", "", "") == Platform::Hvr);
         assert!(android_platform("", "iQIYI-A5", "", "") == Platform::Qiyu);
         assert!(android_platform("", "iQIYI-A6-B", "", "") == Platform::Qiyu);
+        assert!(android_platform("iQIYI", "A091", "kona", "kona") == Platform::Qiyu);
     }
 }
 
