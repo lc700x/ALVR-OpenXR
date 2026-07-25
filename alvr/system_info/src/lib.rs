@@ -120,7 +120,21 @@ impl Display for Platform {
 }
 
 #[cfg(any(target_os = "android", test))]
+fn has_qiyu_keyword(value: &str) -> bool {
+    let upper = value.to_ascii_uppercase();
+    upper.contains("IQIYI") || upper.contains("QIYU")
+}
+
+#[cfg(any(target_os = "android", test))]
 fn android_platform(manufacturer: &str, model: &str, device: &str, product: &str) -> Platform {
+    if has_qiyu_keyword(manufacturer)
+        || has_qiyu_keyword(model)
+        || has_qiyu_keyword(device)
+        || has_qiyu_keyword(product)
+    {
+        return Platform::Qiyu;
+    }
+
     match (manufacturer, model, device, product) {
         ("Oculus", _, "monterey", _) => Platform::Quest1,
         ("Oculus", _, "hollywood", _) => Platform::Quest2,
@@ -143,9 +157,6 @@ fn android_platform(manufacturer: &str, model: &str, device: &str, product: &str
         ("Play For Dream", _, _, _) => Platform::PlayForDreamMR,
         ("Lynx Mixed Reality", _, _, _) => Platform::Lynx,
         ("HUAWEI" | "Huawei", _, _, _) => Platform::Hvr,
-        ("iQIYI", "A091", _, _)
-        | (_, "iQIYI-A5" | "iQIYI-A6-B", _, _)
-        | (_, _, _, "kona") => Platform::Qiyu,
         _ => Platform::AndroidUnknown,
     }
 }
@@ -217,6 +228,8 @@ mod tests {
         assert!(android_platform("", "iQIYI-A5", "", "") == Platform::Qiyu);
         assert!(android_platform("", "iQIYI-A6-B", "", "") == Platform::Qiyu);
         assert!(android_platform("iQIYI", "A091", "kona", "kona") == Platform::Qiyu);
+        assert!(android_platform("QiyuVR", "", "", "") == Platform::Qiyu);
+        assert!(android_platform("", "", "device-qiyu-test", "") == Platform::Qiyu);
     }
 }
 
