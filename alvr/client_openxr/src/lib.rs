@@ -489,7 +489,28 @@ pub fn entry_point() {
                     }
                     xr::Event::InteractionProfileChanged(_)
                     | xr::Event::PassthroughStateChangedFB(_) => {
-                        // todo
+                        // Log the newly activated interaction profile per hand. On QiYu this
+                        // surfaces the runtime's real /interaction_profiles/... path so controller
+                        // bindings can be matched precisely.
+                        for (hand_name, hand_path) in
+                            [("left", "/user/hand/left"), ("right", "/user/hand/right")]
+                        {
+                            if let Ok(top_level) = xr_instance.string_to_path(hand_path) {
+                                match xr_session.current_interaction_profile(top_level) {
+                                    Ok(profile_path) => {
+                                        let profile_str = xr_instance
+                                            .path_to_string(profile_path)
+                                            .unwrap_or_else(|_| "<unknown>".into());
+                                        info!(
+                                            "[PROFILE-DIAG] {hand_name} hand interaction profile changed to: '{profile_str}'"
+                                        );
+                                    }
+                                    Err(error) => info!(
+                                        "[PROFILE-DIAG] {hand_name} hand profile query failed: {error}"
+                                    ),
+                                }
+                            }
+                        }
                     }
                     _ => (),
                 }
@@ -734,7 +755,10 @@ fn android_main(app: android_activity::AndroidApp) {
     alvr_client_core::init_logging();
 
     let platform = alvr_system_info::platform();
-    if platform == Platform::Qiyu {
+    // Only legacy QiYu headsets (A5/A6-B) use the native SXR backend. Newer QiYu
+    // devices (e.g. A091/kona) ship a generic OpenXR runtime; initializing the SXR
+    // SDK on them crashes, so they must fall through to the standard OpenXR path.
+    if platform == Platform::Qiyu && alvr_system_info::qiyu_uses_native_sxr() {
         qiyu::entry_point(app);
         return;
     }

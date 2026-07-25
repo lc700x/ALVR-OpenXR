@@ -161,6 +161,20 @@ fn android_platform(manufacturer: &str, model: &str, device: &str, product: &str
     }
 }
 
+// Legacy QiYu headsets (A5, A6-B) only expose the SXR SDK and require the native
+// backend. Newer QiYu headsets (e.g. A091/kona) ship a generic OpenXR runtime and
+// must use the standard OpenXR path instead: initializing the SXR SDK on them crashes.
+#[cfg(any(target_os = "android", test))]
+fn is_legacy_sxr_qiyu(model: &str) -> bool {
+    matches!(model, "iQIYI-A5" | "iQIYI-A6-B")
+}
+
+// Returns true only for legacy QiYu devices that need the native SXR backend.
+#[cfg(target_os = "android")]
+pub fn qiyu_uses_native_sxr() -> bool {
+    is_legacy_sxr_qiyu(android::model_name().as_str())
+}
+
 pub fn platform() -> Platform {
     #[cfg(target_os = "android")]
     {

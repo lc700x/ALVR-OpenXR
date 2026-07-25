@@ -521,6 +521,51 @@ impl InteractionContext {
             bindings_result.unwrap();
         }
 
+        // QiYu's OpenXR runtime (Monado-based) does not activate the Oculus Touch
+        // profile for its physical controllers and exposes no vendor controller
+        // interaction extension, so the suggestion above yields no controller input.
+        // Every conformant runtime must support the Khronos simple controller, which
+        // Monado maps real controllers onto, so additionally suggest those bindings to
+        // recover controller pose, trigger (select) and menu input.
+        if platform == Platform::Qiyu {
+            let mut simple_bindings = vec![
+                binding(&left_grip_action, "/user/hand/left/input/grip/pose"),
+                binding(&right_grip_action, "/user/hand/right/input/grip/pose"),
+                binding(&left_aim_action, "/user/hand/left/input/aim/pose"),
+                binding(&right_aim_action, "/user/hand/right/input/aim/pose"),
+                binding(&left_vibration_action, "/user/hand/left/output/haptic"),
+                binding(&right_vibration_action, "/user/hand/right/output/haptic"),
+            ];
+            if let Some(ButtonAction::Scalar(action)) =
+                button_actions.get(&*LEFT_TRIGGER_VALUE_ID)
+            {
+                simple_bindings.push(binding(action, "/user/hand/left/input/select/click"));
+            }
+            if let Some(ButtonAction::Scalar(action)) =
+                button_actions.get(&*RIGHT_TRIGGER_VALUE_ID)
+            {
+                simple_bindings.push(binding(action, "/user/hand/right/input/select/click"));
+            }
+            if let Some(ButtonAction::Binary(action)) = button_actions.get(&*LEFT_MENU_CLICK_ID) {
+                simple_bindings.push(binding(action, "/user/hand/left/input/menu/click"));
+            }
+            if let Some(ButtonAction::Binary(action)) = button_actions.get(&*RIGHT_SYSTEM_CLICK_ID)
+            {
+                simple_bindings.push(binding(action, "/user/hand/right/input/menu/click"));
+            }
+
+            let res = xr_instance.suggest_interaction_profile_bindings(
+                xr_instance
+                    .string_to_path("/interaction_profiles/khr/simple_controller")
+                    .unwrap(),
+                &simple_bindings,
+            );
+            match res {
+                Ok(()) => info!("[QIYU] khr/simple_controller bindings accepted"),
+                Err(error) => warn!("[QIYU] khr/simple_controller bindings rejected: {error}"),
+            }
+        }
+
         // Pico headsets require calling get_system_properties to test for extensions, because all
         // extensions function pointers are available even if the feature is not supported by the
         // hardware. The full checks are done in supports_eye_gaze_interaction. This is required
@@ -562,6 +607,30 @@ impl InteractionContext {
         };
 
         xr_session.attach_action_sets(&[&action_set]).unwrap();
+
+        // Diagnostic: log the interaction profile the runtime actually activated for each hand.
+        // On QiYu this reveals the real /interaction_profiles/... path (if any) so controller
+        // bindings can be tailored precisely instead of relying on khr/simple_controller.
+        for (hand_name, hand_path) in [
+            ("left", "/user/hand/left"),
+            ("right", "/user/hand/right"),
+        ] {
+            if let Ok(top_level) = xr_instance.string_to_path(hand_path) {
+                match xr_session.current_interaction_profile(top_level) {
+                    Ok(profile_path) => {
+                        let profile_str = xr_instance
+                            .path_to_string(profile_path)
+                            .unwrap_or_else(|_| "<unknown>".into());
+                        info!(
+                            "[PROFILE-DIAG] {hand_name} hand current interaction profile: '{profile_str}'"
+                        );
+                    }
+                    Err(error) => {
+                        info!("[PROFILE-DIAG] {hand_name} hand interaction profile query failed: {error}");
+                    }
+                }
+            }
+        }
 
         // Huawei's legacy runtime can reject controller interaction bindings entirely, which then
         // makes xrCreateActionSpace fail with ERROR_PATH_INVALID and crashes startup (dark screen).
