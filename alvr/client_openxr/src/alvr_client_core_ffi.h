@@ -166,6 +166,7 @@ struct AlvrDecoderConfig {
 };
 
 void alvr_initialize_android_context(void *java_vm, void *context);
+void alvr_initialize_logging();
 void alvr_initialize(AlvrClientCapabilities capabilities);
 void alvr_destroy();
 void alvr_resume();

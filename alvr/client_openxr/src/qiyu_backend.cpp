@@ -691,9 +691,13 @@ void poll_core_events() {
             break;
         }
         case ALVR_EVENT_STREAMING_STARTED:
+            log(ANDROID_LOG_INFO, "event STREAMING_STARTED %ux%u", event.STREAMING_STARTED.view_width,
+                event.STREAMING_STARTED.view_height);
             start_stream(event.STREAMING_STARTED);
+            log(ANDROID_LOG_INFO, "streaming=%d after start_stream", state.streaming.load());
             break;
         case ALVR_EVENT_STREAMING_STOPPED:
+            log(ANDROID_LOG_INFO, "event STREAMING_STOPPED");
             stop_stream();
             break;
         case ALVR_EVENT_HAPTICS: {
@@ -709,6 +713,7 @@ void poll_core_events() {
             break;
         }
         case ALVR_EVENT_DECODER_CONFIG:
+            log(ANDROID_LOG_INFO, "event DECODER_CONFIG codec=%d", event.DECODER_CONFIG.codec);
             initialize_decoder(event.DECODER_CONFIG.codec);
             break;
         case ALVR_EVENT_REAL_TIME_CONFIG:
@@ -743,7 +748,17 @@ bool render_stream(qiyu_FrameParam &frame) {
     void *hardware_buffer = nullptr;
     if (!state.decoder_initialized ||
         !alvr_get_frame(&timestamp_ns, &hardware_buffer)) {
+        static int miss_log = 0;
+        if ((miss_log++ % 72) == 0) {
+            log(ANDROID_LOG_WARN, "render_stream skip: decoder_init=%d get_frame_failed",
+                state.decoder_initialized);
+        }
         return false;
+    }
+    static int hit_log = 0;
+    if ((hit_log++ % 72) == 0) {
+        log(ANDROID_LOG_INFO, "render_stream frame ts=%llu buf=%p",
+            (unsigned long long)timestamp_ns, hardware_buffer);
     }
 
     auto tracking = tracking_for_timestamp(timestamp_ns);
@@ -809,6 +824,10 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     if (state.initialized.load()) {
         return true;
     }
+    // Initialize ALVR core logging so connection/streaming events are visible in logcat. Without
+    // this, alvr_common::info!/error! produce no output (the OpenXR path calls init_logging in
+    // Rust; the SXR path never did), leaving connection failures invisible.
+    alvr_initialize_logging();
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.java_vm = static_cast<JavaVM *>(java_vm);
 
