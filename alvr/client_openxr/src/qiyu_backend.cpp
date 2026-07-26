@@ -809,8 +809,38 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
         return true;
     }
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
-    state.activity = static_cast<jobject>(activity);
     state.java_vm = static_cast<JavaVM *>(java_vm);
+
+    // The official ALVR-QIYU attaches the calling thread to the JVM (getOvrJava(true) ->
+    // AttachCurrentThread) and passes a GLOBAL ref activity (NewGlobalRef in initializeNative)
+    // BEFORE qiyu_Init. QVR_Init dereferences the JNIEnv of the current thread and the activity
+    // object; without an attached thread / global ref it crashes with SIGSEGV at addr 0x0.
+    JNIEnv *jni_env = nullptr;
+    if (state.java_vm != nullptr) {
+        jint get_env = state.java_vm->GetEnv(reinterpret_cast<void **>(&jni_env), JNI_VERSION_1_6);
+        if (get_env == JNI_EDETACHED) {
+            JavaVMAttachArgs args{JNI_VERSION_1_6, "alvr_qiyu_main", nullptr};
+            if (state.java_vm->AttachCurrentThread(&jni_env, &args) != JNI_OK) {
+                log(ANDROID_LOG_ERROR, "init step 1b: AttachCurrentThread FAILED");
+                jni_env = nullptr;
+            } else {
+                log(ANDROID_LOG_INFO, "init step 1b: AttachCurrentThread ok");
+            }
+        } else {
+            log(ANDROID_LOG_INFO, "init step 1b: thread already attached (env=%p)", jni_env);
+        }
+    }
+
+    // Promote the activity to a global reference so QVR_Init can safely hold it.
+    jobject activity_local = static_cast<jobject>(activity);
+    if (jni_env != nullptr && activity_local != nullptr) {
+        state.activity = jni_env->NewGlobalRef(activity_local);
+        log(ANDROID_LOG_INFO, "init step 1c: activity global ref=%p", state.activity);
+    } else {
+        state.activity = activity_local;
+        log(ANDROID_LOG_WARN, "init step 1c: using activity as-is (no env)");
+    }
+
     if (!api.load()) {
         log(ANDROID_LOG_ERROR, "init step 2: api.load() FAILED");
         api.unload();
