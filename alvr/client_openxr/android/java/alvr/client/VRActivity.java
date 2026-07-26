@@ -6,6 +6,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.BatteryManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -18,16 +19,31 @@ import android.view.WindowManager;
 
 import java.util.concurrent.Semaphore;
 
-// Official-style ALVR QiYu VR activity. The QiYu SXR SDK (qiyu_Init -> QVR_Init)
-// must be driven from a real Android Activity on a dedicated rendering thread; a
-// NativeActivity's android_main thread crashes it. The native methods are
-// implemented in libalvr_client_openxr.so (Java_alvr_client_VRActivity_*).
+// Official-style ALVR QiYu VR activity. The QiYu SXR SDK (qiyu_Init -> QVR_Init) must be
+// driven from a real Android Activity on a dedicated rendering thread; a NativeActivity's
+// android_main thread crashes it. The native methods are implemented in
+// libalvr_client_openxr.so (Java_alvr_client_VRActivity_*).
+//
+// This is a single universal APK. VRActivity is the launcher, but only QiYu devices use the
+// SXR path here: on any other device it immediately delegates to android.app.NativeActivity
+// (the standard OpenXR path) and finishes, so Quest/Pico/HVR/YVR behaviour is unchanged.
 public class VRActivity extends Activity {
     static {
         System.loadLibrary("alvr_client_openxr");
     }
 
     static final String TAG = "VRActivity";
+
+    static boolean isQiyu() {
+        String m = (Build.MANUFACTURER == null ? "" : Build.MANUFACTURER).toUpperCase();
+        String mo = (Build.MODEL == null ? "" : Build.MODEL).toUpperCase();
+        String d = (Build.DEVICE == null ? "" : Build.DEVICE).toUpperCase();
+        String p = (Build.PRODUCT == null ? "" : Build.PRODUCT).toUpperCase();
+        return m.contains("IQIYI") || m.contains("QIYU")
+                || mo.contains("IQIYI") || mo.contains("QIYU")
+                || d.contains("IQIYI") || d.contains("QIYU")
+                || p.contains("IQIYI") || p.contains("QIYU");
+    }
 
     class RenderingCallbacks implements SurfaceHolder.Callback {
         @Override
@@ -69,6 +85,17 @@ public class VRActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        // Non-QiYu devices: delegate to the standard NativeActivity (OpenXR) and exit.
+        if (!isQiyu()) {
+            Log.i(TAG, "Non-QiYu device, delegating to NativeActivity (OpenXR path).");
+            Intent intent = new Intent();
+            intent.setClassName(getPackageName(), "android.app.NativeActivity");
+            intent.addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION);
+            startActivity(intent);
+            finish();
+            return;
+        }
+
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
         requestWindowFeature(Window.FEATURE_NO_TITLE);
@@ -91,6 +118,9 @@ public class VRActivity extends Activity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        if (mRenderingHandler == null) {
+            return; // delegated path, nothing to tear down
+        }
         final Semaphore sem = new Semaphore(1);
         try {
             sem.acquire();
@@ -114,6 +144,9 @@ public class VRActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        if (mRenderingHandler == null) {
+            return; // delegated path
+        }
         mResumed = true;
         maybeResume();
     }
@@ -129,8 +162,10 @@ public class VRActivity extends Activity {
 
     @Override
     protected void onPause() {
-        maybePause();
-        mResumed = false;
+        if (mRenderingHandler != null) {
+            maybePause();
+            mResumed = false;
+        }
         super.onPause();
     }
 

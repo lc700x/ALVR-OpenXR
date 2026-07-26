@@ -569,6 +569,106 @@ fn add_android_vendor_runtime(sh: &Shell, apk_path: &Path, profile: Profile, key
     cmd!(sh, "{apksigner} sign --ks {keystore_path} --ks-pass pass:alvrclient --out {signed_apk} {aligned_apk}")
         .run()
         .unwrap();
+
+    // Activate the QiYu VRActivity as the launcher via apktool (the binary AndroidManifest.xml
+    // cannot be edited with aapt). VRActivity delegates to NativeActivity on non-QiYu devices,
+    // so this remains a single universal APK. Skipped (with a warning) if apktool.jar is absent.
+    let apktool_jar = afs::workspace_dir().join("build/tools/apktool.jar");
+    if apktool_jar.exists() {
+        let decoded_dir = work_dir.join("apktool_decoded");
+        sh.remove_path(&decoded_dir).ok();
+        cmd!(
+            sh,
+            "{java} -jar {apktool_jar} d -s -f {signed_apk} -o {decoded_dir}"
+        )
+        .run()
+        .unwrap();
+
+        let manifest_path = decoded_dir.join("AndroidManifest.xml");
+        let manifest = fs::read_to_string(&manifest_path).unwrap();
+        let native_activity_open = concat!(
+            "<activity android:configChanges=\"density|keyboard|keyboardHidden|navigation|",
+            "orientation|screenLayout|screenSize|uiMode\" android:exported=\"true\" ",
+            "android:launchMode=\"singleTask\" android:name=\"android.app.NativeActivity\" ",
+            "android:screenOrientation=\"landscape\">"
+        );
+        // Insert a VRActivity launcher that mirrors the NativeActivity intent-filters, and demote
+        // the NativeActivity so it no longer advertises itself as the launcher.
+        let vractivity_block = concat!(
+            "<activity android:configChanges=\"density|keyboard|keyboardHidden|navigation|",
+            "orientation|screenLayout|screenSize|uiMode\" android:exported=\"true\" ",
+            "android:launchMode=\"singleTask\" android:name=\"alvr.client.VRActivity\" ",
+            "android:screenOrientation=\"landscape\">",
+            "<intent-filter>",
+            "<action android:name=\"android.intent.action.MAIN\"/>",
+            "<category android:name=\"android.intent.category.LAUNCHER\"/>",
+            "<category android:name=\"com.oculus.intent.category.VR\"/>",
+            "<category android:name=\"com.yvr.intent.category.VR\"/>",
+            "<category android:name=\"org.khronos.openxr.intent.category.IMMERSIVE_HMD\"/>",
+            "</intent-filter>",
+            "<intent-filter>",
+            "<action android:name=\"com.huawei.android.vr.action.MAIN\"/>",
+            "<category android:name=\"android.intent.category.DEFAULT\"/>",
+            "</intent-filter>",
+            "</activity>",
+            "<activity android:configChanges=\"density|keyboard|keyboardHidden|navigation|",
+            "orientation|screenLayout|screenSize|uiMode\" android:exported=\"true\" ",
+            "android:launchMode=\"singleTask\" android:name=\"android.app.NativeActivity\" ",
+            "android:screenOrientation=\"landscape\">"
+        );
+        assert!(
+            manifest.contains(native_activity_open),
+            "NativeActivity declaration not found in decoded manifest; apktool output changed"
+        );
+        // Replace only the opening tag: prepend VRActivity block, then strip NativeActivity's
+        // launcher intent-filters (which now belong to VRActivity) while keeping the lib_name.
+        let manifest = manifest.replacen(native_activity_open, vractivity_block, 1);
+        let native_launcher_filters = concat!(
+            "<meta-data android:name=\"android.app.lib_name\" ",
+            "android:value=\"alvr_client_openxr\"/>",
+            "\n            <intent-filter>\n",
+            "                <action android:name=\"android.intent.action.MAIN\"/>\n",
+            "                <category android:name=\"android.intent.category.LAUNCHER\"/>\n",
+            "                <category android:name=\"com.oculus.intent.category.VR\"/>\n",
+            "                <category android:name=\"com.yvr.intent.category.VR\"/>\n",
+            "                <category android:name=\"org.khronos.openxr.intent.category.IMMERSIVE_HMD\"/>\n",
+            "            </intent-filter>\n",
+            "            <intent-filter>\n",
+            "                <action android:name=\"com.huawei.android.vr.action.MAIN\"/>\n",
+            "                <category android:name=\"android.intent.category.DEFAULT\"/>\n",
+            "            </intent-filter>"
+        );
+        let native_lib_only =
+            "<meta-data android:name=\"android.app.lib_name\" android:value=\"alvr_client_openxr\"/>";
+        let manifest = if manifest.contains(native_launcher_filters) {
+            manifest.replacen(native_launcher_filters, native_lib_only, 1)
+        } else {
+            manifest
+        };
+        fs::write(&manifest_path, manifest).unwrap();
+
+        let rebuilt_apk = work_dir.join("alvr_client_qiyu_vractivity_unsigned.apk");
+        cmd!(
+            sh,
+            "{java} -jar {apktool_jar} b {decoded_dir} -o {rebuilt_apk} --use-aapt2"
+        )
+        .run()
+        .unwrap();
+        let vractivity_aligned = work_dir.join("alvr_client_qiyu_vractivity_aligned.apk");
+        cmd!(sh, "{zipalign} -f 4 {rebuilt_apk} {vractivity_aligned}")
+            .run()
+            .unwrap();
+        cmd!(sh, "{apksigner} sign --ks {keystore_path} --ks-pass pass:alvrclient --out {signed_apk} {vractivity_aligned}")
+            .run()
+            .unwrap();
+    } else {
+        println!(
+            "cargo:warning=apktool.jar not found at {}; QiYu VRActivity launcher not activated \
+             (A091 will use the OpenXR path without ABXY/thumbstick)",
+            apktool_jar.display()
+        );
+    }
+
     fs::copy(signed_apk, apk_path).unwrap();
 }
 
