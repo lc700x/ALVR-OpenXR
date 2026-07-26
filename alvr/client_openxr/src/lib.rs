@@ -755,10 +755,13 @@ fn android_main(app: android_activity::AndroidApp) {
     alvr_client_core::init_logging();
 
     let platform = alvr_system_info::platform();
-    // Diagnostic build: route ALL QiYu devices (including A091/kona) to the native SXR
-    // backend to capture the real crash and match the official ALVR-QIYU which reads full
-    // controller input (ABXY/thumbstick) via qiyu_GetControllerData.
-    if platform == Platform::Qiyu {
+    // A091/kona's native SXR path crashes inside QVR_Init because the QiYu SDK requires the
+    // official Java VRActivity architecture (custom Activity + SurfaceView + HandlerThread),
+    // which this NativeActivity-based client does not provide. Confirmed by tombstone:
+    //   #00 QVR_Init+200 libqiyivrsdkcore.so (null deref)  #01 qiyu_Init libqiyuapi.so
+    // So only legacy SXR headsets (A5/A6-B) use the native backend; A091 falls through to the
+    // working OpenXR path (video + ray-following controller via khr/simple_controller).
+    if platform == Platform::Qiyu && alvr_system_info::qiyu_uses_native_sxr() {
         qiyu::entry_point(app);
         return;
     }
