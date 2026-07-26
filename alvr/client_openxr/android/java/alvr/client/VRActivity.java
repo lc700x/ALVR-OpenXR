@@ -45,6 +45,19 @@ public class VRActivity extends Activity {
                 || p.contains("IQIYI") || p.contains("QIYU");
     }
 
+    // Load a QiYu SXR native library via System.loadLibrary so the Android runtime invokes its
+    // JNI_OnLoad. QVR_Init (in libqiyivrsdkcore.so) dereferences globals that are only set up by
+    // that library's JNI_OnLoad; loading it with dlopen from native code does NOT trigger
+    // JNI_OnLoad, which is why QVR_Init crashed with a null-pointer dereference.
+    static void loadQiyuLibrary(String name) {
+        try {
+            System.loadLibrary(name);
+            Log.i(TAG, "loaded QiYu library " + name);
+        } catch (Throwable t) {
+            Log.e(TAG, "loadLibrary " + name + " failed: " + t);
+        }
+    }
+
     class RenderingCallbacks implements SurfaceHolder.Callback {
         @Override
         public void surfaceCreated(SurfaceHolder holder) {
@@ -95,6 +108,14 @@ public class VRActivity extends Activity {
             finish();
             return;
         }
+
+        // Load the QiYu SXR libraries here (QiYu-only) so their JNI_OnLoad runs and initializes
+        // the VRSDKCore globals required by QVR_Init. Order matters: the core/base libraries must
+        // be loaded before qiyuapi, which depends on them.
+        loadQiyuLibrary("qiyivrsdkcore");
+        loadQiyuLibrary("sxrapi");
+        loadQiyuLibrary("ashreader");
+        loadQiyuLibrary("qiyuapi");
 
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
