@@ -7,6 +7,17 @@ unsafe extern "C" {
     fn alvr_qiyu_stop();
     fn alvr_qiyu_render_frame();
     fn alvr_qiyu_destroy();
+    fn alvr_qiyu_register_natives(java_vm: *mut c_void) -> i32;
+}
+
+// Android calls JNI_OnLoad when the shared object is loaded. A C-side JNI_OnLoad only becomes a
+// local symbol in the Rust cdylib (not in the dynamic symbol table), so the loader cannot find
+// it. Defining it here as `#[no_mangle] pub extern "C"` guarantees it lands in the dynamic
+// symbol table. It forwards to the C helper that registers the VRActivity native methods via
+// RegisterNatives, which also anchors those Java_* functions against --gc-sections.
+#[no_mangle]
+pub extern "C" fn JNI_OnLoad(vm: *mut c_void, _reserved: *mut c_void) -> i32 {
+    unsafe { alvr_qiyu_register_natives(vm) }
 }
 
 pub fn entry_point(app: AndroidApp) {

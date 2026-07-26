@@ -1066,3 +1066,47 @@ Java_alvr_client_VRActivity_onBatteryChangedNative(
                       static_cast<bool>(plugged));
 }
 
+// Explicitly register the VRActivity native methods. The linker's --gc-sections pass removes
+// the individually-exported Java_* symbols because nothing in the Rust code references them
+// (they are only called dynamically from Java), which caused UnsatisfiedLinkError.
+// RegisterNatives references every function pointer here, anchoring them so they survive
+// dead-code elimination, and binds them regardless of dynamic symbol export.
+//
+// This is invoked from the Rust `JNI_OnLoad` (in qiyu.rs), which is `#[no_mangle] pub` and thus
+// guaranteed to land in the dynamic symbol table where the Android loader can find it. A C
+// JNI_OnLoad here would only be a local symbol in the Rust cdylib and would not be discovered.
+extern "C" jint alvr_qiyu_register_natives(JavaVM *vm) {
+    JNIEnv *env = nullptr;
+    if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
+        return JNI_VERSION_1_6;
+    }
+    jclass clazz = env->FindClass("alvr/client/VRActivity");
+    if (clazz == nullptr) {
+        // Not the QiYu build/class not present; nothing to register.
+        env->ExceptionClear();
+        return JNI_VERSION_1_6;
+    }
+    static const JNINativeMethod methods[] = {
+        {"initializeNative", "()V",
+         reinterpret_cast<void *>(Java_alvr_client_VRActivity_initializeNative)},
+        {"destroyNative", "()V",
+         reinterpret_cast<void *>(Java_alvr_client_VRActivity_destroyNative)},
+        {"onResumeNative", "(Landroid/view/Surface;)V",
+         reinterpret_cast<void *>(Java_alvr_client_VRActivity_onResumeNative)},
+        {"onPauseNative", "()V",
+         reinterpret_cast<void *>(Java_alvr_client_VRActivity_onPauseNative)},
+        {"onStreamStartNative", "()V",
+         reinterpret_cast<void *>(Java_alvr_client_VRActivity_onStreamStartNative)},
+        {"onStreamStopNative", "()V",
+         reinterpret_cast<void *>(Java_alvr_client_VRActivity_onStreamStopNative)},
+        {"renderNative", "()V",
+         reinterpret_cast<void *>(Java_alvr_client_VRActivity_renderNative)},
+        {"onBatteryChangedNative", "(IZ)V",
+         reinterpret_cast<void *>(Java_alvr_client_VRActivity_onBatteryChangedNative)},
+    };
+    env->RegisterNatives(clazz, methods,
+                         static_cast<jint>(sizeof(methods) / sizeof(methods[0])));
+    env->DeleteLocalRef(clazz);
+    return JNI_VERSION_1_6;
+}
+
