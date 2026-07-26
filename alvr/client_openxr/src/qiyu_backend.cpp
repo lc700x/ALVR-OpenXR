@@ -808,26 +808,35 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     if (state.initialized.load()) {
         return true;
     }
+    log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.activity = static_cast<jobject>(activity);
     state.java_vm = static_cast<JavaVM *>(java_vm);
     if (!api.load()) {
+        log(ANDROID_LOG_ERROR, "init step 2: api.load() FAILED");
         api.unload();
         return false;
     }
+    log(ANDROID_LOG_INFO, "init step 2: api.load() ok");
     if (!initialize_egl()) {
+        log(ANDROID_LOG_ERROR, "init step 3: initialize_egl() FAILED");
         destroy_egl();
         api.unload();
         return false;
     }
+    log(ANDROID_LOG_INFO, "init step 3: initialize_egl() ok");
+    log(ANDROID_LOG_INFO, "init step 4: calling qiyu_Init...");
     if (!api.init(state.activity, state.java_vm, qiyu_GraphicsApi::GA_OpenGLES,
                   qiyu_TrackingOriginMode::TM_Ground, false)) {
-        log(ANDROID_LOG_ERROR, "qiyu_Init failed");
+        log(ANDROID_LOG_ERROR, "init step 4: qiyu_Init FAILED");
         destroy_egl();
         api.unload();
         return false;
     }
+    log(ANDROID_LOG_INFO, "init step 4: qiyu_Init ok");
 
     const auto device = api.get_device_info();
+    log(ANDROID_LOG_INFO, "init step 5: get_device_info ok (%dx%d)",
+        device.iEyeTargetWidth, device.iEyeTargetHeight);
     state.view_width = std::max(device.iEyeTargetWidth, 1);
     state.view_height = std::max(device.iEyeTargetHeight, 1);
     const float refresh_rates[] = {72.0f, 90.0f};
@@ -845,8 +854,11 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
         1.0f,
         false,
     };
+    log(ANDROID_LOG_INFO, "init step 6: alvr_initialize_android_context...");
     alvr_initialize_android_context(java_vm, activity);
+    log(ANDROID_LOG_INFO, "init step 7: alvr_initialize...");
     alvr_initialize(capabilities);
+    log(ANDROID_LOG_INFO, "init step 8: alvr_initialize_opengl...");
     alvr_initialize_opengl();
     initialize_ids();
     api.post_eye_buffer_size(state.view_width, state.view_height);
@@ -860,18 +872,22 @@ extern "C" bool alvr_qiyu_start(void *native_window) {
     if (!state.initialized.load() || state.running.load() || native_window == nullptr) {
         return state.running.load();
     }
+    log(ANDROID_LOG_INFO, "start step 1: enter (window=%p)", native_window);
     state.window = static_cast<ANativeWindow *>(native_window);
     if (!api.start_vr(state.window, PL_System, PL_System)) {
-        log(ANDROID_LOG_ERROR, "qiyu_StartVR failed");
+        log(ANDROID_LOG_ERROR, "start step 2: qiyu_StartVR FAILED");
         state.window = nullptr;
         return false;
     }
+    log(ANDROID_LOG_INFO, "start step 2: qiyu_StartVR ok");
     api.set_tracking_origin(qiyu_TrackingOriginMode::TM_Ground);
     if (!create_buffers(state.lobby, state.view_width, state.view_height)) {
+        log(ANDROID_LOG_ERROR, "start step 3: create_buffers FAILED");
         api.end_vr();
         state.window = nullptr;
         return false;
     }
+    log(ANDROID_LOG_INFO, "start step 3: create_buffers ok");
     const uint32_t *textures[kEyeCount] = {
         state.lobby[0].textures.data(), state.lobby[1].textures.data()};
     alvr_resume_opengl(state.view_width, state.view_height, textures,
@@ -881,6 +897,7 @@ extern "C" bool alvr_qiyu_start(void *native_window) {
     state.running.store(true);
     state.tracking_thread = std::thread(tracking_loop);
     alvr_resume();
+    log(ANDROID_LOG_INFO, "start step 4: running");
     return true;
 }
 

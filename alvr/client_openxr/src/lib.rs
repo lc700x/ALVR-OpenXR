@@ -755,10 +755,10 @@ fn android_main(app: android_activity::AndroidApp) {
     alvr_client_core::init_logging();
 
     let platform = alvr_system_info::platform();
-    // Only legacy QiYu headsets (A5/A6-B) use the native SXR backend. Newer QiYu
-    // devices (e.g. A091/kona) ship a generic OpenXR runtime; initializing the SXR
-    // SDK on them crashes, so they must fall through to the standard OpenXR path.
-    if platform == Platform::Qiyu && alvr_system_info::qiyu_uses_native_sxr() {
+    // Diagnostic build: route ALL QiYu devices (including A091/kona) to the native SXR
+    // backend to capture the real crash and match the official ALVR-QIYU which reads full
+    // controller input (ABXY/thumbstick) via qiyu_GetControllerData.
+    if platform == Platform::Qiyu {
         qiyu::entry_point(app);
         return;
     }

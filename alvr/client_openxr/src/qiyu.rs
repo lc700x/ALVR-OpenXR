@@ -12,7 +12,18 @@ unsafe extern "C" {
 pub fn entry_point(app: AndroidApp) {
     alvr_client_core::init_logging();
 
-    if !unsafe { alvr_qiyu_initialize(app.activity_as_ptr(), app.vm_as_ptr()) } {
+    // qiyu_Init expects the Java activity jobject and JavaVM (the official ALVR-QIYU passes
+    // java.ActivityObject / java.Vm). app.activity_as_ptr() returns the ANativeActivity* C
+    // struct, NOT the jobject; passing it makes qiyu_Init do JNI calls on a bad pointer and
+    // crash. Use ndk_context which holds the real activity jobject and JavaVM.
+    let ndk_ctx = ndk_context::android_context();
+    let activity = ndk_ctx.context();
+    let java_vm = ndk_ctx.vm();
+    alvr_common::info!(
+        "[QIYU-SXR] entry_point: activity={activity:?} vm={java_vm:?} (ndk_context)"
+    );
+
+    if !unsafe { alvr_qiyu_initialize(activity, java_vm) } {
         alvr_common::error!("QiYu SDK initialization failed");
         return;
     }
