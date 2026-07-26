@@ -886,7 +886,10 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
         false,
     };
     log(ANDROID_LOG_INFO, "init step 6: alvr_initialize_android_context...");
-    alvr_initialize_android_context(java_vm, activity);
+    // Pass the GLOBAL ref (state.activity), not the raw local `activity`. ALVR core (app_dirs2)
+    // stores this jobject and later calls GetObjectClass on it from the render thread; a local
+    // ref would be invalid there and triggers a JNI abort (JniAbort in DecodeJObject).
+    alvr_initialize_android_context(java_vm, state.activity);
     log(ANDROID_LOG_INFO, "init step 7: alvr_initialize...");
     alvr_initialize(capabilities);
     log(ANDROID_LOG_INFO, "init step 8: alvr_initialize_opengl...");
