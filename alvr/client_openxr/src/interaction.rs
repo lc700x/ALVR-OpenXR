@@ -1045,7 +1045,11 @@ pub fn get_hand_data(
     // Huawei's legacy runtime can report a pose action inactive even while xrLocateSpace returns a
     // fully tracked controller pose. Its official sample locates the action spaces independently
     // of isActive, so accept valid space locations on HVR and let the location flags decide.
+    // QiYu's OpenXR runtime only exposes khr/simple_controller and behaves the same way: the grip
+    // pose action reports inactive even though xrLocateSpace tracks the controller, which makes the
+    // ray not follow the hand. Bypass the isActive gate for QiYu too and trust the location flags.
     let pose_active = platform == Platform::Hvr
+        || platform == Platform::Qiyu
         || hand_source
             .grip_action
             .is_active(xr_session, hand_source.subaction_path)
