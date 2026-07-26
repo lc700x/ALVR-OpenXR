@@ -501,6 +501,29 @@ fn add_android_vendor_runtime(sh: &Shell, apk_path: &Path, profile: Profile, key
         "apksigner"
     });
     let android_jar = android_home.join("platforms/android-32/android.jar");
+
+    // Compile the QiYu VRActivity Java class and add it to the dex inputs. The SXR SDK
+    // (qiyu_Init -> QVR_Init) must be driven from a real Activity; VRActivity forwards to
+    // the JNI bridge in libalvr_client_openxr.so.
+    let java_home = PathBuf::from(env::var("JAVA_HOME").expect("JAVA_HOME not set"));
+    let javac = java_home.join("bin").join(afs::exec_fname("javac"));
+    let jar_tool = java_home.join("bin").join(afs::exec_fname("jar"));
+    let vractivity_src = afs::workspace_dir()
+        .join("alvr/client_openxr/android/java/alvr/client/VRActivity.java");
+    let vractivity_classes_dir = work_dir.join("vractivity_classes");
+    sh.create_dir(&vractivity_classes_dir).unwrap();
+    cmd!(
+        sh,
+        "{javac} -source 8 -target 8 -classpath {android_jar} -d {vractivity_classes_dir} {vractivity_src}"
+    )
+    .run()
+    .unwrap();
+    let vractivity_jar = work_dir.join("vractivity.jar");
+    cmd!(sh, "{jar_tool} cf {vractivity_jar} -C {vractivity_classes_dir} .")
+        .run()
+        .unwrap();
+    jars.push(vractivity_jar);
+
     let dex_dir = work_dir.join("dex");
     sh.create_dir(&dex_dir).unwrap();
     let jars_ref = &jars;

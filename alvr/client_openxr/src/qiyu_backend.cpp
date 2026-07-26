@@ -11,6 +11,7 @@
 #include <GLES3/gl3.h>
 #include <android/log.h>
 #include <android/native_window.h>
+#include <android/native_window_jni.h>
 #include <dlfcn.h>
 #include <jni.h>
 
@@ -994,3 +995,74 @@ extern "C" void alvr_qiyu_destroy() {
     destroy_egl();
     api.unload();
 }
+
+// ---------------------------------------------------------------------------
+// JNI bridge for the official-style Java `alvr.client.VRActivity`.
+//
+// The QiYu SXR SDK (qiyu_Init -> QVR_Init) requires being driven from a real
+// Android Activity on a dedicated Java thread (HandlerThread), the same way the
+// official ALVR-QIYU client works. Driving it from a NativeActivity's
+// android_main thread makes QVR_Init crash (null deref). These functions let the
+// Java VRActivity own the lifecycle and forward to the existing backend logic.
+//
+// initializeNative / renderNative / onResumeNative etc. all run on the same
+// VRActivity rendering HandlerThread, so the EGL context created in
+// initialize_egl stays current for rendering.
+// ---------------------------------------------------------------------------
+
+extern "C" JNIEXPORT void JNICALL
+Java_alvr_client_VRActivity_initializeNative(JNIEnv *env, jobject thiz) {
+    JavaVM *vm = nullptr;
+    env->GetJavaVM(&vm);
+    // Pass the real Activity jobject (thiz). alvr_qiyu_initialize promotes it to a
+    // global ref and attaches the thread as needed.
+    alvr_qiyu_initialize(static_cast<void *>(thiz), static_cast<void *>(vm));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_alvr_client_VRActivity_onResumeNative(JNIEnv *env, jobject /*thiz*/, jobject surface) {
+    if (surface == nullptr) {
+        log(ANDROID_LOG_ERROR, "onResumeNative: null surface");
+        return;
+    }
+    ANativeWindow *window = ANativeWindow_fromSurface(env, surface);
+    if (window == nullptr) {
+        log(ANDROID_LOG_ERROR, "onResumeNative: ANativeWindow_fromSurface returned null");
+        return;
+    }
+    alvr_qiyu_start(static_cast<void *>(window));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_alvr_client_VRActivity_onPauseNative(JNIEnv * /*env*/, jobject /*thiz*/) {
+    alvr_qiyu_stop();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_alvr_client_VRActivity_renderNative(JNIEnv * /*env*/, jobject /*thiz*/) {
+    alvr_qiyu_render_frame();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_alvr_client_VRActivity_destroyNative(JNIEnv * /*env*/, jobject /*thiz*/) {
+    alvr_qiyu_destroy();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_alvr_client_VRActivity_onStreamStartNative(JNIEnv * /*env*/, jobject /*thiz*/) {
+    // Streaming start/stop is handled internally via poll_core_events in the render
+    // loop; this bridge exists for Java parity and is currently a no-op.
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_alvr_client_VRActivity_onStreamStopNative(JNIEnv * /*env*/, jobject /*thiz*/) {
+    // See onStreamStartNative.
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_alvr_client_VRActivity_onBatteryChangedNative(
+    JNIEnv * /*env*/, jobject /*thiz*/, jint battery, jboolean plugged) {
+    alvr_send_battery(state.ids.head, static_cast<float>(battery) / 100.0f,
+                      static_cast<bool>(plugged));
+}
+
