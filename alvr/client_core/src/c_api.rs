@@ -773,7 +773,11 @@ pub struct AlvrLobbyViewParams {
 pub struct AlvrStreamViewParams {
     swapchain_index: u32,
     reprojection_rotation: AlvrQuat,
-    fov: AlvrFov,
+    /// FOV the streamed image was rendered with on the server (from
+    /// `alvr_report_compositor_start`). Sizes the video quad.
+    input_fov: AlvrFov,
+    /// FOV this view is presented through on the device. Builds the projection matrix.
+    output_fov: AlvrFov,
 }
 
 #[repr(C)]
@@ -961,28 +965,28 @@ pub unsafe extern "C" fn alvr_render_stream_opengl(
                         swapchain_index: left_params.swapchain_index,
                         input_view_params: ViewParams {
                             pose: Pose::default(),
-                            fov: from_capi_fov(left_params.fov),
+                            fov: from_capi_fov(left_params.input_fov),
                         },
                         output_view_params: ViewParams {
                             pose: Pose {
                                 orientation: from_capi_quat(left_params.reprojection_rotation),
                                 position: Vec3::ZERO,
                             },
-                            fov: from_capi_fov(left_params.fov),
+                            fov: from_capi_fov(left_params.output_fov),
                         },
                     },
                     StreamViewParams {
                         swapchain_index: right_params.swapchain_index,
                         input_view_params: ViewParams {
                             pose: Pose::default(),
-                            fov: from_capi_fov(right_params.fov),
+                            fov: from_capi_fov(right_params.input_fov),
                         },
                         output_view_params: ViewParams {
                             pose: Pose {
                                 orientation: from_capi_quat(right_params.reprojection_rotation),
                                 position: Vec3::ZERO,
                             },
-                            fov: from_capi_fov(right_params.fov),
+                            fov: from_capi_fov(right_params.output_fov),
                         },
                     },
                 ],

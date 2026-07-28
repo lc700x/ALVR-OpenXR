@@ -893,18 +893,20 @@ bool render_stream(qiyu_FrameParam &frame) {
     alvr_report_compositor_start(timestamp_ns, input_views);
     const auto current_orientation =
         head_orientation(api.predict_head_pose(api.predict_display_time()).pose.rotation);
-    // Project with the headset's own per-eye frustum, exactly like render_lobby and the official
-    // QiYu sample (glm::frustum over di.frustumLeftEye/RightEye). The FOV echoed back by
-    // report_compositor_start is the server's view of the eyes and need not equal this device's
-    // lens calibration; using it here made the streamed image fail to converge with the other eye
-    // even though the lobby, which uses the device frustum, converged fine.
+    // Same split the OpenXR path makes (stream.rs: input_view_params vs output_view_params).
+    // input_fov describes the frustum the SERVER encoded the video with, and sizes the video quad;
+    // output_fov is this headset's own lens frustum and builds the projection matrix. Collapsing
+    // them into one value (as the C API used to) makes the reprojection a plain blit, so any
+    // server/device FOV mismatch is never corrected: the two eyes end up scaled differently, never
+    // fuse, and resampling at the wrong scale looks soft.
     const auto stream_device = api.get_device_info();
     AlvrStreamViewParams views[kEyeCount]{};
     for (int eye = 0; eye < kEyeCount; ++eye) {
         views[eye].swapchain_index = state.stream[eye].index;
         views[eye].reprojection_rotation =
             alvr_rotation_delta(input_views[eye].pose.orientation, current_orientation);
-        views[eye].fov = get_fov(stream_device, eye);
+        views[eye].input_fov = input_views[eye].fov;
+        views[eye].output_fov = get_fov(stream_device, eye);
     }
 
     // [STREAM-DBG] Only one eye shows streamed video on device while the lobby (same textures,
@@ -916,13 +918,14 @@ bool render_stream(qiyu_FrameParam &frame) {
     if ((stream_dbg++ % 72) == 0) {
         for (int eye = 0; eye < kEyeCount; ++eye) {
             log(ANDROID_LOG_WARN,
-                "[STREAM-DBG] eye=%d sc_idx=%u tex=%u fov(l=%.4f r=%.4f u=%.4f d=%.4f) "
-                "in_pos(%.3f,%.3f,%.3f)",
+                "[STREAM-DBG] eye=%d sc_idx=%u tex=%u in_fov(l=%.4f r=%.4f u=%.4f d=%.4f) "
+                "out_fov(l=%.4f r=%.4f u=%.4f d=%.4f) in_pos(%.3f,%.3f,%.3f)",
                 eye, views[eye].swapchain_index,
-                state.stream[eye].textures[state.stream[eye].index], views[eye].fov.left,
-                views[eye].fov.right, views[eye].fov.up, views[eye].fov.down,
-                input_views[eye].pose.position[0], input_views[eye].pose.position[1],
-                input_views[eye].pose.position[2]);
+                state.stream[eye].textures[state.stream[eye].index], views[eye].input_fov.left,
+                views[eye].input_fov.right, views[eye].input_fov.up, views[eye].input_fov.down,
+                views[eye].output_fov.left, views[eye].output_fov.right, views[eye].output_fov.up,
+                views[eye].output_fov.down, input_views[eye].pose.position[0],
+                input_views[eye].pose.position[1], input_views[eye].pose.position[2]);
         }
     }
 
@@ -1005,7 +1008,7 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     alvr_initialize_logging();
     // Build marker: lets a captured log prove which APK the device actually ran, so a missing
     // diagnostic can be told apart from a stale install.
-    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build34 %s %s", __DATE__, __TIME__);
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build35 %s %s", __DATE__, __TIME__);
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.java_vm = static_cast<JavaVM *>(java_vm);
 

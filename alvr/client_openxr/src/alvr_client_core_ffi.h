@@ -112,7 +112,10 @@ struct AlvrLobbyViewParams {
 struct AlvrStreamViewParams {
     uint32_t swapchain_index;
     AlvrQuat reprojection_rotation;
-    AlvrFov fov;
+    // FOV the server rendered the streamed image with; sizes the video quad.
+    AlvrFov input_fov;
+    // FOV this view is presented through on the device; builds the projection matrix.
+    AlvrFov output_fov;
 };
 
 struct AlvrStreamConfig {
