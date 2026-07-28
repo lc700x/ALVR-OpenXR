@@ -155,6 +155,7 @@ struct State {
     ANativeWindow *window = nullptr;
     std::atomic_bool initialized = false;
     std::atomic_bool running = false;
+    std::atomic_bool starting = false;
     std::atomic_bool streaming = false;
     std::atomic<float> refresh_rate = kDefaultRefreshRate;
     std::atomic<float> tracking_offset = 0.0f;
@@ -167,6 +168,7 @@ struct State {
     uint32_t stream_height = 1;
     uint64_t last_frame_time_ns = 0;
     bool decoder_initialized = false;
+    int decoder_codec = -1;
     bool controller_connected[kEyeCount]{};
     int last_controller_battery[kEyeCount] = {-1, -1};
     InputIds ids;
@@ -365,7 +367,12 @@ void initialize_ids() {
     state.ids.hands[1] = id("/user/hand/right");
     state.ids.haptics[0] = id("/user/hand/left/output/haptic");
     state.ids.haptics[1] = id("/user/hand/right/output/haptic");
-    state.ids.profile = id("/interaction_profiles/oculus/touch");
+    // Must match QUEST_CONTROLLER_PROFILE_PATH exactly: alvr_common::inputs builds it as
+    // "/interaction_profiles/" + "oculus/touch" + "_controller". The id is a hash, so dropping
+    // the "_controller" suffix yields an id absent from CONTROLLER_PROFILE_INFO; the server then
+    // leaves controller_button_mapping_manager unset and silently discards every button entry
+    // (poses still work, since tracking bypasses button mapping).
+    state.ids.profile = id("/interaction_profiles/oculus/touch_controller");
     state.ids.menu = id("/user/hand/left/input/menu/click");
 
     const char *hands[kEyeCount] = {"left", "right"};
@@ -477,6 +484,31 @@ void send_view_params() {
     views[1].pose.position[0] = half_ipd;
     views[0].fov = get_fov(device, 0);
     views[1].fov = get_fov(device, 1);
+    static int vp_dbg = 0;
+    if (vp_dbg++ < 3) {
+        log(ANDROID_LOG_WARN,
+            "[VIEW-DBG] L fov(l=%.4f r=%.4f u=%.4f d=%.4f) R fov(l=%.4f r=%.4f u=%.4f d=%.4f) ipd=%.4f "
+            "Lfrustum(l=%.4f r=%.4f t=%.4f b=%.4f n=%.4f) Rfrustum(l=%.4f r=%.4f t=%.4f b=%.4f n=%.4f)",
+            views[0].fov.left, views[0].fov.right, views[0].fov.up, views[0].fov.down,
+            views[1].fov.left, views[1].fov.right, views[1].fov.up, views[1].fov.down, half_ipd * 2.0f,
+            device.frustumLeftEye.left, device.frustumLeftEye.right, device.frustumLeftEye.top,
+            device.frustumLeftEye.bottom, device.frustumLeftEye.near,
+            device.frustumRightEye.left, device.frustumRightEye.right, device.frustumRightEye.top,
+            device.frustumRightEye.bottom, device.frustumRightEye.near);
+        // [GEOM-DBG] SXR logs a "display frustum" AND a narrower "render frustum" at startup, but
+        // qiyu_DeviceInfo only exposes one pair. Print the SDK's own eye-target size next to the
+        // buffers we actually allocated: if the frustum we build FOV from is the display one while
+        // the compositor samples the render one, the image is magnified (~21%) and soft.
+        log(ANDROID_LOG_WARN,
+            "[GEOM-DBG] sdk_eye_target=%dx%d our_view=%ux%u stream=%ux%u "
+            "Lpos(%.4f,%.4f,%.4f) Rpos(%.4f,%.4f,%.4f) Lfar=%.4f Rfar=%.4f",
+            device.iEyeTargetWidth, device.iEyeTargetHeight, state.view_width, state.view_height,
+            state.stream_width, state.stream_height,
+            device.frustumLeftEye.position.x, device.frustumLeftEye.position.y,
+            device.frustumLeftEye.position.z, device.frustumRightEye.position.x,
+            device.frustumRightEye.position.y, device.frustumRightEye.position.z,
+            device.frustumLeftEye.far, device.frustumRightEye.far);
+    }
     alvr_send_view_params(views);
 }
 
@@ -549,6 +581,26 @@ void tracking_loop() {
             qiyu_ControllerData controllers[kEyeCount]{};
             api.get_controller_data(&controllers[0], &controllers[1]);
             const float prediction_seconds = static_cast<float>(prediction_ns) / 1e9f;
+            // [BTN-DIAG] The QiYu service was observed reporting click:0x0 on every sample while
+            // touch bits fired, so ABXY never reaches ALVR. Dump the raw struct fields edge-
+            // triggered (only on change) to tell "button field is dead" apart from "our bit
+            // mapping is wrong" without flooding logcat.
+            static int last_button[kEyeCount] = {-1, -1};
+            static int last_touch[kEyeCount] = {-1, -1};
+            for (int hand = 0; hand < kEyeCount; ++hand) {
+                if (controllers[hand].button != last_button[hand] ||
+                    controllers[hand].buttonTouch != last_touch[hand]) {
+                    last_button[hand] = controllers[hand].button;
+                    last_touch[hand] = controllers[hand].buttonTouch;
+                    log(ANDROID_LOG_WARN,
+                        "[BTN-DIAG] hand=%d connect=%d button=0x%08x touch=0x%08x "
+                        "trigger=%.3f grip=%.3f stick=(%.3f,%.3f)",
+                        hand, controllers[hand].isConnect, controllers[hand].button,
+                        controllers[hand].buttonTouch, controllers[hand].triggerForce,
+                        controllers[hand].gripForce, controllers[hand].joyStickPos.x,
+                        controllers[hand].joyStickPos.y);
+                }
+            }
             for (int hand = 0; hand < kEyeCount; ++hand) {
                 update_controller_buttons(controllers[hand], hand);
                 if (controllers[hand].isConnect) {
@@ -559,8 +611,9 @@ void tracking_loop() {
 
             if (std::chrono::steady_clock::now() >= next_slow_update) {
                 log(ANDROID_LOG_INFO,
-                    "Controllers: module=ready left(connect=%d show=%d pos=%.3f,%.3f,%.3f) "
+                    "Controllers: module=ready head(%.3f,%.3f,%.3f) left(connect=%d show=%d pos=%.3f,%.3f,%.3f) "
                     "right(connect=%d show=%d pos=%.3f,%.3f,%.3f)",
+                    head.pose.position.x, head.pose.position.y, head.pose.position.z,
                     controllers[0].isConnect, controllers[0].isShow,
                     controllers[0].position.x, controllers[0].position.y,
                     controllers[0].position.z, controllers[1].isConnect,
@@ -608,6 +661,12 @@ void tracking_loop() {
 }
 
 void initialize_decoder(AlvrCodec codec) {
+    // The server can re-send DecoderConfig repeatedly. Only (re)create the MediaCodec decoder when
+    // it isn't already up for this codec; otherwise we tear down and rebuild the decoder on every
+    // event (observed thousands of MediaCodec recreations), which prevents any frame from decoding.
+    if (state.decoder_initialized && state.decoder_codec == static_cast<int>(codec)) {
+        return;
+    }
     if (state.decoder_initialized) {
         alvr_destroy_decoder();
     }
@@ -628,6 +687,7 @@ void initialize_decoder(AlvrCodec codec) {
     };
     alvr_create_decoder(decoder_config);
     state.decoder_initialized = true;
+    state.decoder_codec = static_cast<int>(codec);
 }
 
 void start_stream(const StreamingStarted_Body &config) {
@@ -674,6 +734,7 @@ void stop_stream() {
     if (state.decoder_initialized) {
         alvr_destroy_decoder();
         state.decoder_initialized = false;
+        state.decoder_codec = -1;
     }
 }
 
@@ -732,13 +793,27 @@ qiyu_HeadPoseState tracking_for_timestamp(uint64_t timestamp_ns) {
     return api.predict_head_pose(api.predict_display_time());
 }
 
+// Render/submit indices of the frame currently being built, captured so one log line can compare
+// what wgpu drew into against what SXR is handed. Two separately throttled logs sampled different
+// frames and could not prove they agree.
+int g_render_index[kEyeCount] = {-1, -1};
+uint32_t g_render_tex[kEyeCount] = {0, 0};
+
 void fill_frame_layers(qiyu_FrameParam &frame, EyeBuffers (&buffers)[kEyeCount]) {
+    static int layer_dbg = 0;
+    const bool trace_layers = (layer_dbg++ % 72) == 0;
     for (int eye = 0; eye < kEyeCount; ++eye) {
         auto &layer = frame.renderLayers[eye];
         layer.imageHandle = static_cast<int32_t>(buffers[eye].textures[buffers[eye].index]);
         layer.imageType = TT_Texture;
         fill_layout(layer.imageCoords);
         layer.eyeMask = eye == 0 ? RL_EyeMask_Left : RL_EyeMask_Right;
+        if (trace_layers) {
+            log(ANDROID_LOG_WARN,
+                "[FRAME-DBG] eye=%d submit(idx=%u tex=%d) render(idx=%d tex=%u) mask=0x%x", eye,
+                buffers[eye].index, layer.imageHandle, g_render_index[eye], g_render_tex[eye],
+                static_cast<int>(layer.eyeMask));
+        }
         buffers[eye].index = (buffers[eye].index + 1) % kSwapchainLength;
     }
 }
@@ -774,9 +849,42 @@ bool render_stream(qiyu_FrameParam &frame) {
         views[eye].fov = input_views[eye].fov;
     }
 
+    // [STREAM-DBG] Only one eye shows streamed video on device while the lobby (same textures,
+    // same submit path) renders both. That narrows the fault to what wgpu's StreamRenderer is
+    // handed: it picks its render target as views_objects[eye].render_target[swapchain_index],
+    // so identical per-eye indices would make both eyes draw into the same target, and identical
+    // per-eye fov would mean report_compositor_start never split the views. Log both.
+    static int stream_dbg = 0;
+    if ((stream_dbg++ % 72) == 0) {
+        for (int eye = 0; eye < kEyeCount; ++eye) {
+            log(ANDROID_LOG_WARN,
+                "[STREAM-DBG] eye=%d sc_idx=%u tex=%u fov(l=%.4f r=%.4f u=%.4f d=%.4f) "
+                "in_pos(%.3f,%.3f,%.3f)",
+                eye, views[eye].swapchain_index,
+                state.stream[eye].textures[state.stream[eye].index], views[eye].fov.left,
+                views[eye].fov.right, views[eye].fov.up, views[eye].fov.down,
+                input_views[eye].pose.position[0], input_views[eye].pose.position[1],
+                input_views[eye].pose.position[2]);
+        }
+    }
+
+    // Record what wgpu is about to draw into so fill_frame_layers can print render vs submit for
+    // the SAME frame.
+    for (int eye = 0; eye < kEyeCount; ++eye) {
+        g_render_index[eye] = static_cast<int>(views[eye].swapchain_index);
+        g_render_tex[eye] = state.stream[eye].textures[views[eye].swapchain_index];
+    }
+
     api.start_eye(false, EYE_Left, TT_Texture);
     api.start_eye(false, EYE_Right, TT_Texture);
+    // Bracket the call: if "pre" appears without "post", alvr_render_stream_opengl never returned;
+    // if both appear while the Rust-side probes stay silent, the call is resolving somewhere other
+    // than the freshly built libalvr_client_openxr.so.
+    static int call_dbg = 0;
+    const bool trace_call = (call_dbg++ % 72) == 0;
+    if (trace_call) log(ANDROID_LOG_WARN, "[STREAM-CALL] pre alvr_render_stream_opengl");
     alvr_render_stream_opengl(hardware_buffer, views);
+    if (trace_call) log(ANDROID_LOG_WARN, "[STREAM-CALL] post alvr_render_stream_opengl");
     api.end_eye(false, EYE_Left, TT_Texture);
     api.end_eye(false, EYE_Right, TT_Texture);
 
@@ -789,10 +897,15 @@ bool render_stream(qiyu_FrameParam &frame) {
 }
 
 void render_lobby(qiyu_FrameParam &frame) {
+    static int lob = 0;
+    const bool trace = lob++ < 3;
+    if (trace) log(ANDROID_LOG_INFO, "lobby[%d] A: get_device_info", lob - 1);
     const auto device = api.get_device_info();
+    if (trace) log(ANDROID_LOG_INFO, "lobby[%d] B: predict_head_pose", lob - 1);
     const auto tracking = api.predict_head_pose(api.predict_display_time());
     qiyu_Matrix4 view_matrices[kEyeCount]{};
     float tracking_offset = state.tracking_offset.load();
+    if (trace) log(ANDROID_LOG_INFO, "lobby[%d] C: get_view_matrix", lob - 1);
     api.get_view_matrix(view_matrices[0], view_matrices[1], tracking_offset, tracking,
                         device.frustumLeftEye.rotation,
                         device.frustumRightEye.rotation);
@@ -809,13 +922,17 @@ void render_lobby(qiyu_FrameParam &frame) {
         views[eye].fov = get_fov(device, eye);
     }
 
+    if (trace) log(ANDROID_LOG_INFO, "lobby[%d] D: start_eye L/R", lob - 1);
     api.start_eye(false, EYE_Left, TT_Texture);
     api.start_eye(false, EYE_Right, TT_Texture);
+    if (trace) log(ANDROID_LOG_INFO, "lobby[%d] E: alvr_render_lobby_opengl", lob - 1);
     alvr_render_lobby_opengl(views, true);
+    if (trace) log(ANDROID_LOG_INFO, "lobby[%d] F: end_eye L/R", lob - 1);
     api.end_eye(false, EYE_Left, TT_Texture);
     api.end_eye(false, EYE_Right, TT_Texture);
     fill_frame_layers(frame, state.lobby);
     frame.headPoseState = tracking;
+    if (trace) log(ANDROID_LOG_INFO, "lobby[%d] G: done", lob - 1);
 }
 
 } // namespace
@@ -828,6 +945,9 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     // this, alvr_common::info!/error! produce no output (the OpenXR path calls init_logging in
     // Rust; the SXR path never did), leaving connection failures invisible.
     alvr_initialize_logging();
+    // Build marker: lets a captured log prove which APK the device actually ran, so a missing
+    // diagnostic can be told apart from a stale install.
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build30 %s %s", __DATE__, __TIME__);
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.java_vm = static_cast<JavaVM *>(java_vm);
 
@@ -911,8 +1031,20 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     alvr_initialize_android_context(java_vm, state.activity);
     log(ANDROID_LOG_INFO, "init step 7: alvr_initialize...");
     alvr_initialize(capabilities);
-    log(ANDROID_LOG_INFO, "init step 8: alvr_initialize_opengl...");
-    alvr_initialize_opengl();
+    log(ANDROID_LOG_INFO, "init step 8: alvr_initialize_opengl_external...");
+    // Make the SXR EGL context current so wgpu adopts IT (shared GL namespace) instead of
+    // creating a separate context. Separate contexts leave the eye swapchain textures and
+    // qiyu_SubmitFrame in different namespaces -> timewarp sees empty frames -> black screen.
+    eglMakeCurrent(state.egl.display, state.egl.surface, state.egl.surface, state.egl.context);
+    if (!alvr_initialize_opengl_external()) {
+        log(ANDROID_LOG_ERROR, "init step 8: alvr_initialize_opengl_external FAILED");
+        destroy_egl();
+        api.unload();
+        return false;
+    }
+    // wgpu's adapter init may have switched the current context; restore SXR's for subsequent
+    // GL work (create_buffers, StartEye/EndEye, SubmitFrame).
+    eglMakeCurrent(state.egl.display, state.egl.surface, state.egl.surface, state.egl.context);
     initialize_ids();
     api.post_eye_buffer_size(state.view_width, state.view_height);
     state.initialized.store(true);
@@ -925,11 +1057,26 @@ extern "C" bool alvr_qiyu_start(void *native_window) {
     if (!state.initialized.load() || state.running.load() || native_window == nullptr) {
         return state.running.load();
     }
+    // qiyu_StartVR internally cycles SXR pause/resume before running is set; that cycle can
+    // re-enter alvr_qiyu_start via onResumeNative while running is still false. Guard the whole
+    // start with a dedicated flag so the reentrant call is rejected (avoids double StartVR that
+    // kills the render loop -> black screen).
+    if (state.starting.exchange(true)) {
+        log(ANDROID_LOG_WARN, "alvr_qiyu_start: already starting, rejecting reentrant call");
+        return false;
+    }
     log(ANDROID_LOG_INFO, "start step 1: enter (window=%p)", native_window);
     state.window = static_cast<ANativeWindow *>(native_window);
+    // qiyu_StartVR reads the thread's *current* EGL surface to derive the eye-buffer config. After
+    // a pause the previous SXR surface is destroyed, and if it is still bound here SXR queries a
+    // dead handle ("Config ID of eye surface: -1" / "Unable to find current eye surface config!")
+    // and comes back up with a broken eye context. Bind our own long-lived pbuffer first so SXR
+    // always reads a valid surface/config on both the first start and every resume.
+    eglMakeCurrent(state.egl.display, state.egl.surface, state.egl.surface, state.egl.context);
     if (!api.start_vr(state.window, PL_System, PL_System)) {
         log(ANDROID_LOG_ERROR, "start step 2: qiyu_StartVR FAILED");
         state.window = nullptr;
+        state.starting.store(false);
         return false;
     }
     log(ANDROID_LOG_INFO, "start step 2: qiyu_StartVR ok");
@@ -938,6 +1085,7 @@ extern "C" bool alvr_qiyu_start(void *native_window) {
         log(ANDROID_LOG_ERROR, "start step 3: create_buffers FAILED");
         api.end_vr();
         state.window = nullptr;
+        state.starting.store(false);
         return false;
     }
     log(ANDROID_LOG_INFO, "start step 3: create_buffers ok");
@@ -950,12 +1098,15 @@ extern "C" bool alvr_qiyu_start(void *native_window) {
     state.running.store(true);
     state.tracking_thread = std::thread(tracking_loop);
     alvr_resume();
+    state.starting.store(false);
     log(ANDROID_LOG_INFO, "start step 4: running");
     return true;
 }
 
 extern "C" void alvr_qiyu_stop() {
+    log(ANDROID_LOG_WARN, "alvr_qiyu_stop: enter (running=%d)", state.running.load());
     if (!state.running.exchange(false)) {
+        log(ANDROID_LOG_WARN, "alvr_qiyu_stop: already stopped, no-op");
         return;
     }
     if (state.tracking_thread.joinable()) {
@@ -976,6 +1127,10 @@ extern "C" void alvr_qiyu_stop() {
         state.tracking_frames.clear();
     }
     api.end_vr();
+    // end_vr destroys SXR's EGL surfaces. They stay bound to this thread unless we release them,
+    // and the next qiyu_StartVR would then inspect a destroyed surface. Drop back to our own
+    // pbuffer so the thread always has a valid surface/context bound across the pause.
+    eglMakeCurrent(state.egl.display, state.egl.surface, state.egl.surface, state.egl.context);
     state.window = nullptr;
 }
 
@@ -983,6 +1138,22 @@ extern "C" void alvr_qiyu_render_frame() {
     if (!state.running.load()) {
         return;
     }
+
+    // Ensure a GL context is current on this render thread so qiyu_SubmitFrame can reach the shared
+    // GL textures. SXR normally leaves its own (namespace-sharing) context current here; only bind
+    // ours if nothing is current (observed ctx=0x0 at submit -> timewarp gets no valid frame ->
+    // black screen). Bind the pbuffer rather than EGL_NO_SURFACE: this driver rejects surfaceless
+    // binds with EGL_BAD_SURFACE.
+    if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
+        eglMakeCurrent(state.egl.display, state.egl.surface, state.egl.surface, state.egl.context);
+    }
+
+    static int render_heartbeat = 0;
+    if ((render_heartbeat++ % 72) == 0) {
+        log(ANDROID_LOG_INFO, "render_frame heartbeat #%d streaming=%d decoder_init=%d",
+            render_heartbeat - 1, state.streaming.load(), state.decoder_initialized);
+    }
+
     poll_core_events();
 
     const uint64_t now_ns = clock_ns();
@@ -1003,6 +1174,10 @@ extern "C" void alvr_qiyu_render_frame() {
     }
     if (!api.submit_frame(frame)) {
         log(ANDROID_LOG_WARN, "qiyu_SubmitFrame failed");
+    }
+    static int tail = 0;
+    if (tail++ < 3) {
+        log(ANDROID_LOG_INFO, "render_frame[%d] returned (submit done)", tail - 1);
     }
 }
 
@@ -1043,6 +1218,7 @@ Java_alvr_client_VRActivity_initializeNative(JNIEnv *env, jobject thiz) {
 
 extern "C" JNIEXPORT void JNICALL
 Java_alvr_client_VRActivity_onResumeNative(JNIEnv *env, jobject /*thiz*/, jobject surface) {
+    log(ANDROID_LOG_WARN, "onResumeNative: enter (running=%d)", state.running.load());
     if (surface == nullptr) {
         log(ANDROID_LOG_ERROR, "onResumeNative: null surface");
         return;
@@ -1057,6 +1233,7 @@ Java_alvr_client_VRActivity_onResumeNative(JNIEnv *env, jobject /*thiz*/, jobjec
 
 extern "C" JNIEXPORT void JNICALL
 Java_alvr_client_VRActivity_onPauseNative(JNIEnv * /*env*/, jobject /*thiz*/) {
+    log(ANDROID_LOG_WARN, "onPauseNative: enter (running=%d)", state.running.load());
     alvr_qiyu_stop();
 }
 

@@ -531,6 +531,139 @@ impl GraphicsContext {
         })
     }
 
+    /// QiYu SXR path: adopt the EGL context that is *already current* (created by the native SXR
+    /// backend's initialize_egl) instead of letting wgpu create its own. This keeps the ALVR
+    /// lobby/stream renderers, the eye swapchain textures, and qiyu_SubmitFrame all in the SAME
+    /// GL context/namespace. With separate contexts (the default new_gl path) the textures wgpu
+    /// renders into live in a different namespace than the ones SXR submits, so timewarp sees
+    /// empty frames ("No valid frame to warp", checkFrameCount(0)) and the render loop deadlocks
+    /// on the second submit -> black screen. Mirrors the Huawei new_gl_hvr external-adopt pattern.
+    #[cfg(target_os = "android")]
+    pub unsafe fn new_gl_external() -> Result<Self, String> {
+        use std::mem;
+        use wgpu::{
+            Backends, DeviceDescriptor, Features, InstanceDescriptor, InstanceFlags, Limits,
+            MemoryHints,
+        };
+
+        const CREATE_IMAGE_FN_STR: &str = "eglCreateImageKHR";
+        const DESTROY_IMAGE_FN_STR: &str = "eglDestroyImageKHR";
+        const GET_NATIVE_CLIENT_BUFFER_FN_STR: &str = "eglGetNativeClientBufferANDROID";
+        const IMAGE_TARGET_TEXTURE_2D_FN_STR: &str = "glEGLImageTargetTexture2DOES";
+
+        let egl_instance = unsafe {
+            egl::DynamicInstance::<egl::EGL1_4>::load_required()
+                .map_err(|error| format!("Cannot load libEGL: {error}"))?
+        };
+
+        // Capture the context/display/surface the SXR backend made current in initialize_egl.
+        let display = egl_instance
+            .get_current_display()
+            .ok_or_else(|| "no current EGL display (SXR context not current)".to_owned())?;
+        let context = egl_instance
+            .get_current_context()
+            .ok_or_else(|| "no current EGL context (SXR context not current)".to_owned())?;
+        let surface = egl_instance
+            .get_current_surface(egl::DRAW)
+            .ok_or_else(|| "no current EGL draw surface".to_owned())?;
+
+        // Resolve the config backing the current context so GraphicsContext has a valid handle.
+        let config_id = egl_instance
+            .query_context(display, context, egl::CONFIG_ID)
+            .map_err(|error| format!("eglQueryContext(CONFIG_ID) failed: {error}"))?;
+        let mut configs = Vec::with_capacity(
+            egl_instance
+                .get_config_count(display)
+                .map_err(|error| format!("eglGetConfigs count failed: {error}"))?,
+        );
+        egl_instance
+            .get_configs(display, &mut configs)
+            .map_err(|error| format!("eglGetConfigs failed: {error}"))?;
+        let config = configs
+            .into_iter()
+            .find(|&cfg| {
+                egl_instance
+                    .get_config_attrib(display, cfg, egl::CONFIG_ID)
+                    .ok()
+                    == Some(config_id)
+            })
+            .ok_or_else(|| "could not resolve EGL config from current context".to_owned())?;
+
+        let flags = if cfg!(debug_assertions) {
+            InstanceFlags::DEBUG | InstanceFlags::VALIDATION
+        } else {
+            InstanceFlags::empty()
+        };
+        let instance = Instance::new(&InstanceDescriptor {
+            backends: Backends::GL,
+            flags,
+            backend_options: Default::default(),
+        });
+
+        // Instance creation may switch EGL contexts. Restore the SXR context before exposing it to
+        // wgpu-hal; external GLES adapters require their context to remain current.
+        egl_instance
+            .make_current(display, Some(surface), Some(surface), Some(context))
+            .map_err(|error| format!("eglMakeCurrent after wgpu init failed: {error}"))?;
+        let exposed_adapter = unsafe {
+            <api::Gles as hal::Api>::Adapter::new_external(|name| {
+                egl_instance
+                    .get_proc_address(name)
+                    .map_or(ptr::null(), |function| function as *const c_void)
+            })
+        }
+        .ok_or_else(|| "wgpu could not expose the SXR GLES context".to_owned())?;
+        let adapter = unsafe { instance.create_adapter_from_hal(exposed_adapter) };
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &DeviceDescriptor {
+                label: None,
+                required_features: Features::PUSH_CONSTANTS,
+                required_limits: Limits {
+                    max_push_constant_size: MAX_PUSH_CONSTANTS_SIZE,
+                    ..adapter.limits()
+                },
+                memory_hints: MemoryHints::Performance,
+            },
+            None,
+        ))
+        .map_err(|error| format!("wgpu request_device failed: {error}"))?;
+
+        let gl_context = gl::Context::from_loader_function(|name| {
+            egl_instance
+                .get_proc_address(name)
+                .map_or(ptr::null(), |function| function as *const c_void)
+        });
+        let get_fn_ptr = |name| {
+            egl_instance
+                .get_proc_address(name)
+                .map_or(ptr::null(), |function| function as *const c_void)
+        };
+        let create_image: CreateImageFn = mem::transmute(get_fn_ptr(CREATE_IMAGE_FN_STR));
+        let destroy_image: DestroyImageFn = mem::transmute(get_fn_ptr(DESTROY_IMAGE_FN_STR));
+        let get_native_client_buffer: GetNativeClientBufferFn =
+            mem::transmute(get_fn_ptr(GET_NATIVE_CLIENT_BUFFER_FN_STR));
+        let image_target_texture_2d: ImageTargetTexture2DFn =
+            mem::transmute(get_fn_ptr(IMAGE_TARGET_TEXTURE_2D_FN_STR));
+
+        Ok(Self {
+            _instance: instance,
+            adapter,
+            device,
+            queue,
+            egl_display: display,
+            egl_config: config,
+            egl_context: context,
+            gl_context,
+            dummy_surface: surface,
+            window_surface: Some(surface),
+            _hvr_egl_instance: Some(egl_instance),
+            create_image,
+            destroy_image,
+            get_native_client_buffer,
+            image_target_texture_2d,
+        })
+    }
+
     #[cfg(windows)]
     pub fn new_gl() -> Self {
         unimplemented!()

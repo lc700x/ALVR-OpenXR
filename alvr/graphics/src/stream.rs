@@ -298,9 +298,17 @@ impl StreamRenderer {
         view_params: [StreamViewParams; 2],
         passthrough: Option<&PassthroughMode>,
     ) {
+        // [STREAM-RT-DBG] Entry probe, before the Huawei deferred-target gate. Deliberately
+        // unthrottled and error-level, mirroring the one graphics-crate log line known to reach
+        // logcat on this device, so silence here can only mean render() is never called.
+        let rt0 = self.views_objects[0].render_target.len();
+        let rt1 = self.views_objects[1].render_target.len();
+        alvr_common::error!("[STREAM-RT-DBG] enter rt_len={rt0},{rt1}");
+
         // Deferred-render-target path (Huawei): skip until valid swapchain handles have been
         // supplied via set_swapchain_textures. Rendering with no targets would index an empty Vec.
         if !self.render_targets_ready() {
+            alvr_common::error!("[STREAM-RT-DBG] gate closed, frame skipped");
             return;
         }
 
@@ -308,6 +316,7 @@ impl StreamRenderer {
         if !hardware_buffer.is_null() {
             self.staging_renderer.render(hardware_buffer);
         }
+
 
         let mut encoder = self
             .context

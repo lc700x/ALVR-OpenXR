@@ -190,6 +190,7 @@ void alvr_report_compositor_start(uint64_t target_timestamp_ns,
                                   AlvrViewParams *out_view_params);
 void alvr_report_submit(uint64_t target_timestamp_ns, uint64_t vsync_queue_ns);
 void alvr_initialize_opengl();
+bool alvr_initialize_opengl_external();
 void alvr_destroy_opengl();
 void alvr_resume_opengl(uint32_t preferred_view_width,
                         uint32_t preferred_view_height,

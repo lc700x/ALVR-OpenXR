@@ -56,10 +56,61 @@ pub struct AlvrClientCapabilities {
 }
 
 #[repr(u8)]
+#[derive(Clone, Copy)]
 pub enum AlvrCodec {
     H264 = 0,
     Hevc = 1,
     AV1 = 2,
+}
+
+// C-facing event ABI used by C++ backends (qiyu_backend.cpp). Keep this layout in sync with
+// `alvr_client_core_ffi.h`.
+#[repr(u8)]
+#[derive(Clone, Copy)]
+pub enum AlvrEventTagC {
+    HudMessageUpdated,
+    StreamingStarted,
+    StreamingStopped,
+    Haptics,
+    DecoderConfig,
+    RealTimeConfig,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct StreamingStartedBodyC {
+    tag: AlvrEventTagC,
+    view_width: u32,
+    view_height: u32,
+    refresh_rate_hint: f32,
+    encoding_gamma: f32,
+    enable_foveated_encoding: bool,
+    enable_hdr: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct HapticsBodyC {
+    tag: AlvrEventTagC,
+    device_id: u64,
+    duration_s: f32,
+    frequency: f32,
+    amplitude: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DecoderConfigBodyC {
+    tag: AlvrEventTagC,
+    codec: AlvrCodec,
+}
+
+#[repr(C)]
+pub union AlvrEventC {
+    tag: AlvrEventTagC,
+    STREAMING_STARTED: StreamingStartedBodyC,
+    HAPTICS: HapticsBodyC,
+    DECODER_CONFIG: DecoderConfigBodyC,
 }
 
 #[repr(u8)]
@@ -333,54 +384,69 @@ pub extern "C" fn alvr_pause() {
 
 /// Returns true if there was a new event
 #[no_mangle]
-pub extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent) -> bool {
+pub extern "C" fn alvr_poll_event(out_event: *mut AlvrEventC) -> bool {
     if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
         if let Some(event) = context.poll_event() {
             let event = match event {
                 ClientCoreEvent::UpdateHudMessage(message) => {
                     *HUD_MESSAGE.lock() = message;
 
-                    AlvrEvent::HudMessageUpdated
+                    AlvrEventC {
+                        tag: AlvrEventTagC::HudMessageUpdated,
+                    }
                 }
                 ClientCoreEvent::StreamingStarted(stream_config) => {
                     *SETTINGS.lock() = serde_json::to_string(&stream_config.settings).unwrap();
                     *SERVER_VERSION.lock() = stream_config.server_version.to_string();
 
-                    AlvrEvent::StreamingStarted {
-                        view_width: stream_config.negotiated_config.view_resolution.x,
-                        view_height: stream_config.negotiated_config.view_resolution.y,
-                        refresh_rate_hint: stream_config.negotiated_config.refresh_rate_hint,
-                        encoding_gamma: stream_config.negotiated_config.encoding_gamma,
-                        enable_foveated_encoding: stream_config
-                            .negotiated_config
-                            .enable_foveated_encoding,
-                        enable_hdr: stream_config.negotiated_config.enable_hdr,
+                    AlvrEventC {
+                        STREAMING_STARTED: StreamingStartedBodyC {
+                            tag: AlvrEventTagC::StreamingStarted,
+                            view_width: stream_config.negotiated_config.view_resolution.x,
+                            view_height: stream_config.negotiated_config.view_resolution.y,
+                            refresh_rate_hint: stream_config.negotiated_config.refresh_rate_hint,
+                            encoding_gamma: stream_config.negotiated_config.encoding_gamma,
+                            enable_foveated_encoding: stream_config
+                                .negotiated_config
+                                .enable_foveated_encoding,
+                            enable_hdr: stream_config.negotiated_config.enable_hdr,
+                        },
                     }
                 }
-                ClientCoreEvent::StreamingStopped => AlvrEvent::StreamingStopped,
+                ClientCoreEvent::StreamingStopped => AlvrEventC {
+                    tag: AlvrEventTagC::StreamingStopped,
+                },
                 ClientCoreEvent::Haptics {
                     device_id,
                     duration,
                     frequency,
                     amplitude,
-                } => AlvrEvent::Haptics {
-                    device_id,
-                    duration_s: duration.as_secs_f32(),
-                    frequency,
-                    amplitude,
+                } => AlvrEventC {
+                    HAPTICS: HapticsBodyC {
+                        tag: AlvrEventTagC::Haptics,
+                        device_id,
+                        duration_s: duration.as_secs_f32(),
+                        frequency,
+                        amplitude,
+                    },
                 },
                 ClientCoreEvent::DecoderConfig { codec, config_nal } => {
                     *DECODER_CONFIG_BUFFER.lock() = config_nal;
 
-                    AlvrEvent::DecoderConfig {
-                        codec: match codec {
-                            CodecType::H264 => AlvrCodec::H264,
-                            CodecType::Hevc => AlvrCodec::Hevc,
-                            CodecType::AV1 => AlvrCodec::AV1,
+                    AlvrEventC {
+                        DECODER_CONFIG: DecoderConfigBodyC {
+                            tag: AlvrEventTagC::DecoderConfig,
+                            codec: match codec {
+                                CodecType::H264 => AlvrCodec::H264,
+                                CodecType::Hevc => AlvrCodec::Hevc,
+                                CodecType::AV1 => AlvrCodec::AV1,
+                            },
                         },
                     }
                 }
-                ClientCoreEvent::RealTimeConfig(_) => AlvrEvent::RealTimeConfig {},
+                ClientCoreEvent::RealTimeConfig(_) => AlvrEventC {
+                    tag: AlvrEventTagC::RealTimeConfig,
+                },
             };
 
             unsafe { *out_event = event };
@@ -735,6 +801,25 @@ pub extern "C" fn alvr_initialize_opengl() {
     GRAPHICS_CONTEXT.set(Some(Rc::new(GraphicsContext::new_gl())));
 }
 
+/// QiYu SXR only: adopt the EGL context already made current by the native SXR backend, instead
+/// of letting wgpu create a separate one. Required so the lobby/stream swapchain textures and
+/// qiyu_SubmitFrame share a single GL context/namespace (otherwise timewarp gets empty frames and
+/// the render loop deadlocks -> black screen). Returns false on failure so the caller can bail.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "C" fn alvr_initialize_opengl_external() -> bool {
+    match unsafe { GraphicsContext::new_gl_external() } {
+        Ok(context) => {
+            GRAPHICS_CONTEXT.set(Some(Rc::new(context)));
+            true
+        }
+        Err(error) => {
+            error!("[QIYU] alvr_initialize_opengl_external failed: {error}");
+            false
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn alvr_destroy_opengl() {
     GRAPHICS_CONTEXT.set(None);
@@ -869,8 +954,7 @@ pub unsafe extern "C" fn alvr_render_stream_opengl(
     STREAM_RENDERER.with_borrow(|renderer| {
         if let Some(renderer) = renderer {
             let left_params = &*view_params;
-            let right_params = &*view_params.offset(1);
-            renderer.render(
+            let right_params = &*view_params.offset(1);            renderer.render(
                 hardware_buffer,
                 [
                     StreamViewParams {
@@ -904,6 +988,11 @@ pub unsafe extern "C" fn alvr_render_stream_opengl(
                 ],
                 None,
             );
+        } else {
+            // [STREAM-CALL-DBG] STREAM_RENDERER is a thread_local: if alvr_start_stream_opengl ran
+            // on a different thread than this call, the renderer reads back as None here and every
+            // streamed frame is silently dropped.
+            alvr_common::error!("[STREAM-CALL-DBG] STREAM_RENDERER is None; frame dropped");
         }
     });
 }

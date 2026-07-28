@@ -67,8 +67,17 @@ public class VRActivity extends Activity {
 
         @Override
         public void surfaceChanged(SurfaceHolder holder, int fmt, int w, int h) {
+            // Only restart the SXR pipeline when the underlying Surface instance actually
+            // changes. Android delivers a spurious surfaceChanged right after surfaceCreated;
+            // pausing+resuming on that spurious callback re-enters alvr_qiyu_start, rebuilds the
+            // SXR context and kills the freshly-started render loop (black screen).
+            Surface newSurface = holder.getSurface();
+            if (newSurface == mScreenSurface) {
+                Log.i(TAG, "surfaceChanged: same surface, skipping restart");
+                return;
+            }
             maybePause();
-            mScreenSurface = holder.getSurface();
+            mScreenSurface = newSurface;
             maybeResume();
         }
 
@@ -173,6 +182,7 @@ public class VRActivity extends Activity {
     }
 
     void maybeResume() {
+        Log.i(TAG, "maybeResume: mResumed=" + mResumed + " surface=" + (mScreenSurface != null));
         if (mResumed && mScreenSurface != null) {
             mRenderingHandler.post(() -> {
                 onResumeNative(mScreenSurface);
@@ -191,6 +201,7 @@ public class VRActivity extends Activity {
     }
 
     void maybePause() {
+        Log.i(TAG, "maybePause: mResumed=" + mResumed + " surface=" + (mScreenSurface != null));
         if (mResumed && mScreenSurface != null) {
             mRenderingHandler.post(this::onPauseNative);
         }
