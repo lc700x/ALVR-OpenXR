@@ -76,6 +76,8 @@ cmake-build-debug/
 # HVR session scratch (not source)
 *.local.txt
 build-*.log
+build[0-9]*.log
+logs/
 build-*.ps1
 capture-*.ps1
 parse-*.ps1

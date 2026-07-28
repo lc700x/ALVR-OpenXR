@@ -135,6 +135,7 @@ struct InputIds {
     uint64_t haptics[kEyeCount]{};
     uint64_t profile = 0;
     uint64_t menu = 0;
+    uint64_t system = 0;
     uint64_t face_click[kEyeCount][2]{};
     uint64_t face_touch[kEyeCount][2]{};
     uint64_t squeeze_click[kEyeCount]{};
@@ -373,7 +374,11 @@ void initialize_ids() {
     // leaves controller_button_mapping_manager unset and silently discards every button entry
     // (poses still work, since tracking bypasses button mapping).
     state.ids.profile = id("/interaction_profiles/oculus/touch_controller");
+    // The Oculus Touch profile names this button per hand: menu/click on the left, system/click on
+    // the right (see CONTROLLER_PROFILE_INFO in alvr_common::inputs). Sending the right
+    // controller's BT_Home_Menu to a left-hand path would be dropped by the server's button set.
     state.ids.menu = id("/user/hand/left/input/menu/click");
+    state.ids.system = id("/user/hand/right/input/system/click");
 
     const char *hands[kEyeCount] = {"left", "right"};
     const char *faces[kEyeCount][2] = {{"x", "y"}, {"a", "b"}};
@@ -430,6 +435,8 @@ void update_scalar(uint64_t path, float value) {
 void clear_controller_buttons(int hand) {
     if (hand == 0) {
         update_binary(state.ids.menu, false);
+    } else {
+        update_binary(state.ids.system, false);
     }
     for (int face = 0; face < 2; ++face) {
         update_binary(state.ids.face_click[hand][face], false);
@@ -458,6 +465,8 @@ void update_controller_buttons(const qiyu_ControllerData &controller, int hand) 
     state.controller_connected[hand] = true;
     if (hand == 0) {
         update_binary(state.ids.menu, controller.button & BT_Home_Menu);
+    } else {
+        update_binary(state.ids.system, controller.button & BT_Home_Menu);
     }
     update_binary(state.ids.face_click[hand][0], controller.button & BT_A_X);
     update_binary(state.ids.face_touch[hand][0], controller.buttonTouch & BT_A_X);
@@ -581,10 +590,10 @@ void tracking_loop() {
             qiyu_ControllerData controllers[kEyeCount]{};
             api.get_controller_data(&controllers[0], &controllers[1]);
             const float prediction_seconds = static_cast<float>(prediction_ns) / 1e9f;
-            // [BTN-DIAG] The QiYu service was observed reporting click:0x0 on every sample while
-            // touch bits fired, so ABXY never reaches ALVR. Dump the raw struct fields edge-
-            // triggered (only on change) to tell "button field is dead" apart from "our bit
-            // mapping is wrong" without flooding logcat.
+            // [BTN-DIAG] With a single (right) physical controller, the click bits for A/B were
+            // seen in the hand=0 slot in one session and never in hand=1 in another, while
+            // buttonTouch fired in both. Print battery and isShow alongside, since those identify
+            // which slot the real device actually landed in.
             static int last_button[kEyeCount] = {-1, -1};
             static int last_touch[kEyeCount] = {-1, -1};
             for (int hand = 0; hand < kEyeCount; ++hand) {
@@ -593,9 +602,10 @@ void tracking_loop() {
                     last_button[hand] = controllers[hand].button;
                     last_touch[hand] = controllers[hand].buttonTouch;
                     log(ANDROID_LOG_WARN,
-                        "[BTN-DIAG] hand=%d connect=%d button=0x%08x touch=0x%08x "
+                        "[BTN-DIAG] hand=%d connect=%d show=%d batt=%d button=0x%08x touch=0x%08x "
                         "trigger=%.3f grip=%.3f stick=(%.3f,%.3f)",
-                        hand, controllers[hand].isConnect, controllers[hand].button,
+                        hand, controllers[hand].isConnect, controllers[hand].isShow,
+                        controllers[hand].batteryLevel, controllers[hand].button,
                         controllers[hand].buttonTouch, controllers[hand].triggerForce,
                         controllers[hand].gripForce, controllers[hand].joyStickPos.x,
                         controllers[hand].joyStickPos.y);
