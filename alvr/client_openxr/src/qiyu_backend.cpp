@@ -194,24 +194,64 @@ bool initialize_egl() {
         return false;
     }
 
+    // Do NOT use eglChooseConfig here. Android's EGL injects multisample flags into
+    // eglChooseConfig when the system "force 4x MSAA" developer option is on, which is wasted on
+    // a warp target and yields a config whose sample count does not match the eye textures — SXR
+    // then fails to resolve one eye and it stays black. Enumerate configs and match the exact
+    // attributes instead, as the reference ALVR-QIYU client does.
     constexpr EGLint attributes[] = {
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT_KHR,
-        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT | EGL_WINDOW_BIT,
         EGL_RED_SIZE, 8,
         EGL_GREEN_SIZE, 8,
         EGL_BLUE_SIZE, 8,
-        EGL_ALPHA_SIZE, 8,
+        EGL_ALPHA_SIZE, 8, // the multi-pass timewarp compositor needs alpha
         EGL_DEPTH_SIZE, 0,
         EGL_STENCIL_SIZE, 0,
         EGL_SAMPLES, 0,
         EGL_NONE,
     };
+
+    constexpr int kMaxConfigs = 1024;
+    EGLConfig configs[kMaxConfigs];
     EGLint config_count = 0;
-    if (!eglChooseConfig(state.egl.display, attributes, &state.egl.config, 1,
-                         &config_count) || config_count == 0) {
-        log(ANDROID_LOG_ERROR, "eglChooseConfig failed: 0x%x", eglGetError());
+    if (!eglGetConfigs(state.egl.display, configs, kMaxConfigs, &config_count)) {
+        log(ANDROID_LOG_ERROR, "eglGetConfigs failed: 0x%x", eglGetError());
         return false;
     }
+
+    state.egl.config = nullptr;
+    for (EGLint i = 0; i < config_count; ++i) {
+        EGLint value = 0;
+
+        eglGetConfigAttrib(state.egl.display, configs[i], EGL_RENDERABLE_TYPE, &value);
+        if ((value & EGL_OPENGL_ES3_BIT_KHR) != EGL_OPENGL_ES3_BIT_KHR) {
+            continue;
+        }
+
+        // The pbuffer config must also be window-compatible so it can share textures with the
+        // window (warp) context.
+        eglGetConfigAttrib(state.egl.display, configs[i], EGL_SURFACE_TYPE, &value);
+        if ((value & (EGL_WINDOW_BIT | EGL_PBUFFER_BIT)) !=
+            (EGL_WINDOW_BIT | EGL_PBUFFER_BIT)) {
+            continue;
+        }
+
+        int j = 0;
+        for (; attributes[j] != EGL_NONE; j += 2) {
+            eglGetConfigAttrib(state.egl.display, configs[i], attributes[j], &value);
+            if (value != attributes[j + 1]) {
+                break;
+            }
+        }
+        if (attributes[j] == EGL_NONE) {
+            state.egl.config = configs[i];
+            break;
+        }
+    }
+    if (state.egl.config == nullptr) {
+        log(ANDROID_LOG_ERROR, "no exact-match EGL config among %d", config_count);
+        return false;
+    }
+    log(ANDROID_LOG_INFO, "EGL config selected by exact match (%d candidates)", config_count);
 
     constexpr EGLint context_attributes[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
     state.egl.context = eglCreateContext(state.egl.display, state.egl.config,
@@ -254,9 +294,11 @@ bool create_buffers(EyeBuffers (&buffers)[kEyeCount], uint32_t width, uint32_t h
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, static_cast<GLsizei>(width),
-                         static_cast<GLsizei>(height), 0, GL_RGBA,
-                         GL_UNSIGNED_BYTE, nullptr);
+            // Immutable storage, matching the reference ALVR-QIYU render target. SXR's warp
+            // samples these textures directly; a mutable glTexImage2D allocation can leave one
+            // eye unresolved (black) on this runtime.
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, static_cast<GLsizei>(width),
+                           static_cast<GLsizei>(height));
         }
     }
     glBindTexture(GL_TEXTURE_2D, 0);
@@ -957,7 +999,7 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     alvr_initialize_logging();
     // Build marker: lets a captured log prove which APK the device actually ran, so a missing
     // diagnostic can be told apart from a stale install.
-    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build30 %s %s", __DATE__, __TIME__);
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build32 %s %s", __DATE__, __TIME__);
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.java_vm = static_cast<JavaVM *>(java_vm);
 
