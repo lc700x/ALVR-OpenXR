@@ -949,13 +949,11 @@ pub unsafe extern "C" fn alvr_start_stream_opengl(config: AlvrStreamConfig) {
         view_resolution,
         compute_target_view_resolution(view_resolution, &upscaling),
         swapchain_textures,
-        alvr_graphics::SDR_FORMAT_GL,
+        alvr_graphics::SDR_FORMAT_SRGB_GL,
         foveated_encoding,
-        // The C/SXR backend supplies linear GL_RGBA8 eye textures. Unlike an OpenXR
-        // GL_SRGB8_ALPHA8 swapchain, these attachments do not automatically encode linear shader
-        // output back to sRGB. Keep the decoded sRGB numeric values unchanged; otherwise the
-        // shader's sRGB->linear conversion is left unpaired and darkens every midtone.
-        false,
+        // Match native OpenXR's preferred GL_SRGB8_ALPHA8 swapchain: decode sampled sRGB into
+        // linear values in the shader, then let the sRGB eye attachment encode them for SXR.
+        true,
         config.use_full_range && !config.enable_hdr,
         config.encoding_gamma,
         upscaling,
