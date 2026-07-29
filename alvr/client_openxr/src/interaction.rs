@@ -24,6 +24,11 @@ use xr::SpaceLocationFlags;
 const IPD_CHANGE_EPS: f32 = 0.001;
 const HVR_CONTROLLER_PROFILE_PATH: &str = "/interaction_profiles/huawei/6dof_controller";
 
+// When true, QiYu suggests only the Oculus Touch profile. The runtime is then unable to fall back
+// to khr/simple_controller, so the [PROFILE-DIAG] lines report whether it activates Touch (full
+// button set) or leaves the controllers unbound.
+const QIYU_FORCE_TOUCH_PROFILE: bool = true;
+
 fn hvr_binding_path(standard_path: &str) -> Option<String> {
     if standard_path.ends_with("/thumbrest/touch") {
         None
@@ -531,7 +536,21 @@ impl InteractionContext {
         // Every conformant runtime must support the Khronos simple controller, which
         // Monado maps real controllers onto, so additionally suggest those bindings to
         // recover controller pose, trigger (select) and menu input.
+        //
+        // Set QIYU_FORCE_TOUCH_PROFILE to skip the simple-controller fallback. With both
+        // profiles suggested the runtime always picks the simple one, so this is the only way
+        // to observe whether it would ever activate Touch and expose the full button set.
         if platform == Platform::Qiyu {
+            match &bindings_result {
+                Ok(()) => info!(
+                    "[QIYU] oculus/touch_controller bindings accepted (profile: {interaction_profile_path})"
+                ),
+                Err(error) => {
+                    warn!("[QIYU] oculus/touch_controller bindings rejected: {error}")
+                }
+            }
+        }
+        if platform == Platform::Qiyu && !QIYU_FORCE_TOUCH_PROFILE {
             let mut simple_bindings = vec![
                 binding(&left_grip_action, "/user/hand/left/input/grip/pose"),
                 binding(&right_grip_action, "/user/hand/right/input/grip/pose"),
