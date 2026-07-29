@@ -942,7 +942,7 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     alvr_initialize_logging();
     // Build marker: lets a captured log prove which APK the device actually ran, so a missing
     // diagnostic can be told apart from a stale install.
-    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build51 %s %s", __DATE__, __TIME__);
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build53 %s %s", __DATE__, __TIME__);
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.java_vm = static_cast<JavaVM *>(java_vm);
 
@@ -1198,15 +1198,17 @@ extern "C" void alvr_qiyu_destroy() {
 // SDK does expose the full button set through qiyu_GetControllerData, so read the controllers
 // directly from libqiyuapi.so while OpenXR keeps driving display and tracking.
 //
-// This deliberately does not call qiyu_Init or qiyu_StartVR: entering SXR VR mode would fight the
-// active OpenXR runtime. If the controller module is unavailable without that initialization, the
-// probe simply reports failure and the caller keeps the simple-controller bindings.
+// qiyu_IsControllerInit stays false until qiyu_Init has run, so the bridge does call it. It stops
+// there: qiyu_StartVR is what takes over the display, and that would fight the active OpenXR
+// runtime. qiyu_Init is documented as being callable straight from android_main with the
+// ANativeActivity jobject and JavaVM, which is exactly where this runs.
 // ---------------------------------------------------------------------------
 
 namespace {
 
 struct ControllerBridge {
     void *library = nullptr;
+    decltype(&qiyu_Init) init = nullptr;
     decltype(&qiyu_IsControllerInit) is_initialized = nullptr;
     decltype(&qiyu_GetControllerData) get_data = nullptr;
     decltype(&qiyu_StartControllerVibration) start_vibration = nullptr;
@@ -1215,6 +1217,12 @@ struct ControllerBridge {
 };
 
 ControllerBridge bridge;
+
+// Set from Java once every QiYu SXR library has been loaded with System.loadLibrary. QVR_Init
+// (inside libqiyivrsdkcore.so) dereferences globals that only that library's JNI_OnLoad sets up,
+// and dlopen from native code does not run JNI_OnLoad, so calling qiyu_Init without this is a
+// guaranteed null-pointer crash.
+std::atomic_bool sxr_libraries_loaded = false;
 
 } // namespace
 
@@ -1229,15 +1237,19 @@ struct AlvrQiyuController {
     float stick_y;
 };
 
-extern "C" bool alvr_qiyu_controller_bridge_init() {
+extern "C" bool alvr_qiyu_controller_bridge_init(void *activity, void *java_vm) {
     if (bridge.loaded) {
         return true;
     }
+    // The OpenXR path never reaches alvr_qiyu_initialize, so repeat the build marker here to keep
+    // captures able to tell a stale install apart from a missing diagnostic.
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build53 %s %s", __DATE__, __TIME__);
     bridge.library = dlopen("libqiyuapi.so", RTLD_NOW | RTLD_LOCAL);
     if (bridge.library == nullptr) {
         log(ANDROID_LOG_WARN, "[CTRL-BRIDGE] cannot load libqiyuapi.so: %s", dlerror());
         return false;
     }
+    bridge.init = reinterpret_cast<decltype(bridge.init)>(dlsym(bridge.library, "qiyu_Init"));
     bridge.is_initialized = reinterpret_cast<decltype(bridge.is_initialized)>(
         dlsym(bridge.library, "qiyu_IsControllerInit"));
     bridge.get_data = reinterpret_cast<decltype(bridge.get_data)>(
@@ -1254,6 +1266,38 @@ extern "C" bool alvr_qiyu_controller_bridge_init() {
     }
     bridge.loaded = true;
     log(ANDROID_LOG_WARN, "[CTRL-BRIDGE] libqiyuapi.so loaded, controller_init=%d",
+        bridge.is_initialized() ? 1 : 0);
+
+    if (bridge.init == nullptr) {
+        log(ANDROID_LOG_WARN, "[CTRL-BRIDGE] qiyu_Init symbol missing");
+        return true;
+    }
+    if (!sxr_libraries_loaded.load()) {
+        log(ANDROID_LOG_WARN,
+            "[CTRL-BRIDGE] SXR libraries not loaded through System.loadLibrary; skipping "
+            "qiyu_Init to avoid the QVR_Init null dereference");
+        return true;
+    }
+
+    // QVR_Init dereferences the JNIEnv of the calling thread and keeps the activity object, so
+    // attach the thread and hand it a global reference, the same way the SXR path does.
+    auto *vm = static_cast<JavaVM *>(java_vm);
+    JNIEnv *jni_env = nullptr;
+    if (vm != nullptr && vm->GetEnv(reinterpret_cast<void **>(&jni_env), JNI_VERSION_1_6) ==
+                             JNI_EDETACHED) {
+        JavaVMAttachArgs args{JNI_VERSION_1_6, "alvr_qiyu_controllers", nullptr};
+        if (vm->AttachCurrentThread(&jni_env, &args) != JNI_OK) {
+            jni_env = nullptr;
+        }
+    }
+    jobject activity_ref = static_cast<jobject>(activity);
+    if (jni_env != nullptr && activity_ref != nullptr) {
+        activity_ref = jni_env->NewGlobalRef(activity_ref);
+    }
+
+    const bool init_ok = bridge.init(activity_ref, vm, qiyu_GraphicsApi::GA_OpenGLES,
+                                     qiyu_TrackingOriginMode::TM_Ground, false);
+    log(ANDROID_LOG_WARN, "[CTRL-BRIDGE] qiyu_Init=%d controller_init=%d", init_ok ? 1 : 0,
         bridge.is_initialized() ? 1 : 0);
     return true;
 }
@@ -1363,6 +1407,13 @@ Java_alvr_client_VRActivity_onBatteryChangedNative(
                       static_cast<bool>(plugged));
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_alvr_client_VRActivity_setSxrLibrariesLoadedNative(JNIEnv * /*env*/, jclass /*clazz*/,
+                                                        jboolean loaded) {
+    sxr_libraries_loaded.store(loaded == JNI_TRUE);
+    log(ANDROID_LOG_WARN, "[CTRL-BRIDGE] SXR libraries loaded=%d", loaded == JNI_TRUE ? 1 : 0);
+}
+
 // Explicitly register the VRActivity native methods. The linker's --gc-sections pass removes
 // the individually-exported Java_* symbols because nothing in the Rust code references them
 // (they are only called dynamically from Java), which caused UnsatisfiedLinkError.
@@ -1400,6 +1451,8 @@ extern "C" jint alvr_qiyu_register_natives(JavaVM *vm) {
          reinterpret_cast<void *>(Java_alvr_client_VRActivity_renderNative)},
         {"onBatteryChangedNative", "(IZ)V",
          reinterpret_cast<void *>(Java_alvr_client_VRActivity_onBatteryChangedNative)},
+        {"setSxrLibrariesLoadedNative", "(Z)V",
+         reinterpret_cast<void *>(Java_alvr_client_VRActivity_setSxrLibrariesLoadedNative)},
     };
     env->RegisterNatives(clazz, methods,
                          static_cast<jint>(sizeof(methods) / sizeof(methods[0])));

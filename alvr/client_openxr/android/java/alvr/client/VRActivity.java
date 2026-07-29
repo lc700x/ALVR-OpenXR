@@ -58,12 +58,14 @@ public class VRActivity extends Activity {
     // JNI_OnLoad. QVR_Init (in libqiyivrsdkcore.so) dereferences globals that are only set up by
     // that library's JNI_OnLoad; loading it with dlopen from native code does NOT trigger
     // JNI_OnLoad, which is why QVR_Init crashed with a null-pointer dereference.
-    static void loadQiyuLibrary(String name) {
+    static boolean loadQiyuLibrary(String name) {
         try {
             System.loadLibrary(name);
             Log.i(TAG, "loaded QiYu library " + name);
+            return true;
         } catch (Throwable t) {
             Log.e(TAG, "loadLibrary " + name + " failed: " + t);
+            return false;
         }
     }
 
@@ -116,6 +118,23 @@ public class VRActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        // Load the QiYu SXR libraries so their JNI_OnLoad runs and initializes the VRSDKCore
+        // globals required by QVR_Init. Order matters: the core/base libraries must be loaded
+        // before qiyuapi, which depends on them.
+        //
+        // This runs before the OpenXR delegation below on purpose. The OpenXR path also calls
+        // qiyu_Init (from the native controller bridge, to bring up the controller module the
+        // simple-controller interaction profile cannot supply), and QVR_Init dereferences those
+        // same globals. Loading libqiyuapi.so with dlopen from native code does NOT trigger
+        // JNI_OnLoad, which made QVR_Init crash with a null-pointer dereference.
+        boolean sxrLoaded = loadQiyuLibrary("qiyivrsdkcore");
+        sxrLoaded &= loadQiyuLibrary("sxrapi");
+        sxrLoaded &= loadQiyuLibrary("ashreader");
+        sxrLoaded &= loadQiyuLibrary("qiyuapi");
+        // Gate the native qiyu_Init call. If any library is missing, QVR_Init dereferences a null
+        // global and takes the whole process down, so the bridge must skip it instead.
+        setSxrLibrariesLoadedNative(sxrLoaded);
+
         // Non-QiYu devices: delegate to the standard NativeActivity (OpenXR) and exit.
         if (!isQiyu()) {
             Log.i(TAG, "Non-QiYu device, delegating to NativeActivity (OpenXR path).");
@@ -126,14 +145,6 @@ public class VRActivity extends Activity {
             finish();
             return;
         }
-
-        // Load the QiYu SXR libraries here (QiYu-only) so their JNI_OnLoad runs and initializes
-        // the VRSDKCore globals required by QVR_Init. Order matters: the core/base libraries must
-        // be loaded before qiyuapi, which depends on them.
-        loadQiyuLibrary("qiyivrsdkcore");
-        loadQiyuLibrary("sxrapi");
-        loadQiyuLibrary("ashreader");
-        loadQiyuLibrary("qiyuapi");
 
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
@@ -239,6 +250,9 @@ public class VRActivity extends Activity {
     native void renderNative();
 
     native void onBatteryChangedNative(int battery, boolean plugged);
+
+    // Static: also consulted by the OpenXR path, which runs without a VRActivity instance.
+    static native void setSxrLibrariesLoadedNative(boolean loaded);
 
     @SuppressWarnings("unused")
     public void onStreamStart() {
