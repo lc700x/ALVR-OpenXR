@@ -36,6 +36,12 @@ constexpr int kSwapchainLength = 3;
 constexpr size_t kMaxTrackingFrames = 360;
 constexpr float kButtonEpsilon = 0.001f;
 constexpr float kDefaultRefreshRate = 72.0f;
+// Display calibration for the SXR compositor. The stream shader chain is numerically identity on
+// this path (no range fix, no sRGB decode, linear GL_RGBA8 eye textures), yet SXR still presents
+// the same content darker than the OpenXR runtime does, so the difference lies in the compositor's
+// own display transfer. Compensate with an explicit gamma: values below 1.0 brighten midtones and
+// leave black and white fixed. Applied only when the server negotiates a neutral gamma.
+constexpr float kQiyuDisplayGamma = 0.85f;
 
 void log(int priority, const char *format, ...);
 
@@ -742,7 +748,8 @@ void start_stream(const StreamingStarted_Body &config) {
     // into [16/255, 235/255]; applying it a second time here lowers white to 92.2% and makes the
     // whole image visibly dark, so do not request the redundant staging correction.
     renderer_config.use_full_range = false;
-    renderer_config.encoding_gamma = config.encoding_gamma;
+    renderer_config.encoding_gamma =
+        config.encoding_gamma == 1.0f ? kQiyuDisplayGamma : config.encoding_gamma;
     renderer_config.enable_hdr = config.enable_hdr;
     alvr_start_stream_opengl(renderer_config);
 
@@ -917,7 +924,7 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     alvr_initialize_logging();
     // Build marker: lets a captured log prove which APK the device actually ran, so a missing
     // diagnostic can be told apart from a stale install.
-    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build44 %s %s", __DATE__, __TIME__);
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build45 %s %s", __DATE__, __TIME__);
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.java_vm = static_cast<JavaVM *>(java_vm);
 
