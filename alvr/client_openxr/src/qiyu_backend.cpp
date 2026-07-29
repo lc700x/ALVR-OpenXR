@@ -942,7 +942,7 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     alvr_initialize_logging();
     // Build marker: lets a captured log prove which APK the device actually ran, so a missing
     // diagnostic can be told apart from a stale install.
-    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build53 %s %s", __DATE__, __TIME__);
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build54 %s %s", __DATE__, __TIME__);
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.java_vm = static_cast<JavaVM *>(java_vm);
 
@@ -1243,7 +1243,7 @@ extern "C" bool alvr_qiyu_controller_bridge_init(void *activity, void *java_vm) 
     }
     // The OpenXR path never reaches alvr_qiyu_initialize, so repeat the build marker here to keep
     // captures able to tell a stale install apart from a missing diagnostic.
-    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build53 %s %s", __DATE__, __TIME__);
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build54 %s %s", __DATE__, __TIME__);
     bridge.library = dlopen("libqiyuapi.so", RTLD_NOW | RTLD_LOCAL);
     if (bridge.library == nullptr) {
         log(ANDROID_LOG_WARN, "[CTRL-BRIDGE] cannot load libqiyuapi.so: %s", dlerror());

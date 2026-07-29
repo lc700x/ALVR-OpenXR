@@ -47,6 +47,26 @@ fn environment_blend_mode(platform: Platform) -> xr::EnvironmentBlendMode {
     }
 }
 
+/// Reports whether the runtime can composite the submitted layers against the real world through
+/// the standard alpha-blend environment mode. This is the only passthrough route on runtimes that
+/// expose no composition-layer passthrough extension ALVR understands: QiYu ships an undocumented
+/// XR_QIYU_passthrough rather than the FB or HTC one, so `PassthroughLayer::new` always fails
+/// there even though the headset has cameras.
+fn supports_alpha_blend(xr_instance: &xr::Instance, xr_system: xr::SystemId) -> bool {
+    match xr_instance
+        .enumerate_environment_blend_modes(xr_system, xr::ViewConfigurationType::PRIMARY_STEREO)
+    {
+        Ok(modes) => {
+            info!("OpenXR environment blend modes: {modes:?}");
+            modes.contains(&xr::EnvironmentBlendMode::ALPHA_BLEND)
+        }
+        Err(error) => {
+            error!("Cannot enumerate environment blend modes: {error}");
+            false
+        }
+    }
+}
+
 fn tracking_reference_space_type(platform: Platform) -> xr::ReferenceSpaceType {
     if platform == Platform::Hvr {
         xr::ReferenceSpaceType::LOCAL
@@ -429,7 +449,9 @@ pub fn entry_point() {
         let mut logged_first_frame = false;
         let mut hvr_stream_frame_diag_count: u32 = 0;
         let mut stream_context = None::<StreamContext>;
-        let environment_blend_mode = environment_blend_mode(platform);
+        let opaque_blend_mode = environment_blend_mode(platform);
+        let alpha_blend_supported = supports_alpha_blend(&xr_instance, xr_system);
+        let mut environment_blend_mode = opaque_blend_mode;
 
         let mut event_storage = xr::EventDataBuffer::new();
         'render_loop: loop {
@@ -551,9 +573,22 @@ pub fn entry_point() {
                             passthrough_layer = None;
                         }
 
+                        // With no passthrough composition layer the real world can still show
+                        // through the stream, but only if the runtime blends the submitted layers
+                        // against it. Ask for that mode while the server wants passthrough.
+                        if alpha_blend_supported && passthrough_layer.is_none() {
+                            environment_blend_mode = if context.uses_passthrough() {
+                                xr::EnvironmentBlendMode::ALPHA_BLEND
+                            } else {
+                                opaque_blend_mode
+                            };
+                        }
+
                         stream_context = Some(context);
                     }
                     ClientCoreEvent::StreamingStopped => {
+                        environment_blend_mode = opaque_blend_mode;
+
                         if passthrough_layer.is_none() {
                             passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
                         }
@@ -616,6 +651,14 @@ pub fn entry_point() {
                             passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
                         } else if config.passthrough.is_none() && passthrough_layer.is_some() {
                             passthrough_layer = None;
+                        }
+
+                        if alpha_blend_supported && passthrough_layer.is_none() {
+                            environment_blend_mode = if config.passthrough.is_some() {
+                                xr::EnvironmentBlendMode::ALPHA_BLEND
+                            } else {
+                                opaque_blend_mode
+                            };
                         }
 
                         if let Some(stream) = &mut stream_context {
