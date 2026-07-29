@@ -784,7 +784,12 @@ void start_stream(const StreamingStarted_Body &config) {
     renderer_config.upscaling_edge_threshold = config.upscaling_edge_threshold;
     renderer_config.upscaling_edge_sharpness = config.upscaling_edge_sharpness;
     renderer_config.upscale_factor = config.upscale_factor;
-    renderer_config.use_full_range = config.use_full_range;
+    // OMX.qcom.video.decoder.avc on QiYu already converts the negotiated YUV range while producing
+    // the external RGB texture. The generic Android full-range workaround remaps RGB [0, 1] back
+    // into [16/255, 235/255]; applying it here a second time lowers white to 92.2% and makes the
+    // whole image visibly dark (log37/build38). Keep the negotiated value in STREAM-CONFIG for
+    // diagnostics, but do not request the redundant staging correction on this decoder.
+    renderer_config.use_full_range = false;
     renderer_config.encoding_gamma = config.encoding_gamma;
     renderer_config.enable_hdr = config.enable_hdr;
     alvr_start_stream_opengl(renderer_config);
@@ -797,7 +802,7 @@ void start_stream(const StreamingStarted_Body &config) {
     log(ANDROID_LOG_WARN,
         "[STREAM-CONFIG] source=%ux%u target=%ux%u foveation=%d "
         "center=(%.3f,%.3f) shift=(%.3f,%.3f) edge=(%.3f,%.3f) "
-        "upscaling=%d factor=%.3f full_range=%d gamma=%.3f hdr=%d",
+        "upscaling=%d factor=%.3f full_range=%d range_fix=0 gamma=%.3f hdr=%d",
         state.stream_source_width, state.stream_source_height, state.stream_width,
         state.stream_height, config.enable_foveated_encoding,
         config.foveation_center_size_x, config.foveation_center_size_y,
@@ -1053,7 +1058,7 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     alvr_initialize_logging();
     // Build marker: lets a captured log prove which APK the device actually ran, so a missing
     // diagnostic can be told apart from a stale install.
-    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build39 %s %s", __DATE__, __TIME__);
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build40 %s %s", __DATE__, __TIME__);
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.java_vm = static_cast<JavaVM *>(java_vm);
 
