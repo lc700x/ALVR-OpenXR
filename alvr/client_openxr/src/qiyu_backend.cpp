@@ -287,8 +287,7 @@ void destroy_egl() {
     state.egl = {};
 }
 
-bool create_buffers(EyeBuffers (&buffers)[kEyeCount], uint32_t width, uint32_t height,
-                    GLenum internal_format = GL_RGBA8) {
+bool create_buffers(EyeBuffers (&buffers)[kEyeCount], uint32_t width, uint32_t height) {
     for (auto &eye : buffers) {
         glGenTextures(kSwapchainLength, eye.textures.data());
         eye.index = 0;
@@ -301,7 +300,7 @@ bool create_buffers(EyeBuffers (&buffers)[kEyeCount], uint32_t width, uint32_t h
             // Immutable storage, matching the reference ALVR-QIYU render target. SXR's warp
             // samples these textures directly; a mutable glTexImage2D allocation can leave one
             // eye unresolved (black) on this runtime.
-            glTexStorage2D(GL_TEXTURE_2D, 1, internal_format, static_cast<GLsizei>(width),
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, static_cast<GLsizei>(width),
                            static_cast<GLsizei>(height));
         }
     }
@@ -759,8 +758,7 @@ void start_stream(const StreamingStarted_Body &config) {
     EyeBuffers old[kEyeCount] = {state.stream[0], state.stream[1]};
     state.stream[0] = {};
     state.stream[1] = {};
-    if (!create_buffers(state.stream, state.stream_width, state.stream_height,
-                        GL_SRGB8_ALPHA8)) {
+    if (!create_buffers(state.stream, state.stream_width, state.stream_height)) {
         state.stream[0] = old[0];
         state.stream[1] = old[1];
         return;
@@ -804,7 +802,7 @@ void start_stream(const StreamingStarted_Body &config) {
     log(ANDROID_LOG_WARN,
         "[STREAM-CONFIG] source=%ux%u target=%ux%u foveation=%d "
         "center=(%.3f,%.3f) shift=(%.3f,%.3f) edge=(%.3f,%.3f) "
-        "upscaling=%d factor=%.3f full_range=%d range_fix=0 srgb_target=1 gamma=%.3f hdr=%d",
+        "upscaling=%d factor=%.3f full_range=%d range_fix=0 srgb_fix=0 gamma=%.3f hdr=%d",
         state.stream_source_width, state.stream_source_height, state.stream_width,
         state.stream_height, config.enable_foveated_encoding,
         config.foveation_center_size_x, config.foveation_center_size_y,
@@ -1060,7 +1058,7 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     alvr_initialize_logging();
     // Build marker: lets a captured log prove which APK the device actually ran, so a missing
     // diagnostic can be told apart from a stale install.
-    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build42 %s %s", __DATE__, __TIME__);
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build43 %s %s", __DATE__, __TIME__);
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.java_vm = static_cast<JavaVM *>(java_vm);
 
