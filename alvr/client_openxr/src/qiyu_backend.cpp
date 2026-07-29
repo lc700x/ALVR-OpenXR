@@ -43,10 +43,13 @@ constexpr float kDefaultRefreshRate = 72.0f;
 // leave black and white fixed. Applied only when the server negotiates a neutral gamma.
 constexpr float kQiyuDisplayGamma = 0.75f;
 // Per-eye resolution reported to the server. qiyu_GetDeviceInfo returns the SXR eye-buffer target
-// (1920x1920), but this headset's own OpenXR runtime recommends 2160x2160 per eye, which made the
-// server negotiate a 2816x2816 stream instead of 2592x2592. Reporting the smaller value cost about
-// 18% of the pixels and is why the SXR path looked softer than the OpenXR path.
+// (1920x1920), which is lower than the 2160x2160 this headset's own OpenXR runtime recommends.
+// Report the larger value so a server configured for scaled resolution derives the same stream size
+// as the OpenXR path. Note that a server using an absolute view resolution ignores this entirely.
 constexpr int kQiyuRecommendedViewSize = 2160;
+// GPU foveation level requested from SXR, matching the XR_QIYU_foveation profile the QiYu OpenXR
+// runtime enables. FL_Low keeps the fovea at full resolution and only reduces the periphery.
+constexpr qiyu_FoveationLevel kQiyuFoveationLevel = qiyu_FoveationLevel::FL_Low;
 
 void log(int priority, const char *format, ...);
 
@@ -66,6 +69,7 @@ struct QiyuApi {
     decltype(&qiyu_PredictHeadPose) predict_head_pose = nullptr;
     decltype(&qiyu_PostSetEyeBufferSize) post_eye_buffer_size = nullptr;
     decltype(&qiyu_SetTrackingOriginMode) set_tracking_origin = nullptr;
+    decltype(&qiyu_SetFoveation) set_foveation = nullptr;
     decltype(&qiyu_IsControllerInit) is_controller_initialized = nullptr;
     decltype(&qiyu_GetControllerData) get_controller_data = nullptr;
     decltype(&qiyu_StartControllerVibration) start_vibration = nullptr;
@@ -109,6 +113,15 @@ struct QiyuApi {
                LOAD_QIYU(stop_vibration, qiyu_StopControllerVibration) &&
                LOAD_QIYU(get_boundary_dimensions, qiyu_GetBoundaryDimensions);
 #undef LOAD_QIYU
+    }
+
+    // Optional: older libqiyuapi.so builds may not export foveation. Load it separately so a
+    // missing symbol degrades to "no foveation" instead of failing the whole backend.
+    void load_optional_symbols() {
+        set_foveation = reinterpret_cast<decltype(set_foveation)>(dlsym(library, "qiyu_SetFoveation"));
+        if (set_foveation == nullptr) {
+            log(ANDROID_LOG_WARN, "qiyu_SetFoveation unavailable; running without foveation");
+        }
     }
 
     void unload() {
@@ -929,7 +942,7 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     alvr_initialize_logging();
     // Build marker: lets a captured log prove which APK the device actually ran, so a missing
     // diagnostic can be told apart from a stale install.
-    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build46 %s %s", __DATE__, __TIME__);
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build47 %s %s", __DATE__, __TIME__);
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.java_vm = static_cast<JavaVM *>(java_vm);
 
@@ -969,6 +982,7 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
         return false;
     }
     log(ANDROID_LOG_INFO, "init step 2: api.load() ok");
+    api.load_optional_symbols();
     if (!initialize_egl()) {
         log(ANDROID_LOG_ERROR, "init step 3: initialize_egl() FAILED");
         destroy_egl();
@@ -1067,6 +1081,13 @@ extern "C" bool alvr_qiyu_start(void *native_window) {
     }
     log(ANDROID_LOG_INFO, "start step 2: qiyu_StartVR ok");
     api.set_tracking_origin(qiyu_TrackingOriginMode::TM_Ground);
+    // The QiYu OpenXR runtime enables XR_QIYU_foveation (QCOM hardware foveated rendering) for its
+    // eye swapchains. Request the same GPU foveation here so the SXR path renders with the
+    // resolution profile the OpenXR path uses instead of a uniformly sampled eye buffer.
+    if (api.set_foveation != nullptr &&
+        !api.set_foveation(kQiyuFoveationLevel, nullptr)) {
+        log(ANDROID_LOG_WARN, "qiyu_SetFoveation failed; continuing without foveation");
+    }
     if (!create_buffers(state.lobby, state.view_width, state.view_height)) {
         log(ANDROID_LOG_ERROR, "start step 3: create_buffers FAILED");
         api.end_vr();
