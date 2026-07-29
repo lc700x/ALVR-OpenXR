@@ -308,6 +308,10 @@ impl InteractionContext {
             // Reuse Touch button inventory for server-side mapping. Bindings are
             // suggested against Huawei's actual interaction profile below.
             Platform::Hvr => QUEST_CONTROLLER_PROFILE_PATH,
+            // QiYu's runtime exposes no vendor controller interaction profile, so bind against
+            // Oculus Touch explicitly rather than relying on the fallback and never on the simple
+            // controller profile, which would lose the face buttons, thumbstick and grip axis.
+            Platform::Qiyu => QUEST_CONTROLLER_PROFILE_PATH,
             _ => QUEST_CONTROLLER_PROFILE_PATH,
         };
         let interaction_profile_path = if platform == Platform::Hvr {

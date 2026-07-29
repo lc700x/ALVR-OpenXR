@@ -41,7 +41,7 @@ constexpr float kDefaultRefreshRate = 72.0f;
 // the same content darker than the OpenXR runtime does, so the difference lies in the compositor's
 // own display transfer. Compensate with an explicit gamma: values below 1.0 brighten midtones and
 // leave black and white fixed. Applied only when the server negotiates a neutral gamma.
-constexpr float kQiyuDisplayGamma = 0.75f;
+constexpr float kQiyuDisplayGamma = 0.65f;
 // Per-eye resolution reported to the server. qiyu_GetDeviceInfo returns the SXR eye-buffer target
 // (1920x1920), which is lower than the 2160x2160 this headset's own OpenXR runtime recommends.
 // Report the larger value so a server configured for scaled resolution derives the same stream size

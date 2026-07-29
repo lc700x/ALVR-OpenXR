@@ -34,7 +34,16 @@ public class VRActivity extends Activity {
 
     static final String TAG = "VRActivity";
 
+    // Route QiYu to the SXR backend. Set to false to use the standard OpenXR path on QiYu as
+    // well, which is what the device's own runtime uses (XR_QIYU_foveation, standard controller
+    // interaction profiles, higher negotiated stream resolution). The SXR implementation is
+    // retained and re-enabled by flipping this back to true.
+    static final boolean USE_SXR_ON_QIYU = false;
+
     static boolean isQiyu() {
+        if (!USE_SXR_ON_QIYU) {
+            return false;
+        }
         String m = (Build.MANUFACTURER == null ? "" : Build.MANUFACTURER).toUpperCase();
         String mo = (Build.MODEL == null ? "" : Build.MODEL).toUpperCase();
         String d = (Build.DEVICE == null ? "" : Build.DEVICE).toUpperCase();

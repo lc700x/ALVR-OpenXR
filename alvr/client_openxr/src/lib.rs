@@ -275,17 +275,22 @@ pub fn entry_point() {
         .other
         .into_iter()
         .filter(|ext| {
-            [
-                META_BODY_TRACKING_FULL_BODY_EXTENSION_NAME,
-                META_SIMULTANEOUS_HANDS_AND_CONTROLLERS_EXTENSION_NAME,
-                META_DETACHED_CONTROLLERS_EXTENSION_NAME,
-                BD_BODY_TRACKING_EXTENSION_NAME,
-                BD_MOTION_TRACKING_EXTENSION_NAME,
-                PICO_CONFIGURATION_EXTENSION_NAME,
-            ]
-            .contains(&ext.as_str())
+            // QiYu ships its features (foveation, hand tracking, passthrough, boundary, refresh
+            // rate, spaces) as vendor extensions rather than the KHR/FB equivalents ALVR enables
+            // above, and they are dropped unless explicitly kept here.
+            ext.starts_with("XR_QIYU_")
+                || [
+                    META_BODY_TRACKING_FULL_BODY_EXTENSION_NAME,
+                    META_SIMULTANEOUS_HANDS_AND_CONTROLLERS_EXTENSION_NAME,
+                    META_DETACHED_CONTROLLERS_EXTENSION_NAME,
+                    BD_BODY_TRACKING_EXTENSION_NAME,
+                    BD_MOTION_TRACKING_EXTENSION_NAME,
+                    PICO_CONFIGURATION_EXTENSION_NAME,
+                ]
+                .contains(&ext.as_str())
         })
         .collect();
+    alvr_common::info!("OpenXR enabled vendor extensions: {:?}", exts.other);
 
     let available_layers = xr_entry.enumerate_layers().unwrap();
     alvr_common::info!("OpenXR available layers: {available_layers:#?}");
