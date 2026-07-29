@@ -891,20 +891,29 @@ bool render_stream(qiyu_FrameParam &frame) {
     auto tracking = tracking_for_timestamp(timestamp_ns);
     AlvrViewParams input_views[kEyeCount]{};
     alvr_report_compositor_start(timestamp_ns, input_views);
-    const auto current_orientation =
-        head_orientation(api.predict_head_pose(api.predict_display_time()).pose.rotation);
-    // Same split the OpenXR path makes (stream.rs: input_view_params vs output_view_params).
-    // input_fov describes the frustum the SERVER encoded the video with, and sizes the video quad;
-    // output_fov is this headset's own lens frustum and builds the projection matrix. Collapsing
-    // them into one value (as the C API used to) makes the reprojection a plain blit, so any
-    // server/device FOV mismatch is never corrected: the two eyes end up scaled differently, never
-    // fuse, and resampling at the wrong scale looks soft.
     const auto stream_device = api.get_device_info();
+    const auto current_tracking = api.predict_head_pose(api.predict_display_time());
+    qiyu_Matrix4 current_view_matrices[kEyeCount]{};
+    float tracking_offset = state.tracking_offset.load();
+    api.get_view_matrix(current_view_matrices[0], current_view_matrices[1], tracking_offset,
+                        current_tracking, stream_device.frustumLeftEye.rotation,
+                        stream_device.frustumRightEye.rotation);
+    state.tracking_offset.store(tracking_offset);
+
+    // Mirror client_openxr::stream exactly: input is the full per-eye pose/FOV the server used to
+    // render this decoded frame, output is the full current per-eye pose/FOV reported by the
+    // headset. The old C ABI discarded both positions and retained only a rotation delta. That
+    // erased the approximately 64 mm eye separation as soon as streaming began, while the lobby
+    // (which already passes full poses) remained correctly fused.
     AlvrStreamViewParams views[kEyeCount]{};
     for (int eye = 0; eye < kEyeCount; ++eye) {
+        const auto current_inverse = matrix_inverse(current_view_matrices[eye]);
         views[eye].swapchain_index = state.stream[eye].index;
-        views[eye].reprojection_rotation =
-            alvr_rotation_delta(input_views[eye].pose.orientation, current_orientation);
+        views[eye].input_pose = input_views[eye].pose;
+        views[eye].output_pose.orientation = head_orientation(current_tracking.pose.rotation);
+        views[eye].output_pose.position[0] = -current_inverse.M[0][3];
+        views[eye].output_pose.position[1] = -current_inverse.M[1][3] - tracking_offset;
+        views[eye].output_pose.position[2] = -current_inverse.M[2][3];
         views[eye].input_fov = input_views[eye].fov;
         views[eye].output_fov = get_fov(stream_device, eye);
     }
@@ -919,13 +928,16 @@ bool render_stream(qiyu_FrameParam &frame) {
         for (int eye = 0; eye < kEyeCount; ++eye) {
             log(ANDROID_LOG_WARN,
                 "[STREAM-DBG] eye=%d sc_idx=%u tex=%u in_fov(l=%.4f r=%.4f u=%.4f d=%.4f) "
-                "out_fov(l=%.4f r=%.4f u=%.4f d=%.4f) in_pos(%.3f,%.3f,%.3f)",
+                "out_fov(l=%.4f r=%.4f u=%.4f d=%.4f) "
+                "in_pos(%.3f,%.3f,%.3f) out_pos(%.3f,%.3f,%.3f)",
                 eye, views[eye].swapchain_index,
                 state.stream[eye].textures[state.stream[eye].index], views[eye].input_fov.left,
                 views[eye].input_fov.right, views[eye].input_fov.up, views[eye].input_fov.down,
                 views[eye].output_fov.left, views[eye].output_fov.right, views[eye].output_fov.up,
-                views[eye].output_fov.down, input_views[eye].pose.position[0],
-                input_views[eye].pose.position[1], input_views[eye].pose.position[2]);
+                views[eye].output_fov.down, views[eye].input_pose.position[0],
+                views[eye].input_pose.position[1], views[eye].input_pose.position[2],
+                views[eye].output_pose.position[0], views[eye].output_pose.position[1],
+                views[eye].output_pose.position[2]);
         }
     }
 
@@ -1008,7 +1020,7 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     alvr_initialize_logging();
     // Build marker: lets a captured log prove which APK the device actually ran, so a missing
     // diagnostic can be told apart from a stale install.
-    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build35 %s %s", __DATE__, __TIME__);
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build36 %s %s", __DATE__, __TIME__);
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.java_vm = static_cast<JavaVM *>(java_vm);
 

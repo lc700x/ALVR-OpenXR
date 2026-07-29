@@ -772,7 +772,10 @@ pub struct AlvrLobbyViewParams {
 #[repr(C)]
 pub struct AlvrStreamViewParams {
     swapchain_index: u32,
-    reprojection_rotation: AlvrQuat,
+    /// Per-eye pose the server used to render the streamed image.
+    input_pose: AlvrPose,
+    /// Current per-eye pose at presentation time on the client.
+    output_pose: AlvrPose,
     /// FOV the streamed image was rendered with on the server (from
     /// `alvr_report_compositor_start`). Sizes the video quad.
     input_fov: AlvrFov,
@@ -964,28 +967,22 @@ pub unsafe extern "C" fn alvr_render_stream_opengl(
                     StreamViewParams {
                         swapchain_index: left_params.swapchain_index,
                         input_view_params: ViewParams {
-                            pose: Pose::default(),
+                            pose: from_capi_pose(left_params.input_pose),
                             fov: from_capi_fov(left_params.input_fov),
                         },
                         output_view_params: ViewParams {
-                            pose: Pose {
-                                orientation: from_capi_quat(left_params.reprojection_rotation),
-                                position: Vec3::ZERO,
-                            },
+                            pose: from_capi_pose(left_params.output_pose),
                             fov: from_capi_fov(left_params.output_fov),
                         },
                     },
                     StreamViewParams {
                         swapchain_index: right_params.swapchain_index,
                         input_view_params: ViewParams {
-                            pose: Pose::default(),
+                            pose: from_capi_pose(right_params.input_pose),
                             fov: from_capi_fov(right_params.input_fov),
                         },
                         output_view_params: ViewParams {
-                            pose: Pose {
-                                orientation: from_capi_quat(right_params.reprojection_rotation),
-                                position: Vec3::ZERO,
-                            },
+                            pose: from_capi_pose(right_params.output_pose),
                             fov: from_capi_fov(right_params.output_fov),
                         },
                     },
