@@ -41,7 +41,12 @@ constexpr float kDefaultRefreshRate = 72.0f;
 // the same content darker than the OpenXR runtime does, so the difference lies in the compositor's
 // own display transfer. Compensate with an explicit gamma: values below 1.0 brighten midtones and
 // leave black and white fixed. Applied only when the server negotiates a neutral gamma.
-constexpr float kQiyuDisplayGamma = 0.85f;
+constexpr float kQiyuDisplayGamma = 0.75f;
+// Per-eye resolution reported to the server. qiyu_GetDeviceInfo returns the SXR eye-buffer target
+// (1920x1920), but this headset's own OpenXR runtime recommends 2160x2160 per eye, which made the
+// server negotiate a 2816x2816 stream instead of 2592x2592. Reporting the smaller value cost about
+// 18% of the pixels and is why the SXR path looked softer than the OpenXR path.
+constexpr int kQiyuRecommendedViewSize = 2160;
 
 void log(int priority, const char *format, ...);
 
@@ -924,7 +929,7 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     alvr_initialize_logging();
     // Build marker: lets a captured log prove which APK the device actually ran, so a missing
     // diagnostic can be told apart from a stale install.
-    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build45 %s %s", __DATE__, __TIME__);
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build46 %s %s", __DATE__, __TIME__);
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.java_vm = static_cast<JavaVM *>(java_vm);
 
@@ -986,10 +991,14 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
         device.iEyeTargetWidth, device.iEyeTargetHeight);
     state.view_width = std::max(device.iEyeTargetWidth, 1);
     state.view_height = std::max(device.iEyeTargetHeight, 1);
+    const uint32_t reported_view_width =
+        std::max(state.view_width, static_cast<uint32_t>(kQiyuRecommendedViewSize));
+    const uint32_t reported_view_height =
+        std::max(state.view_height, static_cast<uint32_t>(kQiyuRecommendedViewSize));
     const float refresh_rates[] = {72.0f, 90.0f};
     const AlvrClientCapabilities capabilities{
-        state.view_width,
-        state.view_height,
+        reported_view_width,
+        reported_view_height,
         refresh_rates,
         2,
         true,
