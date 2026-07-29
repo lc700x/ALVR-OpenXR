@@ -166,6 +166,8 @@ struct State {
     EyeBuffers stream[kEyeCount];
     uint32_t view_width = 1;
     uint32_t view_height = 1;
+    uint32_t stream_source_width = 1;
+    uint32_t stream_source_height = 1;
     uint32_t stream_width = 1;
     uint32_t stream_height = 1;
     uint64_t last_frame_time_ns = 0;
@@ -762,8 +764,11 @@ void initialize_decoder(AlvrCodec codec) {
 }
 
 void start_stream(const StreamingStarted_Body &config) {
-    state.stream_width = config.view_width;
-    state.stream_height = config.view_height;
+    state.stream_source_width = config.view_width;
+    state.stream_source_height = config.view_height;
+    const float upscale_factor = config.enable_upscaling ? config.upscale_factor : 1.0f;
+    state.stream_width = static_cast<uint32_t>(config.view_width * upscale_factor);
+    state.stream_height = static_cast<uint32_t>(config.view_height * upscale_factor);
     state.refresh_rate.store(config.refresh_rate_hint > 0.0f
                                  ? config.refresh_rate_hint
                                  : kDefaultRefreshRate);
@@ -780,10 +785,26 @@ void start_stream(const StreamingStarted_Body &config) {
     const uint32_t *textures[kEyeCount] = {
         state.stream[0].textures.data(), state.stream[1].textures.data()};
     AlvrStreamConfig renderer_config{};
-    renderer_config.view_resolution_width = state.stream_width;
-    renderer_config.view_resolution_height = state.stream_height;
+    renderer_config.view_resolution_width = state.stream_source_width;
+    renderer_config.view_resolution_height = state.stream_source_height;
     renderer_config.swapchain_textures = textures;
     renderer_config.swapchain_length = kSwapchainLength;
+    renderer_config.enable_foveation = config.enable_foveated_encoding;
+    renderer_config.foveation_force_enable = config.foveation_force_enable;
+    renderer_config.foveation_center_size_x = config.foveation_center_size_x;
+    renderer_config.foveation_center_size_y = config.foveation_center_size_y;
+    renderer_config.foveation_center_shift_x = config.foveation_center_shift_x;
+    renderer_config.foveation_center_shift_y = config.foveation_center_shift_y;
+    renderer_config.foveation_edge_ratio_x = config.foveation_edge_ratio_x;
+    renderer_config.foveation_edge_ratio_y = config.foveation_edge_ratio_y;
+    renderer_config.enable_upscaling = config.enable_upscaling;
+    renderer_config.upscaling_edge_direction = config.upscaling_edge_direction;
+    renderer_config.upscaling_edge_threshold = config.upscaling_edge_threshold;
+    renderer_config.upscaling_edge_sharpness = config.upscaling_edge_sharpness;
+    renderer_config.upscale_factor = config.upscale_factor;
+    renderer_config.use_full_range = config.use_full_range;
+    renderer_config.encoding_gamma = config.encoding_gamma;
+    renderer_config.enable_hdr = config.enable_hdr;
     alvr_start_stream_opengl(renderer_config);
 
     for (auto &eye : old) {
@@ -791,6 +812,17 @@ void start_stream(const StreamingStarted_Body &config) {
     }
 
     api.post_eye_buffer_size(state.stream_width, state.stream_height);
+    log(ANDROID_LOG_WARN,
+        "[STREAM-CONFIG] source=%ux%u target=%ux%u foveation=%d "
+        "center=(%.3f,%.3f) shift=(%.3f,%.3f) edge=(%.3f,%.3f) "
+        "upscaling=%d factor=%.3f full_range=%d gamma=%.3f hdr=%d",
+        state.stream_source_width, state.stream_source_height, state.stream_width,
+        state.stream_height, config.enable_foveated_encoding,
+        config.foveation_center_size_x, config.foveation_center_size_y,
+        config.foveation_center_shift_x, config.foveation_center_shift_y,
+        config.foveation_edge_ratio_x, config.foveation_edge_ratio_y,
+        config.enable_upscaling, config.upscale_factor, config.use_full_range,
+        config.encoding_gamma, config.enable_hdr);
     send_view_params();
     alvr_send_active_interaction_profile(state.ids.hands[0], state.ids.profile);
     alvr_send_active_interaction_profile(state.ids.hands[1], state.ids.profile);
@@ -914,7 +946,7 @@ bool render_stream(qiyu_FrameParam &frame) {
             "[VIDEO-DBG] decoded=%ux%u layers=%u stride=%u format=%u expected_sbs=%ux%u "
             "eye_target=%ux%u",
             desc.width, desc.height, desc.layers, desc.stride, desc.format,
-            state.stream_width * 2, state.stream_height, state.stream_width,
+            state.stream_source_width * 2, state.stream_source_height, state.stream_width,
             state.stream_height);
         video_buffer_logged = true;
     }
@@ -1049,7 +1081,7 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     alvr_initialize_logging();
     // Build marker: lets a captured log prove which APK the device actually ran, so a missing
     // diagnostic can be told apart from a stale install.
-    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build37 %s %s", __DATE__, __TIME__);
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build38 %s %s", __DATE__, __TIME__);
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.java_vm = static_cast<JavaVM *>(java_vm);
 

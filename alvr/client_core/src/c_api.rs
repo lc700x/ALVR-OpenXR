@@ -83,9 +83,22 @@ pub struct StreamingStartedBodyC {
     view_width: u32,
     view_height: u32,
     refresh_rate_hint: f32,
+    use_full_range: bool,
     encoding_gamma: f32,
     enable_foveated_encoding: bool,
+    foveation_force_enable: bool,
+    foveation_center_size_x: f32,
+    foveation_center_size_y: f32,
+    foveation_center_shift_x: f32,
+    foveation_center_shift_y: f32,
+    foveation_edge_ratio_x: f32,
+    foveation_edge_ratio_y: f32,
     enable_hdr: bool,
+    enable_upscaling: bool,
+    upscaling_edge_direction: bool,
+    upscaling_edge_threshold: f32,
+    upscaling_edge_sharpness: f32,
+    upscale_factor: f32,
 }
 
 #[repr(C)]
@@ -399,17 +412,40 @@ pub extern "C" fn alvr_poll_event(out_event: *mut AlvrEventC) -> bool {
                     *SETTINGS.lock() = serde_json::to_string(&stream_config.settings).unwrap();
                     *SERVER_VERSION.lock() = stream_config.server_version.to_string();
 
+                    let foveation = stream_config
+                        .negotiated_config
+                        .enable_foveated_encoding
+                        .then(|| stream_config.settings.video.foveated_encoding.as_option())
+                        .flatten();
+                    let upscaling = stream_config.settings.video.upscaling.as_option();
+
                     AlvrEventC {
                         STREAMING_STARTED: StreamingStartedBodyC {
                             tag: AlvrEventTagC::StreamingStarted,
                             view_width: stream_config.negotiated_config.view_resolution.x,
                             view_height: stream_config.negotiated_config.view_resolution.y,
                             refresh_rate_hint: stream_config.negotiated_config.refresh_rate_hint,
+                            use_full_range: stream_config.negotiated_config.use_full_range,
                             encoding_gamma: stream_config.negotiated_config.encoding_gamma,
                             enable_foveated_encoding: stream_config
                                 .negotiated_config
                                 .enable_foveated_encoding,
+                            foveation_force_enable: foveation.is_some_and(|c| c.force_enable),
+                            foveation_center_size_x: foveation.map_or(0.0, |c| c.center_size_x),
+                            foveation_center_size_y: foveation.map_or(0.0, |c| c.center_size_y),
+                            foveation_center_shift_x: foveation.map_or(0.0, |c| c.center_shift_x),
+                            foveation_center_shift_y: foveation.map_or(0.0, |c| c.center_shift_y),
+                            foveation_edge_ratio_x: foveation.map_or(1.0, |c| c.edge_ratio_x),
+                            foveation_edge_ratio_y: foveation.map_or(1.0, |c| c.edge_ratio_y),
                             enable_hdr: stream_config.negotiated_config.enable_hdr,
+                            enable_upscaling: upscaling.is_some(),
+                            upscaling_edge_direction: upscaling
+                                .is_some_and(|c| c.edge_direction),
+                            upscaling_edge_threshold: upscaling
+                                .map_or(0.0, |c| c.edge_threshold),
+                            upscaling_edge_sharpness: upscaling
+                                .map_or(0.0, |c| c.edge_sharpness),
+                            upscale_factor: upscaling.map_or(1.0, |c| c.upscale_factor),
                         },
                     }
                 }
@@ -790,6 +826,7 @@ pub struct AlvrStreamConfig {
     swapchain_textures: *mut *const u32,
     swapchain_length: u32,
     enable_foveation: bool,
+    foveation_force_enable: bool,
     foveation_center_size_x: f32,
     foveation_center_size_y: f32,
     foveation_center_shift_x: f32,
@@ -801,6 +838,9 @@ pub struct AlvrStreamConfig {
     upscaling_edge_threshold: f32,
     upscaling_edge_sharpness: f32,
     upscale_factor: f32,
+    use_full_range: bool,
+    encoding_gamma: f32,
+    enable_hdr: bool,
 }
 
 #[no_mangle]
@@ -889,7 +929,7 @@ pub unsafe extern "C" fn alvr_start_stream_opengl(config: AlvrStreamConfig) {
     let swapchain_textures =
         convert_swapchain_array(config.swapchain_textures, config.swapchain_length);
     let foveated_encoding = config.enable_foveation.then_some(FoveatedEncodingConfig {
-        force_enable: true,
+        force_enable: config.foveation_force_enable,
         center_size_x: config.foveation_center_size_x,
         center_size_y: config.foveation_center_size_y,
         center_shift_x: config.foveation_center_shift_x,
@@ -912,8 +952,8 @@ pub unsafe extern "C" fn alvr_start_stream_opengl(config: AlvrStreamConfig) {
         alvr_graphics::SDR_FORMAT_GL,
         foveated_encoding,
         true,
-        false, // TODO: limited range fix config
-        1.0,   // TODO: encoding gamma config
+        config.use_full_range && !config.enable_hdr,
+        config.encoding_gamma,
         upscaling,
     )));
 }

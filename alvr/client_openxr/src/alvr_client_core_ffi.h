@@ -25,9 +25,22 @@ struct StreamingStarted_Body {
     uint32_t view_width;
     uint32_t view_height;
     float refresh_rate_hint;
+    bool use_full_range;
     float encoding_gamma;
     bool enable_foveated_encoding;
+    bool foveation_force_enable;
+    float foveation_center_size_x;
+    float foveation_center_size_y;
+    float foveation_center_shift_x;
+    float foveation_center_shift_y;
+    float foveation_edge_ratio_x;
+    float foveation_edge_ratio_y;
     bool enable_hdr;
+    bool enable_upscaling;
+    bool upscaling_edge_direction;
+    float upscaling_edge_threshold;
+    float upscaling_edge_sharpness;
+    float upscale_factor;
 };
 
 struct Haptics_Body {
@@ -127,6 +140,7 @@ struct AlvrStreamConfig {
     const uint32_t **swapchain_textures;
     uint32_t swapchain_length;
     bool enable_foveation;
+    bool foveation_force_enable;
     float foveation_center_size_x;
     float foveation_center_size_y;
     float foveation_center_shift_x;
@@ -138,6 +152,9 @@ struct AlvrStreamConfig {
     float upscaling_edge_threshold;
     float upscaling_edge_sharpness;
     float upscale_factor;
+    bool use_full_range;
+    float encoding_gamma;
+    bool enable_hdr;
 };
 
 enum AlvrMediacodecPropType : uint8_t {
