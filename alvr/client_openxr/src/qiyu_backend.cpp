@@ -942,7 +942,7 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     alvr_initialize_logging();
     // Build marker: lets a captured log prove which APK the device actually ran, so a missing
     // diagnostic can be told apart from a stale install.
-    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build50 %s %s", __DATE__, __TIME__);
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build51 %s %s", __DATE__, __TIME__);
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.java_vm = static_cast<JavaVM *>(java_vm);
 

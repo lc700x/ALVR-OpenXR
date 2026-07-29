@@ -839,7 +839,16 @@ fn android_main(app: android_activity::AndroidApp) {
             }
             PollEvent::Main(MainEvent::InputAvailable) => {
                 if let Ok(mut iter) = app.input_events_iter() {
-                    while iter.next(|_| InputStatus::Unhandled) {}
+                    // [INPUT-DIAG] QiYu's OpenXR runtime only activates khr/simple_controller and
+                    // its Native SDK controller module stays uninitialized without a SXR VR
+                    // session, so the remaining question is whether the controller reports its
+                    // buttons as ordinary Android input. Log every event before discarding it.
+                    while iter.next(|event| {
+                        if platform == Platform::Qiyu {
+                            log_android_input_event(event);
+                        }
+                        InputStatus::Unhandled
+                    }) {}
                 }
             }
             _ => (),
@@ -848,4 +857,45 @@ fn android_main(app: android_activity::AndroidApp) {
 
     // Note: the quit event is sent from OpenXR too, this will return rather quicly.
     rendering_thread.join().unwrap();
+}
+
+// [INPUT-DIAG] Temporary probe: reports whether QiYu controller buttons arrive through the Android
+// input queue. Remove once the controller input source is settled.
+#[cfg(target_os = "android")]
+fn log_android_input_event(event: &android_activity::input::InputEvent) {
+    use android_activity::input::{InputEvent, KeyAction, MotionAction};
+
+    match event {
+        InputEvent::KeyEvent(key) => {
+            let action = match key.action() {
+                KeyAction::Down => "down",
+                KeyAction::Up => "up",
+                _ => "other",
+            };
+            alvr_common::info!(
+                "[INPUT-DIAG] key {action} code={:?} scancode={} source={:?} device={}",
+                key.key_code(),
+                key.scan_code(),
+                key.source(),
+                key.device_id()
+            );
+        }
+        InputEvent::MotionEvent(motion) => {
+            // Only log discrete actions; hovering/moving would flood the log.
+            let action = match motion.action() {
+                MotionAction::Down => "down",
+                MotionAction::Up => "up",
+                MotionAction::ButtonPress => "button_press",
+                MotionAction::ButtonRelease => "button_release",
+                _ => return,
+            };
+            alvr_common::info!(
+                "[INPUT-DIAG] motion {action} source={:?} device={} pointers={}",
+                motion.source(),
+                motion.device_id(),
+                motion.pointer_count()
+            );
+        }
+        _ => (),
+    }
 }
