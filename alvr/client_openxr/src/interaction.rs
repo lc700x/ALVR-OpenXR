@@ -65,14 +65,17 @@ mod qiyu_controllers {
     }
 
     unsafe extern "C" {
-        fn alvr_qiyu_controller_bridge_init() -> bool;
+        fn alvr_qiyu_controller_bridge_init(activity: *mut c_void, java_vm: *mut c_void) -> bool;
         fn alvr_qiyu_controller_ready() -> bool;
         fn alvr_qiyu_controller_poll(left: *mut RawController, right: *mut RawController) -> bool;
         fn alvr_qiyu_controller_vibrate(hand: i32, amplitude: f32, duration_s: f32);
     }
 
     pub fn init() -> bool {
-        unsafe { alvr_qiyu_controller_bridge_init() }
+        // qiyu_Init wants the Java activity jobject and the JavaVM. app.activity_as_ptr() returns
+        // the ANativeActivity C struct rather than the jobject, so take both from ndk_context.
+        let context = ndk_context::android_context();
+        unsafe { alvr_qiyu_controller_bridge_init(context.context(), context.vm()) }
     }
 
     pub fn ready() -> bool {
@@ -118,10 +121,12 @@ mod qiyu_controllers {
 
     /// Reported once so a capture distinguishes "bridge missing" from "bridge idle".
     pub fn log_unavailable() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static LOGGED: AtomicBool = AtomicBool::new(false);
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNT: AtomicU32 = AtomicU32::new(0);
 
-        if !LOGGED.swap(true, Ordering::Relaxed) {
+        // qiyu_Init may bring the controller module up asynchronously, so keep reporting at a low
+        // rate instead of only once: a capture then shows whether it ever recovers.
+        if COUNT.fetch_add(1, Ordering::Relaxed) % 600 == 0 {
             warn!("[CTRL-BRIDGE] controller data unavailable; keeping OpenXR button state");
         }
     }
