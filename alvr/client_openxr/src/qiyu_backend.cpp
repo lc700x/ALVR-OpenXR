@@ -802,7 +802,7 @@ void start_stream(const StreamingStarted_Body &config) {
     log(ANDROID_LOG_WARN,
         "[STREAM-CONFIG] source=%ux%u target=%ux%u foveation=%d "
         "center=(%.3f,%.3f) shift=(%.3f,%.3f) edge=(%.3f,%.3f) "
-        "upscaling=%d factor=%.3f full_range=%d range_fix=0 gamma=%.3f hdr=%d",
+        "upscaling=%d factor=%.3f full_range=%d range_fix=0 srgb_fix=0 gamma=%.3f hdr=%d",
         state.stream_source_width, state.stream_source_height, state.stream_width,
         state.stream_height, config.enable_foveated_encoding,
         config.foveation_center_size_x, config.foveation_center_size_y,
@@ -1058,7 +1058,7 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     alvr_initialize_logging();
     // Build marker: lets a captured log prove which APK the device actually ran, so a missing
     // diagnostic can be told apart from a stale install.
-    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build40 %s %s", __DATE__, __TIME__);
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build41 %s %s", __DATE__, __TIME__);
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.java_vm = static_cast<JavaVM *>(java_vm);
 
