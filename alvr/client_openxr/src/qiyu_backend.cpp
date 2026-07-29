@@ -352,24 +352,6 @@ AlvrPose head_pose(const qiyu_HeadPoseState &tracking) {
     return pose;
 }
 
-std::array<float, 3> rotate_vector(const AlvrQuat &q, const std::array<float, 3> &v) {
-    const std::array<float, 3> uv = {
-        q.y * v[2] - q.z * v[1],
-        q.z * v[0] - q.x * v[2],
-        q.x * v[1] - q.y * v[0],
-    };
-    const std::array<float, 3> uuv = {
-        q.y * uv[2] - q.z * uv[1],
-        q.z * uv[0] - q.x * uv[2],
-        q.x * uv[1] - q.y * uv[0],
-    };
-    return {
-        v[0] + 2.0f * (q.w * uv[0] + uuv[0]),
-        v[1] + 2.0f * (q.w * uv[1] + uuv[1]),
-        v[2] + 2.0f * (q.w * uv[2] + uuv[2]),
-    };
-}
-
 float matrix_minor(const qiyu_Matrix4 &matrix, int r0, int r1, int r2,
                    int c0, int c1, int c2) {
     return matrix.M[r0][c0] *
@@ -954,29 +936,19 @@ bool render_stream(qiyu_FrameParam &frame) {
     auto tracking = tracking_for_timestamp(timestamp_ns);
     AlvrViewParams input_views[kEyeCount]{};
     alvr_report_compositor_start(timestamp_ns, input_views);
-    const auto stream_device = api.get_device_info();
-    const auto current_tracking = api.predict_head_pose(api.predict_display_time());
-    const auto current_head_pose = head_pose(current_tracking);
-    const float half_ipd = get_ipd(stream_device) * 0.5f;
 
-    // Mirror client_openxr::stream exactly: input is the full per-eye pose/FOV the server used to
-    // render this decoded frame, output is the full current per-eye pose/FOV reported by the
-    // headset. server_openxr builds each rendered eye as `head_pose * local_eye_pose`; reproduce
-    // that same composition here instead of using qiyu_GetViewMatrix, whose returned matrices on
-    // this device contain no per-eye translation (log35 showed both output eyes at x=0).
+    // SXR owns asynchronous reprojection: qiyu_SubmitFrame receives the exact head pose associated
+    // with this decoded frame below. Match the reference ALVR-QIYU renderer and client_openxr's
+    // normal (non-custom-reprojection) mode by keeping the shader transform at identity. Applying
+    // another input->current pose warp here makes SXR reproject an already-reprojected image and
+    // changes stereo geometry twice. YVR/HVR need the custom shader path; QiYu SXR does not.
     AlvrStreamViewParams views[kEyeCount]{};
     for (int eye = 0; eye < kEyeCount; ++eye) {
-        const auto eye_offset = rotate_vector(
-            current_head_pose.orientation,
-            {eye == 0 ? -half_ipd : half_ipd, 0.0f, 0.0f});
         views[eye].swapchain_index = state.stream[eye].index;
         views[eye].input_pose = input_views[eye].pose;
-        views[eye].output_pose = current_head_pose;
-        views[eye].output_pose.position[0] += eye_offset[0];
-        views[eye].output_pose.position[1] += eye_offset[1];
-        views[eye].output_pose.position[2] += eye_offset[2];
+        views[eye].output_pose = input_views[eye].pose;
         views[eye].input_fov = input_views[eye].fov;
-        views[eye].output_fov = get_fov(stream_device, eye);
+        views[eye].output_fov = input_views[eye].fov;
     }
 
     // [STREAM-DBG] Only one eye shows streamed video on device while the lobby (same textures,
@@ -1081,7 +1053,7 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     alvr_initialize_logging();
     // Build marker: lets a captured log prove which APK the device actually ran, so a missing
     // diagnostic can be told apart from a stale install.
-    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build38 %s %s", __DATE__, __TIME__);
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build39 %s %s", __DATE__, __TIME__);
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.java_vm = static_cast<JavaVM *>(java_vm);
 
