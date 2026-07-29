@@ -1031,11 +1031,6 @@ pub unsafe extern "C" fn alvr_render_stream_opengl(
                 ],
                 None,
             );
-        } else {
-            // [STREAM-CALL-DBG] STREAM_RENDERER is a thread_local: if alvr_start_stream_opengl ran
-            // on a different thread than this call, the renderer reads back as None here and every
-            // streamed frame is silently dropped.
-            alvr_common::error!("[STREAM-CALL-DBG] STREAM_RENDERER is None; frame dropped");
         }
     });
 }

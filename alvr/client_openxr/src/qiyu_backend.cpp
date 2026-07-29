@@ -9,7 +9,6 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
-#include <android/hardware_buffer.h>
 #include <android/log.h>
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
@@ -538,31 +537,6 @@ void send_view_params() {
     views[1].pose.position[0] = half_ipd;
     views[0].fov = get_fov(device, 0);
     views[1].fov = get_fov(device, 1);
-    static int vp_dbg = 0;
-    if (vp_dbg++ < 3) {
-        log(ANDROID_LOG_WARN,
-            "[VIEW-DBG] L fov(l=%.4f r=%.4f u=%.4f d=%.4f) R fov(l=%.4f r=%.4f u=%.4f d=%.4f) ipd=%.4f "
-            "Lfrustum(l=%.4f r=%.4f t=%.4f b=%.4f n=%.4f) Rfrustum(l=%.4f r=%.4f t=%.4f b=%.4f n=%.4f)",
-            views[0].fov.left, views[0].fov.right, views[0].fov.up, views[0].fov.down,
-            views[1].fov.left, views[1].fov.right, views[1].fov.up, views[1].fov.down, half_ipd * 2.0f,
-            device.frustumLeftEye.left, device.frustumLeftEye.right, device.frustumLeftEye.top,
-            device.frustumLeftEye.bottom, device.frustumLeftEye.near,
-            device.frustumRightEye.left, device.frustumRightEye.right, device.frustumRightEye.top,
-            device.frustumRightEye.bottom, device.frustumRightEye.near);
-        // [GEOM-DBG] SXR logs a "display frustum" AND a narrower "render frustum" at startup, but
-        // qiyu_DeviceInfo only exposes one pair. Print the SDK's own eye-target size next to the
-        // buffers we actually allocated: if the frustum we build FOV from is the display one while
-        // the compositor samples the render one, the image is magnified (~21%) and soft.
-        log(ANDROID_LOG_WARN,
-            "[GEOM-DBG] sdk_eye_target=%dx%d our_view=%ux%u stream=%ux%u "
-            "Lpos(%.4f,%.4f,%.4f) Rpos(%.4f,%.4f,%.4f) Lfar=%.4f Rfar=%.4f",
-            device.iEyeTargetWidth, device.iEyeTargetHeight, state.view_width, state.view_height,
-            state.stream_width, state.stream_height,
-            device.frustumLeftEye.position.x, device.frustumLeftEye.position.y,
-            device.frustumLeftEye.position.z, device.frustumRightEye.position.x,
-            device.frustumRightEye.position.y, device.frustumRightEye.position.z,
-            device.frustumLeftEye.far, device.frustumRightEye.far);
-    }
     alvr_send_view_params(views);
 }
 
@@ -635,27 +609,6 @@ void tracking_loop() {
             qiyu_ControllerData controllers[kEyeCount]{};
             api.get_controller_data(&controllers[0], &controllers[1]);
             const float prediction_seconds = static_cast<float>(prediction_ns) / 1e9f;
-            // [BTN-DIAG] With a single (right) physical controller, the click bits for A/B were
-            // seen in the hand=0 slot in one session and never in hand=1 in another, while
-            // buttonTouch fired in both. Print battery and isShow alongside, since those identify
-            // which slot the real device actually landed in.
-            static int last_button[kEyeCount] = {-1, -1};
-            static int last_touch[kEyeCount] = {-1, -1};
-            for (int hand = 0; hand < kEyeCount; ++hand) {
-                if (controllers[hand].button != last_button[hand] ||
-                    controllers[hand].buttonTouch != last_touch[hand]) {
-                    last_button[hand] = controllers[hand].button;
-                    last_touch[hand] = controllers[hand].buttonTouch;
-                    log(ANDROID_LOG_WARN,
-                        "[BTN-DIAG] hand=%d connect=%d show=%d batt=%d button=0x%08x touch=0x%08x "
-                        "trigger=%.3f grip=%.3f stick=(%.3f,%.3f)",
-                        hand, controllers[hand].isConnect, controllers[hand].isShow,
-                        controllers[hand].batteryLevel, controllers[hand].button,
-                        controllers[hand].buttonTouch, controllers[hand].triggerForce,
-                        controllers[hand].gripForce, controllers[hand].joyStickPos.x,
-                        controllers[hand].joyStickPos.y);
-                }
-            }
             for (int hand = 0; hand < kEyeCount; ++hand) {
                 update_controller_buttons(controllers[hand], hand);
                 if (controllers[hand].isConnect) {
@@ -786,9 +739,8 @@ void start_stream(const StreamingStarted_Body &config) {
     renderer_config.upscale_factor = config.upscale_factor;
     // OMX.qcom.video.decoder.avc on QiYu already converts the negotiated YUV range while producing
     // the external RGB texture. The generic Android full-range workaround remaps RGB [0, 1] back
-    // into [16/255, 235/255]; applying it here a second time lowers white to 92.2% and makes the
-    // whole image visibly dark (log37/build38). Keep the negotiated value in STREAM-CONFIG for
-    // diagnostics, but do not request the redundant staging correction on this decoder.
+    // into [16/255, 235/255]; applying it a second time here lowers white to 92.2% and makes the
+    // whole image visibly dark, so do not request the redundant staging correction.
     renderer_config.use_full_range = false;
     renderer_config.encoding_gamma = config.encoding_gamma;
     renderer_config.enable_hdr = config.enable_hdr;
@@ -799,17 +751,6 @@ void start_stream(const StreamingStarted_Body &config) {
     }
 
     api.post_eye_buffer_size(state.stream_width, state.stream_height);
-    log(ANDROID_LOG_WARN,
-        "[STREAM-CONFIG] source=%ux%u target=%ux%u foveation=%d "
-        "center=(%.3f,%.3f) shift=(%.3f,%.3f) edge=(%.3f,%.3f) "
-        "upscaling=%d factor=%.3f full_range=%d range_fix=0 srgb_fix=0 gamma=%.3f hdr=%d",
-        state.stream_source_width, state.stream_source_height, state.stream_width,
-        state.stream_height, config.enable_foveated_encoding,
-        config.foveation_center_size_x, config.foveation_center_size_y,
-        config.foveation_center_shift_x, config.foveation_center_shift_y,
-        config.foveation_edge_ratio_x, config.foveation_edge_ratio_y,
-        config.enable_upscaling, config.upscale_factor, config.use_full_range,
-        config.encoding_gamma, config.enable_hdr);
     send_view_params();
     alvr_send_active_interaction_profile(state.ids.hands[0], state.ids.profile);
     alvr_send_active_interaction_profile(state.ids.hands[1], state.ids.profile);
@@ -883,27 +824,13 @@ qiyu_HeadPoseState tracking_for_timestamp(uint64_t timestamp_ns) {
     return api.predict_head_pose(api.predict_display_time());
 }
 
-// Render/submit indices of the frame currently being built, captured so one log line can compare
-// what wgpu drew into against what SXR is handed. Two separately throttled logs sampled different
-// frames and could not prove they agree.
-int g_render_index[kEyeCount] = {-1, -1};
-uint32_t g_render_tex[kEyeCount] = {0, 0};
-
 void fill_frame_layers(qiyu_FrameParam &frame, EyeBuffers (&buffers)[kEyeCount]) {
-    static int layer_dbg = 0;
-    const bool trace_layers = (layer_dbg++ % 72) == 0;
     for (int eye = 0; eye < kEyeCount; ++eye) {
         auto &layer = frame.renderLayers[eye];
         layer.imageHandle = static_cast<int32_t>(buffers[eye].textures[buffers[eye].index]);
         layer.imageType = TT_Texture;
         fill_layout(layer.imageCoords);
         layer.eyeMask = eye == 0 ? RL_EyeMask_Left : RL_EyeMask_Right;
-        if (trace_layers) {
-            log(ANDROID_LOG_WARN,
-                "[FRAME-DBG] eye=%d submit(idx=%u tex=%d) render(idx=%d tex=%u) mask=0x%x", eye,
-                buffers[eye].index, layer.imageHandle, g_render_index[eye], g_render_tex[eye],
-                static_cast<int>(layer.eyeMask));
-        }
         buffers[eye].index = (buffers[eye].index + 1) % kSwapchainLength;
     }
 }
@@ -913,29 +840,7 @@ bool render_stream(qiyu_FrameParam &frame) {
     void *hardware_buffer = nullptr;
     if (!state.decoder_initialized ||
         !alvr_get_frame(&timestamp_ns, &hardware_buffer)) {
-        static int miss_log = 0;
-        if ((miss_log++ % 72) == 0) {
-            log(ANDROID_LOG_WARN, "render_stream skip: decoder_init=%d get_frame_failed",
-                state.decoder_initialized);
-        }
         return false;
-    }
-    static int hit_log = 0;
-    if ((hit_log++ % 72) == 0) {
-        log(ANDROID_LOG_INFO, "render_stream frame ts=%llu buf=%p",
-            (unsigned long long)timestamp_ns, hardware_buffer);
-    }
-    static bool video_buffer_logged = false;
-    if (!video_buffer_logged) {
-        AHardwareBuffer_Desc desc{};
-        AHardwareBuffer_describe(static_cast<AHardwareBuffer *>(hardware_buffer), &desc);
-        log(ANDROID_LOG_WARN,
-            "[VIDEO-DBG] decoded=%ux%u layers=%u stride=%u format=%u expected_sbs=%ux%u "
-            "eye_target=%ux%u",
-            desc.width, desc.height, desc.layers, desc.stride, desc.format,
-            state.stream_source_width * 2, state.stream_source_height, state.stream_width,
-            state.stream_height);
-        video_buffer_logged = true;
     }
 
     auto tracking = tracking_for_timestamp(timestamp_ns);
@@ -956,46 +861,9 @@ bool render_stream(qiyu_FrameParam &frame) {
         views[eye].output_fov = input_views[eye].fov;
     }
 
-    // [STREAM-DBG] Only one eye shows streamed video on device while the lobby (same textures,
-    // same submit path) renders both. That narrows the fault to what wgpu's StreamRenderer is
-    // handed: it picks its render target as views_objects[eye].render_target[swapchain_index],
-    // so identical per-eye indices would make both eyes draw into the same target, and identical
-    // per-eye fov would mean report_compositor_start never split the views. Log both.
-    static int stream_dbg = 0;
-    if ((stream_dbg++ % 72) == 0) {
-        for (int eye = 0; eye < kEyeCount; ++eye) {
-            log(ANDROID_LOG_WARN,
-                "[STREAM-DBG] eye=%d sc_idx=%u tex=%u in_fov(l=%.4f r=%.4f u=%.4f d=%.4f) "
-                "out_fov(l=%.4f r=%.4f u=%.4f d=%.4f) "
-                "in_pos(%.3f,%.3f,%.3f) out_pos(%.3f,%.3f,%.3f)",
-                eye, views[eye].swapchain_index,
-                state.stream[eye].textures[state.stream[eye].index], views[eye].input_fov.left,
-                views[eye].input_fov.right, views[eye].input_fov.up, views[eye].input_fov.down,
-                views[eye].output_fov.left, views[eye].output_fov.right, views[eye].output_fov.up,
-                views[eye].output_fov.down, views[eye].input_pose.position[0],
-                views[eye].input_pose.position[1], views[eye].input_pose.position[2],
-                views[eye].output_pose.position[0], views[eye].output_pose.position[1],
-                views[eye].output_pose.position[2]);
-        }
-    }
-
-    // Record what wgpu is about to draw into so fill_frame_layers can print render vs submit for
-    // the SAME frame.
-    for (int eye = 0; eye < kEyeCount; ++eye) {
-        g_render_index[eye] = static_cast<int>(views[eye].swapchain_index);
-        g_render_tex[eye] = state.stream[eye].textures[views[eye].swapchain_index];
-    }
-
     api.start_eye(false, EYE_Left, TT_Texture);
     api.start_eye(false, EYE_Right, TT_Texture);
-    // Bracket the call: if "pre" appears without "post", alvr_render_stream_opengl never returned;
-    // if both appear while the Rust-side probes stay silent, the call is resolving somewhere other
-    // than the freshly built libalvr_client_openxr.so.
-    static int call_dbg = 0;
-    const bool trace_call = (call_dbg++ % 72) == 0;
-    if (trace_call) log(ANDROID_LOG_WARN, "[STREAM-CALL] pre alvr_render_stream_opengl");
     alvr_render_stream_opengl(hardware_buffer, views);
-    if (trace_call) log(ANDROID_LOG_WARN, "[STREAM-CALL] post alvr_render_stream_opengl");
     api.end_eye(false, EYE_Left, TT_Texture);
     api.end_eye(false, EYE_Right, TT_Texture);
 
@@ -1008,15 +876,10 @@ bool render_stream(qiyu_FrameParam &frame) {
 }
 
 void render_lobby(qiyu_FrameParam &frame) {
-    static int lob = 0;
-    const bool trace = lob++ < 3;
-    if (trace) log(ANDROID_LOG_INFO, "lobby[%d] A: get_device_info", lob - 1);
     const auto device = api.get_device_info();
-    if (trace) log(ANDROID_LOG_INFO, "lobby[%d] B: predict_head_pose", lob - 1);
     const auto tracking = api.predict_head_pose(api.predict_display_time());
     qiyu_Matrix4 view_matrices[kEyeCount]{};
     float tracking_offset = state.tracking_offset.load();
-    if (trace) log(ANDROID_LOG_INFO, "lobby[%d] C: get_view_matrix", lob - 1);
     api.get_view_matrix(view_matrices[0], view_matrices[1], tracking_offset, tracking,
                         device.frustumLeftEye.rotation,
                         device.frustumRightEye.rotation);
@@ -1033,17 +896,13 @@ void render_lobby(qiyu_FrameParam &frame) {
         views[eye].fov = get_fov(device, eye);
     }
 
-    if (trace) log(ANDROID_LOG_INFO, "lobby[%d] D: start_eye L/R", lob - 1);
     api.start_eye(false, EYE_Left, TT_Texture);
     api.start_eye(false, EYE_Right, TT_Texture);
-    if (trace) log(ANDROID_LOG_INFO, "lobby[%d] E: alvr_render_lobby_opengl", lob - 1);
     alvr_render_lobby_opengl(views, true);
-    if (trace) log(ANDROID_LOG_INFO, "lobby[%d] F: end_eye L/R", lob - 1);
     api.end_eye(false, EYE_Left, TT_Texture);
     api.end_eye(false, EYE_Right, TT_Texture);
     fill_frame_layers(frame, state.lobby);
     frame.headPoseState = tracking;
-    if (trace) log(ANDROID_LOG_INFO, "lobby[%d] G: done", lob - 1);
 }
 
 } // namespace
@@ -1058,7 +917,7 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     alvr_initialize_logging();
     // Build marker: lets a captured log prove which APK the device actually ran, so a missing
     // diagnostic can be told apart from a stale install.
-    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build43 %s %s", __DATE__, __TIME__);
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build44 %s %s", __DATE__, __TIME__);
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.java_vm = static_cast<JavaVM *>(java_vm);
 
@@ -1184,7 +1043,6 @@ extern "C" bool alvr_qiyu_start(void *native_window) {
     // and comes back up with a broken eye context. Bind our own long-lived pbuffer first so SXR
     // always reads a valid surface/config on both the first start and every resume.
     eglMakeCurrent(state.egl.display, state.egl.surface, state.egl.surface, state.egl.context);
-    log(ANDROID_LOG_INFO, "start step 1b: pbuffer bound, calling qiyu_StartVR");
     if (!api.start_vr(state.window, PL_System, PL_System)) {
         log(ANDROID_LOG_ERROR, "start step 2: qiyu_StartVR FAILED");
         state.window = nullptr;
@@ -1244,7 +1102,6 @@ extern "C" void alvr_qiyu_stop() {
     // pbuffer so the thread always has a valid surface/context bound across the pause.
     eglMakeCurrent(state.egl.display, state.egl.surface, state.egl.surface, state.egl.context);
     state.window = nullptr;
-    log(ANDROID_LOG_WARN, "alvr_qiyu_stop: done");
 }
 
 extern "C" void alvr_qiyu_render_frame() {
@@ -1259,12 +1116,6 @@ extern "C" void alvr_qiyu_render_frame() {
     // binds with EGL_BAD_SURFACE.
     if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
         eglMakeCurrent(state.egl.display, state.egl.surface, state.egl.surface, state.egl.context);
-    }
-
-    static int render_heartbeat = 0;
-    if ((render_heartbeat++ % 72) == 0) {
-        log(ANDROID_LOG_INFO, "render_frame heartbeat #%d streaming=%d decoder_init=%d",
-            render_heartbeat - 1, state.streaming.load(), state.decoder_initialized);
     }
 
     poll_core_events();
@@ -1287,10 +1138,6 @@ extern "C" void alvr_qiyu_render_frame() {
     }
     if (!api.submit_frame(frame)) {
         log(ANDROID_LOG_WARN, "qiyu_SubmitFrame failed");
-    }
-    static int tail = 0;
-    if (tail++ < 3) {
-        log(ANDROID_LOG_INFO, "render_frame[%d] returned (submit done)", tail - 1);
     }
 }
 
