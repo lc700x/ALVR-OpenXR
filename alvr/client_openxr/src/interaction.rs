@@ -24,10 +24,217 @@ use xr::SpaceLocationFlags;
 const IPD_CHANGE_EPS: f32 = 0.001;
 const HVR_CONTROLLER_PROFILE_PATH: &str = "/interaction_profiles/huawei/6dof_controller";
 
-// When true, QiYu suggests only the Oculus Touch profile. The runtime is then unable to fall back
-// to khr/simple_controller, so the [PROFILE-DIAG] lines report whether it activates Touch (full
-// button set) or leaves the controllers unbound.
-const QIYU_FORCE_TOUCH_PROFILE: bool = true;
+// Probe flag: when true, QiYu suggests only the Oculus Touch profile. log_qiyu44 settled this —
+// the runtime accepts the Touch suggestion but never activates it, leaving both hands at
+// '<unknown>' with no input at all, while khr/simple_controller does get activated. Keep this
+// false; the QiYu OpenXR runtime supports no vendor controller profile, matching its docs, which
+// describe controllers only through the Native SDK and UnityXR.
+const QIYU_FORCE_TOUCH_PROFILE: bool = false;
+
+// QiYu native controller bridge.
+//
+// The runtime only ever activates khr/simple_controller, which carries select and menu, and the
+// vendor documentation defines no OpenXR controller interaction profile. The Native SDK does
+// report every button through qiyu_GetControllerData, so read the controllers straight from
+// libqiyuapi.so and publish them under the Oculus Touch button ids ALVR already uses. Poses,
+// display and tracking keep coming from OpenXR.
+#[cfg(target_os = "android")]
+mod qiyu_controllers {
+    use super::*;
+    use std::ffi::c_void;
+
+    // Mirrors qiyu_ButtonType from the Native SDK headers.
+    const BT_TRIGGER: i32 = 0x01;
+    const BT_GRIP: i32 = 0x02;
+    const BT_A_X: i32 = 0x10;
+    const BT_B_Y: i32 = 0x20;
+    const BT_HOME_MENU: i32 = 0x40;
+    const BT_JOYSTICK: i32 = 0x80;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct RawController {
+        pub connected: i32,
+        pub button: i32,
+        pub button_touch: i32,
+        pub battery: i32,
+        pub trigger: f32,
+        pub grip: f32,
+        pub stick_x: f32,
+        pub stick_y: f32,
+    }
+
+    unsafe extern "C" {
+        fn alvr_qiyu_controller_bridge_init() -> bool;
+        fn alvr_qiyu_controller_ready() -> bool;
+        fn alvr_qiyu_controller_poll(left: *mut RawController, right: *mut RawController) -> bool;
+        fn alvr_qiyu_controller_vibrate(hand: i32, amplitude: f32, duration_s: f32);
+    }
+
+    pub fn init() -> bool {
+        unsafe { alvr_qiyu_controller_bridge_init() }
+    }
+
+    pub fn ready() -> bool {
+        unsafe { alvr_qiyu_controller_ready() }
+    }
+
+    pub fn vibrate(hand: usize, amplitude: f32, duration_s: f32) {
+        unsafe { alvr_qiyu_controller_vibrate(hand as i32, amplitude, duration_s) };
+    }
+
+    pub fn poll() -> Option<[RawController; 2]> {
+        let mut left = RawController::default();
+        let mut right = RawController::default();
+        unsafe { alvr_qiyu_controller_poll(&mut left, &mut right) }.then_some([left, right])
+    }
+
+    /// Edge-triggered state dump. Confirms from a capture whether the bridge sees real button
+    /// data, which is the open question: without qiyu_Init/qiyu_StartVR the controller module may
+    /// never initialize.
+    pub fn log_state(controllers: &[RawController; 2]) {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static LAST: [AtomicI64; 2] = [AtomicI64::new(-1), AtomicI64::new(-1)];
+
+        for (hand, data) in controllers.iter().enumerate() {
+            let signature = ((data.button as i64) << 32)
+                | ((data.button_touch as i64) & 0xffff_ffff)
+                | ((data.connected as i64) << 62);
+            if LAST[hand].swap(signature, Ordering::Relaxed) != signature {
+                info!(
+                    "[CTRL-BRIDGE] hand={hand} connected={} button=0x{:08x} touch=0x{:08x} \
+                     trigger={:.3} grip={:.3} stick=({:.3},{:.3})",
+                    data.connected,
+                    data.button,
+                    data.button_touch,
+                    data.trigger,
+                    data.grip,
+                    data.stick_x,
+                    data.stick_y
+                );
+            }
+        }
+    }
+
+    /// Reported once so a capture distinguishes "bridge missing" from "bridge idle".
+    pub fn log_unavailable() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            warn!("[CTRL-BRIDGE] controller data unavailable; keeping OpenXR button state");
+        }
+    }
+
+    fn insert_binary(values: &mut HashMap<u64, ButtonValue>, id: u64, pressed: bool) {
+        values.insert(id, ButtonValue::Binary(pressed));
+    }
+
+    fn insert_scalar(values: &mut HashMap<u64, ButtonValue>, id: u64, value: f32) {
+        values.insert(id, ButtonValue::Scalar(value));
+    }
+
+    /// Publishes the QiYu button state under the Oculus Touch ids so the server maps it with its
+    /// existing Touch profile. Left uses X/Y, right uses A/B, matching the Touch layout.
+    pub fn collect(controllers: &[RawController; 2]) -> HashMap<u64, ButtonValue> {
+        let mut values = HashMap::new();
+
+        for (hand, data) in controllers.iter().enumerate() {
+            if data.connected == 0 {
+                continue;
+            }
+
+            let is_left = hand == 0;
+            let pressed = |mask: i32| data.button & mask != 0;
+            let touched = |mask: i32| data.button_touch & mask != 0;
+
+            let (face_lower_click, face_lower_touch, face_upper_click, face_upper_touch) = if is_left
+            {
+                (
+                    *LEFT_X_CLICK_ID,
+                    *LEFT_X_TOUCH_ID,
+                    *LEFT_Y_CLICK_ID,
+                    *LEFT_Y_TOUCH_ID,
+                )
+            } else {
+                (
+                    *RIGHT_A_CLICK_ID,
+                    *RIGHT_A_TOUCH_ID,
+                    *RIGHT_B_CLICK_ID,
+                    *RIGHT_B_TOUCH_ID,
+                )
+            };
+            insert_binary(&mut values, face_lower_click, pressed(BT_A_X));
+            insert_binary(&mut values, face_lower_touch, touched(BT_A_X));
+            insert_binary(&mut values, face_upper_click, pressed(BT_B_Y));
+            insert_binary(&mut values, face_upper_touch, touched(BT_B_Y));
+
+            // Touch exposes menu on the left controller and system on the right.
+            if is_left {
+                insert_binary(&mut values, *LEFT_MENU_CLICK_ID, pressed(BT_HOME_MENU));
+            } else {
+                insert_binary(&mut values, *RIGHT_SYSTEM_CLICK_ID, pressed(BT_HOME_MENU));
+            }
+
+            let (trigger_value, trigger_touch, squeeze_value) = if is_left {
+                (
+                    *LEFT_TRIGGER_VALUE_ID,
+                    *LEFT_TRIGGER_TOUCH_ID,
+                    *LEFT_SQUEEZE_VALUE_ID,
+                )
+            } else {
+                (
+                    *RIGHT_TRIGGER_VALUE_ID,
+                    *RIGHT_TRIGGER_TOUCH_ID,
+                    *RIGHT_SQUEEZE_VALUE_ID,
+                )
+            };
+            // triggerForce/gripForce stay at 0 on some firmware even while the digital bit is set,
+            // so fall back to the button bit to keep the axis usable.
+            let trigger = if data.trigger > 0.0 {
+                data.trigger
+            } else {
+                pressed(BT_TRIGGER) as i32 as f32
+            };
+            let grip = if data.grip > 0.0 {
+                data.grip
+            } else {
+                pressed(BT_GRIP) as i32 as f32
+            };
+            insert_scalar(&mut values, trigger_value, trigger);
+            insert_binary(&mut values, trigger_touch, touched(BT_TRIGGER));
+            insert_scalar(&mut values, squeeze_value, grip);
+
+            let (stick_x, stick_y, stick_click, stick_touch) = if is_left {
+                (
+                    *LEFT_THUMBSTICK_X_ID,
+                    *LEFT_THUMBSTICK_Y_ID,
+                    *LEFT_THUMBSTICK_CLICK_ID,
+                    *LEFT_THUMBSTICK_TOUCH_ID,
+                )
+            } else {
+                (
+                    *RIGHT_THUMBSTICK_X_ID,
+                    *RIGHT_THUMBSTICK_Y_ID,
+                    *RIGHT_THUMBSTICK_CLICK_ID,
+                    *RIGHT_THUMBSTICK_TOUCH_ID,
+                )
+            };
+            insert_scalar(&mut values, stick_x, data.stick_x);
+            insert_scalar(&mut values, stick_y, data.stick_y);
+            insert_binary(&mut values, stick_click, pressed(BT_JOYSTICK));
+            insert_binary(&mut values, stick_touch, touched(BT_JOYSTICK));
+        }
+
+        values
+    }
+}
+
+#[cfg(target_os = "android")]
+pub use qiyu_controllers::{
+    init as qiyu_controllers_init, ready as qiyu_controllers_ready,
+    vibrate as qiyu_controllers_vibrate,
+};
 
 fn hvr_binding_path(standard_path: &str) -> Option<String> {
     if standard_path.ends_with("/thumbrest/touch") {
@@ -586,6 +793,17 @@ impl InteractionContext {
             match res {
                 Ok(()) => info!("[QIYU] khr/simple_controller bindings accepted"),
                 Err(error) => warn!("[QIYU] khr/simple_controller bindings rejected: {error}"),
+            }
+
+            // Bring up the Native SDK controller bridge that supplies the buttons the simple
+            // controller profile lacks.
+            #[cfg(target_os = "android")]
+            {
+                let loaded = qiyu_controllers::init();
+                info!(
+                    "[QIYU] native controller bridge loaded={loaded} ready={}",
+                    qiyu_controllers::ready()
+                );
             }
         }
 
@@ -1272,6 +1490,23 @@ pub fn update_buttons(
 
     if platform == Platform::Hvr {
         adjust_hvr_thumbsticks(&mut values, hvr_position_tracking);
+    }
+
+    // QiYu: the activated khr/simple_controller profile only yields select and menu, so overlay the
+    // full button set read from the Native SDK. Anything the bridge reports wins over the sparse
+    // OpenXR state; if the bridge is unavailable the OpenXR values are left untouched.
+    #[cfg(target_os = "android")]
+    if platform == Platform::Qiyu {
+        if let Some(controllers) = qiyu_controllers::poll() {
+            for (id, value) in qiyu_controllers::collect(&controllers) {
+                let changed = button_value_changed(hvr_last_values.get(&id), value);
+                values.insert(id, (value, changed));
+                hvr_last_values.insert(id, value);
+            }
+            qiyu_controllers::log_state(&controllers);
+        } else {
+            qiyu_controllers::log_unavailable();
+        }
     }
 
     let mut button_entries = Vec::with_capacity(2);

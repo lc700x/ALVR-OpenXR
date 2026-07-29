@@ -942,7 +942,7 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     alvr_initialize_logging();
     // Build marker: lets a captured log prove which APK the device actually ran, so a missing
     // diagnostic can be told apart from a stale install.
-    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build47 %s %s", __DATE__, __TIME__);
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build50 %s %s", __DATE__, __TIME__);
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.java_vm = static_cast<JavaVM *>(java_vm);
 
@@ -1188,6 +1188,107 @@ extern "C" void alvr_qiyu_destroy() {
     alvr_destroy();
     destroy_egl();
     api.unload();
+}
+
+// ---------------------------------------------------------------------------
+// Standalone controller bridge for the OpenXR path.
+//
+// QiYu's OpenXR runtime only activates khr/simple_controller, which carries just select and menu,
+// and the vendor documentation defines no OpenXR controller interaction profile at all. The Native
+// SDK does expose the full button set through qiyu_GetControllerData, so read the controllers
+// directly from libqiyuapi.so while OpenXR keeps driving display and tracking.
+//
+// This deliberately does not call qiyu_Init or qiyu_StartVR: entering SXR VR mode would fight the
+// active OpenXR runtime. If the controller module is unavailable without that initialization, the
+// probe simply reports failure and the caller keeps the simple-controller bindings.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct ControllerBridge {
+    void *library = nullptr;
+    decltype(&qiyu_IsControllerInit) is_initialized = nullptr;
+    decltype(&qiyu_GetControllerData) get_data = nullptr;
+    decltype(&qiyu_StartControllerVibration) start_vibration = nullptr;
+    decltype(&qiyu_StopControllerVibration) stop_vibration = nullptr;
+    bool loaded = false;
+};
+
+ControllerBridge bridge;
+
+} // namespace
+
+struct AlvrQiyuController {
+    int32_t connected;
+    int32_t button;
+    int32_t button_touch;
+    int32_t battery;
+    float trigger;
+    float grip;
+    float stick_x;
+    float stick_y;
+};
+
+extern "C" bool alvr_qiyu_controller_bridge_init() {
+    if (bridge.loaded) {
+        return true;
+    }
+    bridge.library = dlopen("libqiyuapi.so", RTLD_NOW | RTLD_LOCAL);
+    if (bridge.library == nullptr) {
+        log(ANDROID_LOG_WARN, "[CTRL-BRIDGE] cannot load libqiyuapi.so: %s", dlerror());
+        return false;
+    }
+    bridge.is_initialized = reinterpret_cast<decltype(bridge.is_initialized)>(
+        dlsym(bridge.library, "qiyu_IsControllerInit"));
+    bridge.get_data = reinterpret_cast<decltype(bridge.get_data)>(
+        dlsym(bridge.library, "qiyu_GetControllerData"));
+    bridge.start_vibration = reinterpret_cast<decltype(bridge.start_vibration)>(
+        dlsym(bridge.library, "qiyu_StartControllerVibration"));
+    bridge.stop_vibration = reinterpret_cast<decltype(bridge.stop_vibration)>(
+        dlsym(bridge.library, "qiyu_StopControllerVibration"));
+    if (bridge.is_initialized == nullptr || bridge.get_data == nullptr) {
+        log(ANDROID_LOG_WARN, "[CTRL-BRIDGE] controller symbols missing");
+        dlclose(bridge.library);
+        bridge.library = nullptr;
+        return false;
+    }
+    bridge.loaded = true;
+    log(ANDROID_LOG_WARN, "[CTRL-BRIDGE] libqiyuapi.so loaded, controller_init=%d",
+        bridge.is_initialized() ? 1 : 0);
+    return true;
+}
+
+extern "C" bool alvr_qiyu_controller_ready() {
+    return bridge.loaded && bridge.is_initialized();
+}
+
+extern "C" bool alvr_qiyu_controller_poll(AlvrQiyuController *left, AlvrQiyuController *right) {
+    if (!bridge.loaded || !bridge.is_initialized()) {
+        return false;
+    }
+    qiyu_ControllerData data[kEyeCount]{};
+    bridge.get_data(&data[0], &data[1]);
+    AlvrQiyuController *out[kEyeCount] = {left, right};
+    for (int hand = 0; hand < kEyeCount; ++hand) {
+        out[hand]->connected = data[hand].isConnect;
+        out[hand]->button = data[hand].button;
+        out[hand]->button_touch = data[hand].buttonTouch;
+        out[hand]->battery = data[hand].batteryLevel;
+        out[hand]->trigger = data[hand].triggerForce;
+        out[hand]->grip = data[hand].gripForce;
+        out[hand]->stick_x = data[hand].joyStickPos.x;
+        out[hand]->stick_y = data[hand].joyStickPos.y;
+    }
+    return true;
+}
+
+extern "C" void alvr_qiyu_controller_vibrate(int32_t hand, float amplitude, float duration_s) {
+    if (!bridge.loaded || bridge.start_vibration == nullptr) {
+        return;
+    }
+    bridge.start_vibration(
+        hand == 0 ? qiyu_ControllerMask::CM_Left : qiyu_ControllerMask::CM_Right,
+        std::clamp(amplitude, 0.0f, 1.0f), std::max(duration_s, 0.0f));
 }
 
 // ---------------------------------------------------------------------------

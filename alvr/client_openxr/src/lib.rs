@@ -571,19 +571,40 @@ pub fn entry_point() {
                         amplitude,
                     } => {
                         let idx = if device_id == *HAND_LEFT_ID { 0 } else { 1 };
-                        let interaction_context = interaction_context.read();
-                        let hand = &interaction_context.hands_interaction[idx];
 
-                        hand.vibration_action
-                            .apply_feedback(
-                                &xr_session,
-                                hand.subaction_path,
-                                &xr::HapticVibration::new()
-                                    .amplitude(amplitude.clamp(0.0, 1.0))
-                                    .frequency(frequency.max(0.0))
-                                    .duration(xr::Duration::from_nanos(duration.as_nanos() as _)),
-                            )
-                            .unwrap();
+                        // QiYu's simple-controller haptic output is not driven by the runtime, so
+                        // route vibration through the same Native SDK bridge that supplies its
+                        // buttons.
+                        #[cfg(target_os = "android")]
+                        let handled_by_qiyu =
+                            platform == Platform::Qiyu && interaction::qiyu_controllers_ready();
+                        #[cfg(not(target_os = "android"))]
+                        let handled_by_qiyu = false;
+
+                        if handled_by_qiyu {
+                            #[cfg(target_os = "android")]
+                            interaction::qiyu_controllers_vibrate(
+                                idx,
+                                amplitude.clamp(0.0, 1.0),
+                                duration.as_secs_f32(),
+                            );
+                        } else {
+                            let interaction_context = interaction_context.read();
+                            let hand = &interaction_context.hands_interaction[idx];
+
+                            hand.vibration_action
+                                .apply_feedback(
+                                    &xr_session,
+                                    hand.subaction_path,
+                                    &xr::HapticVibration::new()
+                                        .amplitude(amplitude.clamp(0.0, 1.0))
+                                        .frequency(frequency.max(0.0))
+                                        .duration(xr::Duration::from_nanos(
+                                            duration.as_nanos() as _
+                                        )),
+                                )
+                                .unwrap();
+                        }
                     }
                     ClientCoreEvent::DecoderConfig { codec, config_nal } => {
                         if let Some(stream) = &mut stream_context {
