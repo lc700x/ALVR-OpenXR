@@ -1,0 +1,57 @@
+[package]
+name = "alvr_server_openxr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors = ["alvr-org"]
+license = "MIT"
+
+[lib]
+# Loaded by the OpenXR loader as the active runtime; rlib so the register
+# helper binary can reuse the registration module.
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "alvr_openxr_register"
+path = "src/bin/register.rs"
+
+[[bin]]
+name = "alvr_openxr_host"
+path = "src/bin/host.rs"
+
+[features]
+gpl = [] # Enable for FFmpeg (software encoder) support on Windows
+
+[dependencies]
+alvr_common.workspace = true
+alvr_filesystem.workspace = true
+alvr_packets.workspace = true
+alvr_server_core.workspace = true
+alvr_server_io.workspace = true
+alvr_session.workspace = true
+
+openxr-sys = { git = "https://github.com/Ralith/openxrs", rev = "9270509d23dc774b43a8b7289e8adf69fcac6828", package = "openxr-sys" }
+bincode = { version = "2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_OpenGL",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+alvr_filesystem = { path = "../filesystem" }
+bindgen = "0.72"
+cc = { version = "1", features = ["parallel"] }
+walkdir = "2"
