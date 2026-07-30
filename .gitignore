@@ -78,6 +78,9 @@ cmake-build-debug/
 build-*.log
 build[0-9]*.log
 logs/
+
+# local archives of the workspace
+*.7z
 build-*.ps1
 capture-*.ps1
 parse-*.ps1
