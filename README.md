@@ -1,90 +1,130 @@
 <p align="center"> <img width="500" src="resources/ALVR-Grey.svg"/> </p>
 
-# ALVR - Air Light VR
+# ALVR 20.14.0 — QiYu / Huawei VR fork
 
-[![badge-discord][]][link-discord] [![badge-matrix][]][link-matrix] [![badge-opencollective][]][link-opencollective]
+Stream VR games from your PC to your headset over Wi-Fi.
 
-Stream VR games from your PC to your headset via Wi-Fi.
-This is a fork of [ALVR](https://github.com/polygraphene/ALVR).
+This is a fork of [ALVR](https://github.com/alvr-org/ALVR) pinned to **20.14.0**, adding support for
+two headsets upstream does not cover:
 
-### Direct download to the latest version:
-### [Windows Launcher](https://github.com/alvr-org/ALVR/releases/latest/download/alvr_launcher_windows.zip) | [Linux Launcher](https://github.com/alvr-org/ALVR/releases/latest/download/alvr_launcher_linux.tar.gz)
+- **iQIYI QiYu (奇遇) 3 / A091** — OpenXR path with the vendor extensions enabled, plus a Native SDK
+  bridge that recovers the full controller button set.
+- **Huawei VR (HVR)** — its legacy OpenXR runtime needs hand subaction paths, a pose-only binding
+  fallback, and a floor-height reference space.
+
+Everything else, including all upstream headsets and the SteamVR/OpenXR streamer, is unchanged.
+
+## What this fork adds
+
+### QiYu
+
+The headset ships a Monado-based OpenXR runtime alongside the proprietary SXR (`libqiyuapi.so`)
+SDK. Neither one alone is enough, so the client uses both:
+
+| Concern | Source | Why |
+| --- | --- | --- |
+| Display, tracking, foveation | OpenXR runtime | Higher recommended resolution (2160²) and `XR_QIYU_foveation` hardware foveation |
+| Controller buttons, axes, haptics | Native SDK bridge | The runtime only ever activates `khr/simple_controller`, which carries just select and menu |
+| Passthrough | `ALPHA_BLEND` environment blend mode | QiYu exposes only the undocumented `XR_QIYU_passthrough`, so ALVR's FB/HTC passthrough layer cannot be created |
+
+The controller bridge reads `qiyu_GetControllerData` directly and publishes the values under the
+Oculus Touch button ids the server already maps. `qiyu_Init` must run first, and its `QVR_Init`
+dereferences globals that only `libqiyivrsdkcore.so`'s `JNI_OnLoad` sets up, so
+[VRActivity.java](alvr/client_openxr/android/java/alvr/client/VRActivity.java) loads the SXR
+libraries with `System.loadLibrary` before delegating to `NativeActivity`.
+
+A complete SXR rendering backend also lives in
+[qiyu_backend.cpp](alvr/client_openxr/src/qiyu_backend.cpp). It works and is kept for reference, but
+is disabled: set `VRActivity.USE_SXR_ON_QIYU = true` to use it instead of OpenXR.
+
+### Huawei VR
+
+`Platform::Hvr` branches cover the runtime's deviations from the specification: per-hand subaction
+paths on every action, `/interaction_profiles/huawei/6dof_controller` bindings with a pose-only
+retry, a `LOCAL` reference space pushed down to floor height, grip-to-aim controller offsets,
+thumbstick deadzone and axis correction, and `ALPHA_BLEND` composition.
 
 ## Compatibility
 
-|          VR Headset          |                                        Support                                         |
-| :--------------------------: | :------------------------------------------------------------------------------------: |
-|       Apple Vision Pro       |    :heavy_check_mark: ([store link](https://apps.apple.com/app/alvr/id6479728026))     |
-|      Quest 1/2/3/3S/Pro      | :heavy_check_mark: ([store link](https://www.meta.com/experiences/7674846229245715) *) |
-|     Pico Neo 3/4/4 Ultra     |                                   :heavy_check_mark:                                   |
-|    Play For Dream YVR 1/2/MR |                                   :heavy_check_mark:                                   |
-| Vive Focus 3/Vision/XR Elite |                                   :heavy_check_mark:                                   |
-|           Lynx R1            |                                   :heavy_check_mark:                                   |
-|     PhoneVR (smartphone)     |     :heavy_check_mark: ** ([repo](https://github.com/PhoneVR-Developers/PhoneVR))      |
-|        Android/Monado        |                                      :warning: **                                      |
-|          Oculus Go           |                 :x: ([old repo](https://github.com/polygraphene/ALVR))                 |
+| VR headset | Support |
+| --- | --- |
+| iQIYI QiYu 3 (A091) | :heavy_check_mark: this fork |
+| Huawei VR (HVR) | :heavy_check_mark: this fork |
+| Quest 1/2/3/3S/Pro, Pico Neo 3/4, Vive Focus 3/XR Elite, YVR, Lynx R1 | :heavy_check_mark: inherited from upstream, untested here |
 
-\* : ALVR for Quest 1 not available through the Meta store.  
-\** : Only works on some smartphones, not enough testing.  
+| PC OS | Support |
+| --- | --- |
+| Windows 10/11 | :heavy_check_mark: |
+| Linux | :warning: inherited from upstream, untested here |
 
-|     PC OS      |                                    Support                                    |
-| :------------: | :---------------------------------------------------------------------------: |
-| Windows 10/11  | :heavy_check_mark: ([store link](https://store.steampowered.com/app/3312710)) |
-| Windows XP/7/8 |                                      :x:                                      |
-|     Linux      |                             :heavy_check_mark:***                             |
-|     macOS      |                                      :x:                                      |
+The PC side needs SteamVR (or the standalone OpenXR runtime built from this repo), a GPU with NVENC
+or AMF encoding, and a 5 GHz Wi-Fi link to the headset.
 
-\*** : Linux support is still in beta. To be able to make audio work or run ALVR at all you may need advanced knowledge of your distro for debugging or building from source.
+## Build
 
-### Requirements
+Everything goes through `cargo xtask`. Full instructions:
+[wiki/Building-From-Source.md](wiki/Building-From-Source.md).
 
--   A supported standalone VR headset (see compatibility table above)
+```powershell
+cargo xtask prepare-deps --platform windows   # first time, or after deps change
+cargo xtask build-streamer --release          # -> build/alvr_streamer_windows
+cargo xtask build-streamer-openxr             # standalone OpenXR runtime, no SteamVR
+cargo xtask build-client --platform android   # -> build/alvr_client_android
+```
 
--   SteamVR
+The Android build merges the QiYu and HVR Java libraries into a single APK at
+`build/alvr_client_android/qiyu_java/alvr_client_qiyu_signed.apk`. One APK covers every headset:
+`VRActivity` inspects `Build.MANUFACTURER` and hands off to the right path.
 
--   High-end gaming PC
-    -   See OS compatibility table above.
-    -   NVIDIA GPU that supports NVENC (1000 GTX Series or higher) (or with an AMD GPU that supports AMF VCE) with the latest driver.
-    -   Laptops with an onboard (Intel HD, AMD iGPU) and an additional dedicated GPU (NVidia GTX/RTX, AMD HD/R5/R7): you should assign the dedicated GPU or "high performance graphics adapter" to the applications ALVR, SteamVR for best performance and compatibility. (NVidia: Nvidia control panel->3d settings->application settings; AMD: similiar way)
+Helper scripts at the repo root:
 
--   802.11ac 5Ghz wireless or ethernet wired connection
-    -   It is recommended to use 802.11ac 5Ghz for the headset and ethernet for PC
-    -   You need to connect both the PC and the headset to same router (or use a routed connection as described [here](https://github.com/alvr-org/ALVR/wiki/ALVR-v14-and-Above))
+- [build-controller.ps1](build-controller.ps1) — build and unit-test the controller pose /
+  grip-to-aim calibration.
+- [test-hello-d3d11.ps1](test-hello-d3d11.ps1), [test-hello-opengl.ps1](test-hello-opengl.ps1) — run
+  OpenXR `hello_xr` against this runtime, logging to `test-logs/`.
+- [capture-hvr-log.ps1](capture-hvr-log.ps1) — pull a filtered `adb logcat` to
+  `test-logs/hvr-logcat.txt`.
 
-## Install
+## Architecture
 
-Follow the installation guide [here](https://github.com/alvr-org/ALVR/wiki/Installation-guide).
+Crates live under `alvr/`.
 
-## Troubleshooting
+**Server:** `server_core` (C-ABI server logic) → `server_openvr` (SteamVR driver) or `server_openxr`
+(standalone runtime) → `server_io` (storage and system info, shared with `dashboard`).
 
--   Please check the [Troubleshooting](https://github.com/alvr-org/ALVR/wiki/Troubleshooting) page, and also [Linux Troubleshooting](https://github.com/alvr-org/ALVR/wiki/Linux-Troubleshooting) if applicable.
--   Configuration recommendations and information may be found [here](https://github.com/alvr-org/ALVR/wiki/Information-and-Recommendations)
+**Client:** `client_core` (main client logic, C-ABI) → `client_openxr` (OpenXR entry point; also
+holds the QiYu C++ bindings) → `client_mock` (headless simulator for desktop testing).
 
-## Uninstall
+**Shared:** `packets` and `sockets` (network protocol), `session` (settings schema), `graphics`
+(glow/OpenGL utilities), `common`, `events`, `filesystem`, `system_info`. `gui_common`, `dashboard`
+and `launcher` are the desktop UI (egui). `vulkan_layer` and `vrcompositor_wrapper` are Linux-only
+compositor interop. `adb` wraps Android Debug Bridge.
 
-Open `ALVR Dashboard.exe`, go to `Installation` tab then press `Remove firewall rules`. Close ALVR window and delete the ALVR folder.
+## Diagnostics
 
-## Build from source
+The QiYu client tags its log lines so a capture can be read quickly:
 
-You can follow the guide [here](https://github.com/alvr-org/ALVR/wiki/Building-From-Source).
+| Tag | Meaning |
+| --- | --- |
+| `[BUILD-ID]` | Which APK the device actually ran. Check this first when a diagnostic is missing. |
+| `[CTRL-BRIDGE]` | Native SDK controller bridge: library loading, `qiyu_Init`, live button state |
+| `[PROFILE-DIAG]` | Which OpenXR interaction profile the runtime activated per hand |
+| `[HVR-DIAG]` | Huawei binding, tracking and frame submission results |
+
+Capture with `adb logcat`; the analysis scripts at the repo root (`parse-hvrlog*.ps1`) filter the
+common cases.
+
+## Code style
+
+Rust conventions (naming, struct and impl ordering, error handling, comments) are documented in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
 ALVR is licensed under the [MIT License](LICENSE).
 
-## Privacy policy
+## Upstream
 
-ALVR apps do not directly collect any kind of data.
-
-## Donate
-
-If you want to support this project you can make a donation to our [Open Source Collective account](https://opencollective.com/alvr).
-
-You can also donate to the original author of ALVR using Paypal (polygraphene@gmail.com) or with bitcoin (1FCbmFVSjsmpnAj6oLx2EhnzQzzhyxTLEv).
-
-[badge-discord]: https://img.shields.io/discord/720612397580025886?style=for-the-badge&logo=discord&color=5865F2 "Join us on Discord"
-[link-discord]: https://discord.gg/ALVR
-[badge-matrix]: https://img.shields.io/static/v1?label=chat&message=%23alvr&style=for-the-badge&logo=matrix&color=blueviolet "Join us on Matrix"
-[link-matrix]: https://matrix.to/#/#alvr:ckie.dev?via=ckie.dev
-[badge-opencollective]: https://img.shields.io/opencollective/all/alvr?style=for-the-badge&logo=opencollective&color=79a3e6 "Donate"
-[link-opencollective]: https://opencollective.com/alvr
+Issues that are not specific to QiYu or HVR belong upstream:
+[alvr-org/ALVR](https://github.com/alvr-org/ALVR) · [Discord](https://discord.gg/ALVR) ·
+[Wiki](https://github.com/alvr-org/ALVR/wiki)
