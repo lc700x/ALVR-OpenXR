@@ -1,6 +1,6 @@
 <p align="center"> <img width="500" src="resources/ALVR-Grey.svg"/> </p>
 
-# ALVR 20.14.0 — QiYu / Huawei VR fork
+# ALVR 20.14.0 — Native OpenXR & QiYu / Huawei VR fork
 
 Stream VR games from your PC to your headset over Wi-Fi.
 
