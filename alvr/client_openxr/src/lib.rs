@@ -763,11 +763,23 @@ pub fn entry_point() {
                 if is_hvr && hvr_stream_frame_diag_count < 10 {
                     error!("[HVR-DIAG] entering stream.render (frame diag {hvr_stream_frame_diag_count})");
                 }
+                // The stream layer is blank until the first decoded video frame arrives, which on
+                // Huawei takes long enough to read as the picture going black. Keep presenting the
+                // lobby until there is something to show. The stream still renders every frame so
+                // it is ready to take over the moment video starts. Sampled before rendering
+                // because the returned layer borrows the stream.
+                let show_lobby = is_hvr && !stream.has_presented_video();
+
                 let out = stream.render(frame_interval, vsync_time);
                 if is_hvr && hvr_stream_frame_diag_count < 10 {
                     error!("[HVR-DIAG] returned from stream.render (frame diag {hvr_stream_frame_diag_count})");
                 }
-                out
+
+                if show_lobby {
+                    (lobby.render(vsync_time), vsync_time)
+                } else {
+                    out
+                }
             } else {
                 (lobby.render(vsync_time), vsync_time)
             };
