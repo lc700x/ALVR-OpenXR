@@ -122,6 +122,7 @@ pub struct StreamContext {
     decoder: Option<(VideoDecoderConfig, VideoDecoderSource)>,
     use_custom_reprojection: bool,
     hvr_video_frame_count: u32,
+    hvr_target_wait_frames: u32,
 }
 
 impl StreamContext {
@@ -273,6 +274,7 @@ impl StreamContext {
             decoder: None,
             use_custom_reprojection: uses_custom_reprojection(platform),
             hvr_video_frame_count: 0,
+            hvr_target_wait_frames: 0,
         };
 
         this.update_reference_space();
@@ -471,7 +473,23 @@ impl StreamContext {
                     alvr_common::info!(
                         "[HVR-DIAG] stream render targets built from in-frame handles"
                     );
+                } else {
+                    // Until this succeeds the stream renderer draws nothing, so the headset shows
+                    // a frozen image. Report the progression (the lobby fills one handle per
+                    // acquired image) so a capture distinguishes "still filling" from "stuck".
+                    self.hvr_target_wait_frames += 1;
+                    if self.hvr_target_wait_frames <= 8 || self.hvr_target_wait_frames % 300 == 0
+                    {
+                        alvr_common::warn!(
+                            "[HVR-DIAG] stream targets not ready after \
+                             {} frames: acquired idx L={left_swapchain_idx} R={right_swapchain_idx}, \
+                             handles left={left:?} right={right:?}",
+                            self.hvr_target_wait_frames
+                        );
+                    }
                 }
+            } else {
+                alvr_common::warn!("[HVR-DIAG] stream in-frame enumerate_images failed");
             }
         }
 
