@@ -111,6 +111,7 @@ pub struct StreamContext {
     platform: Platform,
     reference_space_type: xr::ReferenceSpaceType,
     stage_reference_space: Arc<xr::Space>,
+    hvr_reference_space: Option<Arc<xr::Space>>,
     view_reference_space: Arc<xr::Space>,
     swapchains: [xr::Swapchain<xr::OpenGlEs>; 2],
     last_good_view_params: [ViewParams; 2],
@@ -134,6 +135,7 @@ impl StreamContext {
         interaction_ctx: Arc<RwLock<InteractionContext>>,
         platform: Platform,
         config: ParsedStreamConfig,
+        hvr_reference_space: Option<Arc<xr::Space>>,
     ) -> StreamContext {
         interaction_ctx
             .write()
@@ -249,11 +251,14 @@ impl StreamContext {
         let input_thread_running = Arc::new(RelaxedAtomic::new(false));
 
         let reference_space_type = crate::tracking_reference_space_type(platform);
-        let stage_reference_space = Arc::new(if platform == Platform::Hvr {
-            interaction::get_hvr_floor_reference_space(&xr_session)
+        let stage_reference_space = if let Some(space) = &hvr_reference_space {
+            Arc::clone(space)
         } else {
-            interaction::get_reference_space(&xr_session, reference_space_type)
-        });
+            Arc::new(interaction::get_reference_space(
+                &xr_session,
+                reference_space_type,
+            ))
+        };
         let view_reference_space = Arc::new(interaction::get_reference_space(
             &xr_session,
             xr::ReferenceSpaceType::VIEW,
@@ -266,6 +271,7 @@ impl StreamContext {
             platform,
             reference_space_type,
             stage_reference_space,
+            hvr_reference_space,
             view_reference_space,
             swapchains,
             last_good_view_params: [ViewParams::default(); 2],
@@ -293,20 +299,28 @@ impl StreamContext {
     pub fn update_reference_space(&mut self) {
         self.input_thread_running.set(false);
 
-        self.stage_reference_space = Arc::new(if self.platform == Platform::Hvr {
-            interaction::get_hvr_floor_reference_space(&self.xr_session)
-        } else {
-            interaction::get_reference_space(&self.xr_session, self.reference_space_type)
-        });
+        // Recreating the Huawei space would re-anchor it to the current head pose, so the streamed
+        // world would face wherever the user happened to be looking. Keep the one created at
+        // session setup, which the lobby also uses.
+        if self.hvr_reference_space.is_none() {
+            self.stage_reference_space = Arc::new(interaction::get_reference_space(
+                &self.xr_session,
+                self.reference_space_type,
+            ));
+        }
         self.view_reference_space = Arc::new(interaction::get_reference_space(
             &self.xr_session,
             xr::ReferenceSpaceType::VIEW,
         ));
 
+        // Huawei's legacy runtime returns an error from xrGetReferenceSpaceBoundsRect, and it is
+        // called again on every ReferenceSpaceChangePending event, so unwrapping here crashed the
+        // client mid-session. A missing playspace is already a supported state.
         self.core_context.send_playspace(
             self.xr_session
                 .reference_space_bounds_rect(self.reference_space_type)
-                .unwrap()
+                .ok()
+                .flatten()
                 .map(|a| Vec2::new(a.width, a.height)),
         );
 

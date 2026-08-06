@@ -422,6 +422,14 @@ pub fn entry_point() {
         let mut session_running = false;
         let mut passthrough_layer = None;
 
+        // Huawei re-anchors LOCAL to the current head pose every time the space is created, so a
+        // space created when streaming starts points wherever the user happened to be looking.
+        // HVRSDK_XrDemo creates its LOCAL space once at session setup and reuses it; do the same
+        // and hand the one space to both the lobby and the stream so they share an origin.
+        let hvr_reference_space = (platform == Platform::Hvr).then(|| {
+            Arc::new(interaction::get_hvr_floor_reference_space(&xr_session))
+        });
+
         let mut lobby = Lobby::new(
             xr_session.clone(),
             Rc::clone(&graphics_context),
@@ -429,6 +437,7 @@ pub fn entry_point() {
             platform,
             default_view_resolution,
             &last_lobby_message,
+            hvr_reference_space.clone(),
         );
         let lobby_body_tracking_config = BodyTrackingSourcesConfig {
             body_tracking_fb: Switch::Disabled,
@@ -568,6 +577,7 @@ pub fn entry_point() {
                             Arc::clone(&interaction_context),
                             platform,
                             config,
+                            hvr_reference_space.clone(),
                         );
 
                         if !context.uses_passthrough() {

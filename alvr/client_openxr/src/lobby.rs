@@ -16,7 +16,8 @@ pub struct Lobby {
     xr_session: xr::Session<xr::OpenGlEs>,
     interaction_ctx: Arc<RwLock<InteractionContext>>,
     platform: Platform,
-    reference_space: xr::Space,
+    reference_space: Arc<xr::Space>,
+    hvr_reference_space: Option<Arc<xr::Space>>,
     swapchains: [xr::Swapchain<xr::OpenGlEs>; 2],
     view_resolution: UVec2,
     reference_space_type: xr::ReferenceSpaceType,
@@ -31,6 +32,7 @@ impl Lobby {
         platform: Platform,
         view_resolution: UVec2,
         initial_hud_message: &str,
+        hvr_reference_space: Option<Arc<xr::Space>>,
     ) -> Self {
         let reference_space_type = if platform == Platform::Hvr {
             xr::ReferenceSpaceType::LOCAL
@@ -42,10 +44,13 @@ impl Lobby {
             xr::ReferenceSpaceType::STAGE
         };
 
-        let reference_space = if platform == Platform::Hvr {
-            interaction::get_hvr_floor_reference_space(&xr_session)
+        let reference_space = if let Some(space) = &hvr_reference_space {
+            Arc::clone(space)
         } else {
-            interaction::get_reference_space(&xr_session, reference_space_type)
+            Arc::new(interaction::get_reference_space(
+                &xr_session,
+                reference_space_type,
+            ))
         };
 
         let swapchains = [
@@ -92,6 +97,7 @@ impl Lobby {
             interaction_ctx,
             platform,
             reference_space,
+            hvr_reference_space,
             swapchains,
             view_resolution,
             reference_space_type,
@@ -100,11 +106,16 @@ impl Lobby {
     }
 
     pub fn update_reference_space(&mut self) {
-        self.reference_space = if self.platform == Platform::Hvr {
-            interaction::get_hvr_floor_reference_space(&self.xr_session)
-        } else {
-            interaction::get_reference_space(&self.xr_session, self.reference_space_type)
-        };
+        // Recreating the Huawei space would re-anchor it to the current head pose and desync it
+        // from the stream, which shares the same space.
+        if self.hvr_reference_space.is_some() {
+            return;
+        }
+
+        self.reference_space = Arc::new(interaction::get_reference_space(
+            &self.xr_session,
+            self.reference_space_type,
+        ));
     }
 
     pub fn update_hud_message(&self, message: &str) {
