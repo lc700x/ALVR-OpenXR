@@ -122,8 +122,7 @@ pub struct StreamContext {
     renderer: StreamRenderer,
     decoder: Option<(VideoDecoderConfig, VideoDecoderSource)>,
     use_custom_reprojection: bool,
-    /// Counts every decoded video frame handed to the renderer, not just Huawei's: the count also
-    /// gates the switch from the lobby layer to the stream layer.
+    /// Counts every decoded video frame handed to the renderer. Only used for HVR diagnostics.
     hvr_video_frame_count: u32,
     hvr_target_wait_frames: u32,
     hvr_context_restores: u32,
@@ -298,12 +297,6 @@ impl StreamContext {
 
     pub fn uses_passthrough(&self) -> bool {
         self.config.passthrough.is_some()
-    }
-
-    /// Whether a decoded video frame has ever reached the renderer. Until it has, the stream layer
-    /// is blank, so the caller keeps presenting the lobby instead.
-    pub fn has_presented_video(&self) -> bool {
-        self.hvr_video_frame_count > 0
     }
 
     pub fn update_reference_space(&mut self) {
