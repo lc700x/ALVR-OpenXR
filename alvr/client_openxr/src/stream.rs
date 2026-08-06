@@ -123,6 +123,7 @@ pub struct StreamContext {
     use_custom_reprojection: bool,
     hvr_video_frame_count: u32,
     hvr_target_wait_frames: u32,
+    hvr_context_restores: u32,
 }
 
 impl StreamContext {
@@ -228,7 +229,9 @@ impl StreamContext {
         );
 
         if platform == Platform::Hvr {
-            alvr_common::info!(
+            // Huawei's logd drops info/warn records while the vendor SDK floods the buffer, so
+            // every HVR diagnostic that has to survive a capture is logged at error level.
+            alvr_common::error!(
                 "[HVR-DIAG] stream renderer created: targets_ready={}",
                 renderer.render_targets_ready()
             );
@@ -275,6 +278,7 @@ impl StreamContext {
             use_custom_reprojection: uses_custom_reprojection(platform),
             hvr_video_frame_count: 0,
             hvr_target_wait_frames: 0,
+            hvr_context_restores: 0,
         };
 
         this.update_reference_space();
@@ -429,7 +433,7 @@ impl StreamContext {
         if is_hvr && !buffer_ptr.is_null() {
             self.hvr_video_frame_count += 1;
             if self.hvr_video_frame_count <= 2 || self.hvr_video_frame_count % 300 == 0 {
-                alvr_common::info!(
+                alvr_common::error!(
                     "[HVR-DIAG] decoded video frame {}: timestamp={timestamp:?}, vsync={vsync_time:?}",
                     self.hvr_video_frame_count
                 );
@@ -459,6 +463,27 @@ impl StreamContext {
                 .unwrap();
         }
 
+        // Huawei's runtime binds its own EGL context on this thread inside the swapchain calls.
+        // Drawing without rebinding ours sends every GL command to the wrong context, which is why
+        // the streamed image intermittently freezes or goes black. The lobby already does this.
+        #[cfg(target_os = "android")]
+        if is_hvr {
+            match self.renderer.ensure_hvr_current() {
+                Ok(true) => {
+                    self.hvr_context_restores += 1;
+                    if self.hvr_context_restores <= 3 || self.hvr_context_restores % 600 == 0 {
+                        alvr_common::error!(
+                            "[HVR-DIAG] restored Huawei EGL context after stream swapchain wait \
+                             ({} times)",
+                            self.hvr_context_restores
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => alvr_common::error!("[HVR-DIAG] {error}"),
+            }
+        }
+
         // Huawei returns zero swapchain texture handles until the images are acquired/waited inside
         // an active frame. Now that they have been, re-enumerate and (re)build the render targets.
         if is_hvr && !self.renderer.render_targets_ready() {
@@ -470,7 +495,7 @@ impl StreamContext {
                 let right: Vec<u32> = right_handles.iter().map(|&h| h as u32).collect();
                 if left.iter().all(|&h| h != 0) && right.iter().all(|&h| h != 0) {
                     self.renderer.set_swapchain_textures([left, right]);
-                    alvr_common::info!(
+                    alvr_common::error!(
                         "[HVR-DIAG] stream render targets built from in-frame handles"
                     );
                 } else {
@@ -480,7 +505,7 @@ impl StreamContext {
                     self.hvr_target_wait_frames += 1;
                     if self.hvr_target_wait_frames <= 8 || self.hvr_target_wait_frames % 300 == 0
                     {
-                        alvr_common::warn!(
+                        alvr_common::error!(
                             "[HVR-DIAG] stream targets not ready after \
                              {} frames: acquired idx L={left_swapchain_idx} R={right_swapchain_idx}, \
                              handles left={left:?} right={right:?}",
@@ -489,7 +514,7 @@ impl StreamContext {
                     }
                 }
             } else {
-                alvr_common::warn!("[HVR-DIAG] stream in-frame enumerate_images failed");
+                alvr_common::error!("[HVR-DIAG] stream in-frame enumerate_images failed");
             }
         }
 
