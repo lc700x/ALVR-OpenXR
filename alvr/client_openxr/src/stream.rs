@@ -127,6 +127,8 @@ pub struct StreamContext {
     hvr_target_wait_frames: u32,
     hvr_context_restores: u32,
     hvr_swapchains_primed: bool,
+    hvr_frame_index: u32,
+    hvr_previous_frame_at: Option<Instant>,
 }
 
 impl StreamContext {
@@ -288,6 +290,8 @@ impl StreamContext {
             hvr_target_wait_frames: 0,
             hvr_context_restores: 0,
             hvr_swapchains_primed: false,
+            hvr_frame_index: 0,
+            hvr_previous_frame_at: None,
         };
 
         this.update_reference_space();
@@ -544,6 +548,27 @@ impl StreamContext {
             } else {
                 alvr_common::error!("[HVR-DIAG] stream in-frame enumerate_images failed");
             }
+        }
+
+        // Probe: on HVR, record per frame everything that decides what reaches the display, so a
+        // capture shows exactly which frames were blank and why. Dense at first, then sparse.
+        if is_hvr {
+            self.hvr_frame_index += 1;
+            let index = self.hvr_frame_index;
+            if index <= 120 || index % 60 == 0 {
+                let since_previous = self
+                    .hvr_previous_frame_at
+                    .map(|at| at.elapsed().as_millis())
+                    .unwrap_or(0);
+                alvr_common::error!(
+                    "[HVR-PROBE] frame {index}: dt={since_previous}ms video={} targets_ready={} \
+                     decoder={} idx=L{left_swapchain_idx}/R{right_swapchain_idx}",
+                    !buffer_ptr.is_null(),
+                    self.renderer.render_targets_ready(),
+                    self.decoder.is_some(),
+                );
+            }
+            self.hvr_previous_frame_at = Some(Instant::now());
         }
 
         let (flags, maybe_views) = self

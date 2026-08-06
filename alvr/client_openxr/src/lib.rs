@@ -456,6 +456,8 @@ pub fn entry_point() {
             .select_sources(&lobby_interaction_sources);
 
         let mut logged_first_frame = false;
+        let mut hvr_end_frame_index: u32 = 0;
+        let mut hvr_end_frame_errors: u32 = 0;
         let mut logged_hvr_should_render_false = false;
         let mut hvr_stream_frame_diag_count: u32 = 0;
         let mut stream_context = None::<StreamContext>;
@@ -790,6 +792,24 @@ pub fn entry_point() {
                 graphics_context.make_current();
             }
             let res = xr_frame_stream.end(to_xr_time(display_time), environment_blend_mode, layers);
+
+            // Probe: HVR swallows xrEndFrame errors, so count them instead of losing them, and
+            // record what was actually submitted alongside the stream's own per-frame probe.
+            if is_hvr {
+                hvr_end_frame_index += 1;
+                if res.is_err() {
+                    hvr_end_frame_errors += 1;
+                }
+                if hvr_end_frame_index <= 120 || hvr_end_frame_index % 60 == 0 {
+                    error!(
+                        "[HVR-PROBE] endFrame {hvr_end_frame_index}: res={res:?} errors={hvr_end_frame_errors} \
+                         layers={} passthrough={} blend={environment_blend_mode:?} streaming={}",
+                        layers.len(),
+                        passthrough_layer.is_some(),
+                        stream_context.is_some(),
+                    );
+                }
+            }
 
             if is_hvr && !logged_first_frame {
                 info!("[HVR-DIAG] first rendered frame result: {res:?}");
