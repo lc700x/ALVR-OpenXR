@@ -125,6 +125,7 @@ pub struct StreamContext {
     hvr_video_frame_count: u32,
     hvr_target_wait_frames: u32,
     hvr_context_restores: u32,
+    hvr_swapchains_primed: bool,
 }
 
 impl StreamContext {
@@ -285,6 +286,7 @@ impl StreamContext {
             hvr_video_frame_count: 0,
             hvr_target_wait_frames: 0,
             hvr_context_restores: 0,
+            hvr_swapchains_primed: false,
         };
 
         this.update_reference_space();
@@ -455,6 +457,15 @@ impl StreamContext {
         }
 
         let left_swapchain_idx = if is_hvr {
+            // Populate the Huawei GL texture handles in one go, so the stream does not skip a frame
+            // per swapchain image while they trickle in. Only valid inside an active frame.
+            if !self.hvr_swapchains_primed {
+                self.hvr_swapchains_primed = true;
+                for swapchain in &self.swapchains {
+                    graphics::hvr_prime_swapchain(swapchain);
+                }
+            }
+
             graphics::hvr_acquire_image(&mut self.swapchains[0]).unwrap_or(0)
         } else {
             self.swapchains[0].acquire_image().unwrap()

@@ -18,6 +18,7 @@ pub struct Lobby {
     platform: Platform,
     reference_space: Arc<xr::Space>,
     hvr_reference_space: Option<Arc<xr::Space>>,
+    hvr_swapchains_primed: bool,
     swapchains: [xr::Swapchain<xr::OpenGlEs>; 2],
     view_resolution: UVec2,
     reference_space_type: xr::ReferenceSpaceType,
@@ -98,6 +99,7 @@ impl Lobby {
             platform,
             reference_space,
             hvr_reference_space,
+            hvr_swapchains_primed: false,
             swapchains,
             view_resolution,
             reference_space_type,
@@ -222,6 +224,16 @@ impl Lobby {
         // errors (defaulting the image index to 0) instead of panicking. Other platforms keep the
         // strict unwrap.
         let is_hvr = self.platform == Platform::Hvr;
+
+        // Populate the Huawei GL texture handles in one go, so the lobby does not skip a frame per
+        // swapchain image while they trickle in. Only valid inside an active frame.
+        if is_hvr && !self.hvr_swapchains_primed {
+            self.hvr_swapchains_primed = true;
+            for swapchain in &self.swapchains {
+                graphics::hvr_prime_swapchain(swapchain);
+            }
+        }
+
         let acquire = |swapchain: &mut xr::Swapchain<xr::OpenGlEs>| -> u32 {
             let result = if is_hvr {
                 graphics::hvr_acquire_image(swapchain)

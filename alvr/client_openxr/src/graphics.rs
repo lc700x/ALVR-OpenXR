@@ -142,28 +142,33 @@ pub fn create_swapchain(
     let swapchain = session.create_swapchain(&swapchain_info).unwrap();
 
     if is_hvr {
-        // Huawei populates a swapchain image's GL texture handle only when that image is first
-        // acquired, so xrEnumerateSwapchainImages returns zeros right after creation and fills in
-        // one handle per acquire. Rendering cannot start until every handle is valid, which used to
-        // cost one black frame per image. Cycle every image once here so the handles are all
-        // populated before the first real frame.
-        let image_count = swapchain.enumerate_images().map(|i| i.len()).unwrap_or(0);
-        for _ in 0..image_count {
-            if hvr_acquire_image(&swapchain).is_err() {
-                break;
-            }
-            let _ = hvr_wait_image(&swapchain);
-            let _ = hvr_release_image(&swapchain);
-        }
-
         if let Ok(images) = swapchain.enumerate_images() {
             alvr_common::info!(
-                "[HVR-DIAG] create_swapchain: GL image handles after priming: {images:?}"
+                "[HVR-DIAG] create_swapchain: enumerated GL image handles: {images:?}"
             );
         }
     }
 
     swapchain
+}
+
+/// Huawei fills in a swapchain image's GL texture handle only when that image is first acquired, so
+/// `xrEnumerateSwapchainImages` returns zeros right after creation and gains one handle per
+/// acquire. Rendering is skipped until every handle is valid, costing one black frame per image.
+/// Cycling the images here populates all the handles at once.
+///
+/// Must be called inside an active frame: Huawei's runtime kills the process if the swapchain image
+/// calls happen between `xrEndFrame` and the next `xrBeginFrame`.
+pub fn hvr_prime_swapchain(swapchain: &xr::Swapchain<xr::OpenGlEs>) {
+    let image_count = swapchain.enumerate_images().map(|i| i.len()).unwrap_or(0);
+
+    for _ in 0..image_count {
+        if hvr_acquire_image(swapchain).is_err() {
+            break;
+        }
+        let _ = hvr_wait_image(swapchain);
+        let _ = hvr_release_image(swapchain);
+    }
 }
 
 pub struct ProjectionLayerAlphaConfig {
