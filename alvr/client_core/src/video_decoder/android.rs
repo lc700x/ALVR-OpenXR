@@ -200,7 +200,14 @@ fn decoder_lifecycle(
     image_reader: &mut ImageReader,
 ) -> Result<()> {
     // 2x: keep the target buffering in the middle of the max amount of queuable frames
-    let available_buffering_frames = (2. * config.max_buffering_frames).ceil() as usize;
+    //
+    // The queue owns images acquired from the ImageReader and only releases one when it is popped,
+    // so it can never hold more than the reader's max_images. Clamp accordingly: Huawei's OMX
+    // decoder needs a small max_images, and without this the queue grows past what the reader
+    // allows, every later acquire fails with MaxImagesAcquired, and video stalls on the last frame.
+    let max_queued_images = super::decoder_max_images().max(2) as usize - 1;
+    let available_buffering_frames =
+        ((2. * config.max_buffering_frames).ceil() as usize).min(max_queued_images);
     let acquired_frame_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     image_reader.set_image_listener(Box::new({
