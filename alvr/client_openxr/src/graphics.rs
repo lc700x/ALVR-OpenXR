@@ -157,6 +157,10 @@ pub fn create_swapchain(
 /// acquire. Rendering is skipped until every handle is valid, costing one black frame per image.
 /// Cycling the images here populates all the handles at once.
 ///
+/// Acquire alone populates the handle, so the blocking `xrWaitSwapchainImage` is skipped: waiting
+/// on each image stalls for a vsync and made priming cost ~290 ms, which showed up as a freeze when
+/// the stream started.
+///
 /// Must be called inside an active frame: Huawei's runtime kills the process if the swapchain image
 /// calls happen between `xrEndFrame` and the next `xrBeginFrame`.
 pub fn hvr_prime_swapchain(swapchain: &xr::Swapchain<xr::OpenGlEs>) {
@@ -166,8 +170,11 @@ pub fn hvr_prime_swapchain(swapchain: &xr::Swapchain<xr::OpenGlEs>) {
         if hvr_acquire_image(swapchain).is_err() {
             break;
         }
-        let _ = hvr_wait_image(swapchain);
         let _ = hvr_release_image(swapchain);
+    }
+
+    if let Ok(images) = swapchain.enumerate_images() {
+        alvr_common::error!("[HVR-DIAG] GL image handles after priming: {images:?}");
     }
 }
 
