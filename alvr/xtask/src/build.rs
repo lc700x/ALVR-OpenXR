@@ -623,28 +623,41 @@ fn add_android_vendor_runtime(sh: &Shell, apk_path: &Path, profile: Profile, key
         // Replace only the opening tag: prepend VRActivity block, then strip NativeActivity's
         // launcher intent-filters (which now belong to VRActivity) while keeping the lib_name.
         let manifest = manifest.replacen(native_activity_open, vractivity_block, 1);
-        let native_launcher_filters = concat!(
-            "<meta-data android:name=\"android.app.lib_name\" ",
-            "android:value=\"alvr_client_openxr\"/>",
-            "\n            <intent-filter>\n",
-            "                <action android:name=\"android.intent.action.MAIN\"/>\n",
-            "                <category android:name=\"android.intent.category.LAUNCHER\"/>\n",
-            "                <category android:name=\"com.oculus.intent.category.VR\"/>\n",
-            "                <category android:name=\"com.yvr.intent.category.VR\"/>\n",
-            "                <category android:name=\"org.khronos.openxr.intent.category.IMMERSIVE_HMD\"/>\n",
-            "            </intent-filter>\n",
-            "            <intent-filter>\n",
-            "                <action android:name=\"com.huawei.android.vr.action.MAIN\"/>\n",
-            "                <category android:name=\"android.intent.category.DEFAULT\"/>\n",
-            "            </intent-filter>"
+
+        // Both activities would otherwise advertise the same launcher and Huawei VR actions, and
+        // an ambiguous implicit intent resolves to nothing on Huawei's VR launcher: it reports
+        // "start activity success", no process starts, and the session ends on a dark screen.
+        // Strip the filters structurally rather than by matching the serialized text, which is
+        // whitespace- and line-ending-sensitive (apktool writes CRLF).
+        let native_activity_start = manifest.rfind(native_activity_open).unwrap();
+        let native_activity_end = manifest[native_activity_start..]
+            .find("</activity>")
+            .map(|offset| native_activity_start + offset)
+            .expect("NativeActivity element is not closed; apktool output changed");
+        let native_activity = &manifest[native_activity_start..native_activity_end];
+        let mut stripped = String::with_capacity(native_activity.len());
+        let mut rest = native_activity;
+        let mut removed_filters = 0;
+        while let Some(open) = rest.find("<intent-filter") {
+            let close = rest[open..]
+                .find("</intent-filter>")
+                .map(|offset| open + offset + "</intent-filter>".len())
+                .expect("unterminated intent-filter in NativeActivity");
+            stripped.push_str(rest[..open].trim_end_matches([' ', '\t', '\r', '\n']));
+            rest = &rest[close..];
+            removed_filters += 1;
+        }
+        assert_eq!(
+            removed_filters, 2,
+            "expected the launcher and Huawei VR intent-filters on NativeActivity, found \
+             {removed_filters}; apktool output changed"
         );
-        let native_lib_only =
-            "<meta-data android:name=\"android.app.lib_name\" android:value=\"alvr_client_openxr\"/>";
-        let manifest = if manifest.contains(native_launcher_filters) {
-            manifest.replacen(native_launcher_filters, native_lib_only, 1)
-        } else {
-            manifest
-        };
+        stripped.push_str(rest);
+        let manifest = format!(
+            "{}{stripped}{}",
+            &manifest[..native_activity_start],
+            &manifest[native_activity_end..]
+        );
         fs::write(&manifest_path, manifest).unwrap();
 
         let rebuilt_apk = work_dir.join("alvr_client_qiyu_vractivity_unsigned.apk");
