@@ -625,14 +625,6 @@ impl StreamContext {
                         } | PassthroughMode::RgbChromaKey(_)
                             | PassthroughMode::HsvChromaKey(_)
                     ),
-                })
-                .or_else(|| {
-                    (self.platform == Platform::Hvr).then_some(ProjectionLayerAlphaConfig {
-                        // Wolvic always sets BLEND_TEXTURE_SOURCE_ALPHA on Huawei projection
-                        // layers. Stream output is opaque (alpha=1), so premultiplication is
-                        // equivalent while preserving Huawei's expected compositor contract.
-                        premultiplied: true,
-                    })
                 }),
             clientside_post_processing,
         );

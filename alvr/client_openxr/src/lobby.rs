@@ -363,7 +363,12 @@ impl Lobby {
                             .image_rect(rect),
                     ),
             ],
-            Some(ProjectionLayerAlphaConfig {
+            // Huawei's only environment blend mode is ALPHA_BLEND and the headset has no
+            // passthrough camera, so any layer alpha below 1 composites to black. The official
+            // HVRSDK_XrDemo submits its projection layer with layerFlags = 0, which makes the
+            // runtime treat the layer as opaque regardless of what the texture's alpha holds.
+            // Match that: requesting BLEND_TEXTURE_SOURCE_ALPHA here only risks a black view.
+            (!is_hvr).then_some(ProjectionLayerAlphaConfig {
                 premultiplied: true,
             }),
             None,

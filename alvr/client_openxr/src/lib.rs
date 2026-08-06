@@ -447,6 +447,7 @@ pub fn entry_point() {
             .select_sources(&lobby_interaction_sources);
 
         let mut logged_first_frame = false;
+        let mut logged_hvr_should_render_false = false;
         let mut hvr_stream_frame_diag_count: u32 = 0;
         let mut stream_context = None::<StreamContext>;
         let opaque_blend_mode = environment_blend_mode(platform);
@@ -721,7 +722,14 @@ pub fn entry_point() {
                 Err(e) => panic!("xrBeginFrame failed: {e:?}"),
             }
 
-            if !frame_state.should_render {
+            // Huawei's runtime drops shouldRender to false whenever its SDK considers the app
+            // backgrounded (visible in logcat as "App is on background, do nothing"), and it does
+            // so while the session is still focused and rendering. Submitting zero layers then
+            // leaves the compositor with nothing to show, which is exactly the flash-then-black
+            // symptom. The official HVRSDK_XrDemo never reads shouldRender: its render loop calls
+            // RenderFrame unconditionally while the session runs, and always submits the projection
+            // layer. Follow the sample on HVR and keep the spec-correct skip everywhere else.
+            if !frame_state.should_render && !is_hvr {
                 xr_frame_stream
                     .end(
                         frame_state.predicted_display_time,
@@ -731,6 +739,13 @@ pub fn entry_point() {
                     .unwrap();
 
                 continue;
+            }
+
+            if is_hvr && !frame_state.should_render && !logged_hvr_should_render_false {
+                logged_hvr_should_render_false = true;
+                error!(
+                    "[HVR-DIAG] shouldRender went false; rendering anyway to match HVRSDK_XrDemo"
+                );
             }
 
             // todo: allow rendering lobby and stream layers at the same time and add cross fade
