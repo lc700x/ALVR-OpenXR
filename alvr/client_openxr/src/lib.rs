@@ -794,16 +794,18 @@ pub fn entry_point() {
             let res = xr_frame_stream.end(to_xr_time(display_time), environment_blend_mode, layers);
 
             // Probe: HVR swallows xrEndFrame errors, so count them instead of losing them, and
-            // record what was actually submitted alongside the stream's own per-frame probe.
+            // record what was actually submitted. Report on error rather than on a schedule: a
+            // periodic sample missed the frame the user sees glitch.
             if is_hvr {
                 hvr_end_frame_index += 1;
                 if res.is_err() {
                     hvr_end_frame_errors += 1;
                 }
-                if hvr_end_frame_index <= 120 || hvr_end_frame_index % 60 == 0 {
+                if res.is_err() || hvr_end_frame_index <= 20 || hvr_end_frame_index % 600 == 0 {
                     error!(
                         "[HVR-PROBE] endFrame {hvr_end_frame_index}: res={res:?} errors={hvr_end_frame_errors} \
-                         layers={} passthrough={} blend={environment_blend_mode:?} streaming={}",
+                         layers={} passthrough={} blend={environment_blend_mode:?} streaming={} \
+                         display_time={display_time:?}",
                         layers.len(),
                         passthrough_layer.is_some(),
                         stream_context.is_some(),

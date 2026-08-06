@@ -129,6 +129,7 @@ pub struct StreamContext {
     hvr_swapchains_primed: bool,
     hvr_frame_index: u32,
     hvr_previous_frame_at: Option<Instant>,
+    hvr_previous_had_video: Option<bool>,
 }
 
 impl StreamContext {
@@ -292,6 +293,7 @@ impl StreamContext {
             hvr_swapchains_primed: false,
             hvr_frame_index: 0,
             hvr_previous_frame_at: None,
+            hvr_previous_had_video: None,
         };
 
         this.update_reference_space();
@@ -550,24 +552,41 @@ impl StreamContext {
             }
         }
 
-        // Probe: on HVR, record per frame everything that decides what reaches the display, so a
-        // capture shows exactly which frames were blank and why. Dense at first, then sparse.
+        // Probe: on HVR, record every frame that could be the one the user sees glitch. Sampling
+        // periodically missed it, so report on change instead: the first frames, any frame that
+        // took noticeably longer than a vsync, and every transition between having and not having
+        // a decoded video frame.
         if is_hvr {
             self.hvr_frame_index += 1;
             let index = self.hvr_frame_index;
-            if index <= 120 || index % 60 == 0 {
-                let since_previous = self
-                    .hvr_previous_frame_at
-                    .map(|at| at.elapsed().as_millis())
-                    .unwrap_or(0);
+
+            let has_video = !buffer_ptr.is_null();
+            let since_previous = self
+                .hvr_previous_frame_at
+                .map(|at| at.elapsed().as_millis())
+                .unwrap_or(0);
+
+            let slow = since_previous > 50;
+            let video_changed = self.hvr_previous_had_video != Some(has_video);
+            if index <= 20 || slow || video_changed || index % 600 == 0 {
+                let reason = if video_changed {
+                    "video-change"
+                } else if slow {
+                    "slow"
+                } else {
+                    "sample"
+                };
                 alvr_common::error!(
-                    "[HVR-PROBE] frame {index}: dt={since_previous}ms video={} targets_ready={} \
-                     decoder={} idx=L{left_swapchain_idx}/R{right_swapchain_idx}",
-                    !buffer_ptr.is_null(),
+                    "[HVR-PROBE] frame {index} ({reason}): dt={since_previous}ms video={has_video} \
+                     targets_ready={} decoder={} idx=L{left_swapchain_idx}/R{right_swapchain_idx} \
+                     pose={:?}",
                     self.renderer.render_targets_ready(),
                     self.decoder.is_some(),
+                    view_params[0].pose.position,
                 );
             }
+
+            self.hvr_previous_had_video = Some(has_video);
             self.hvr_previous_frame_at = Some(Instant::now());
         }
 
