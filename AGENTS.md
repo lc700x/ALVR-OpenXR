@@ -33,7 +33,7 @@ Server-side: `server_core` (C-ABI server logic) → `server_openvr` (SteamVR dri
 
 Client-side: `client_core` (main client logic, C-ABI) → `client_openxr` (OpenXR entry point; contains the Qiyu/HVR C++ bindings, see `src/qiyu_backend.cpp` and `build.rs`) → `client_mock` (headless simulator for desktop testing).
 
-Shared: `packets`/`sockets` (network protocol), `session` (settings schema), `graphics` (glow/OpenGL utils), `common`, `events`, `filesystem`, `system_info`. `gui_common`/`dashboard`/`launcher` are the desktop UI (egui). `vulkan_layer` and `vrcompositor_wrapper` are Linux-only compositor interop. `adb` wraps Android Debug Bridge for install/log flows. For legacy QiYu SXR reference behavior, the indexed checkout `C:\Users\xul\Downloads\ALVR-QIYU` is the source of truth — search it (CodeGraph) instead of guessing at SDK semantics.
+Shared: `packets`/`sockets` (network protocol), `session` (settings schema), `graphics` (glow/OpenGL utils), `common`, `events`, `filesystem`, `system_info`. `gui_common`/`dashboard`/`launcher` are the desktop UI (egui). `vulkan_layer` and `vrcompositor_wrapper` are Linux-only compositor interop. `adb` wraps Android Debug Bridge for install/log flows. For legacy QiYu SXR reference behavior, the indexed `ALVR-QIYU` checkout (sibling directory of this repo) is the source of truth — search it (CodeGraph) instead of guessing at SDK semantics.
 
 ## Code style
 
