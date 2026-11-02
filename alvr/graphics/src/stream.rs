@@ -290,6 +290,11 @@ impl StreamRenderer {
         self.context.finish();
     }
 
+    #[cfg(target_os = "android")]
+    pub fn ensure_hvr_current(&self) -> Result<bool, String> {
+        self.context.ensure_hvr_current()
+    }
+
     /// # Safety
     /// `hardware_buffer` must be a valid pointer to a ANativeWindowBuffer.
     pub unsafe fn render(

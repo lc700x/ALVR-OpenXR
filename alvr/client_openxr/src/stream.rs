@@ -32,8 +32,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DECODER_MAX_TIMEOUT_MULTIPLIER: f32 = 0.8;
-
 fn uses_custom_reprojection(platform: Platform) -> bool {
     platform.is_yvr() || platform == Platform::Hvr
 }
@@ -111,6 +109,7 @@ pub struct StreamContext {
     platform: Platform,
     reference_space_type: xr::ReferenceSpaceType,
     stage_reference_space: Arc<xr::Space>,
+    hvr_reference_space: Option<Arc<xr::Space>>,
     view_reference_space: Arc<xr::Space>,
     swapchains: [xr::Swapchain<xr::OpenGlEs>; 2],
     last_good_view_params: [ViewParams; 2],
@@ -121,7 +120,14 @@ pub struct StreamContext {
     renderer: StreamRenderer,
     decoder: Option<(VideoDecoderConfig, VideoDecoderSource)>,
     use_custom_reprojection: bool,
+    /// Counts every decoded video frame handed to the renderer. Only used for HVR diagnostics.
     hvr_video_frame_count: u32,
+    hvr_target_wait_frames: u32,
+    hvr_context_restores: u32,
+    hvr_swapchains_primed: bool,
+    hvr_frame_index: u32,
+    hvr_previous_frame_at: Option<Instant>,
+    hvr_previous_had_video: Option<bool>,
 }
 
 impl StreamContext {
@@ -132,6 +138,7 @@ impl StreamContext {
         interaction_ctx: Arc<RwLock<InteractionContext>>,
         platform: Platform,
         config: ParsedStreamConfig,
+        hvr_reference_space: Option<Arc<xr::Space>>,
     ) -> StreamContext {
         interaction_ctx
             .write()
@@ -227,7 +234,9 @@ impl StreamContext {
         );
 
         if platform == Platform::Hvr {
-            alvr_common::info!(
+            // Huawei's logd drops info/warn records while the vendor SDK floods the buffer, so
+            // every HVR diagnostic that has to survive a capture is logged at error level.
+            alvr_common::error!(
                 "[HVR-DIAG] stream renderer created: targets_ready={}",
                 renderer.render_targets_ready()
             );
@@ -245,11 +254,14 @@ impl StreamContext {
         let input_thread_running = Arc::new(RelaxedAtomic::new(false));
 
         let reference_space_type = crate::tracking_reference_space_type(platform);
-        let stage_reference_space = Arc::new(if platform == Platform::Hvr {
-            interaction::get_hvr_floor_reference_space(&xr_session)
+        let stage_reference_space = if let Some(space) = &hvr_reference_space {
+            Arc::clone(space)
         } else {
-            interaction::get_reference_space(&xr_session, reference_space_type)
-        });
+            Arc::new(interaction::get_reference_space(
+                &xr_session,
+                reference_space_type,
+            ))
+        };
         let view_reference_space = Arc::new(interaction::get_reference_space(
             &xr_session,
             xr::ReferenceSpaceType::VIEW,
@@ -262,6 +274,7 @@ impl StreamContext {
             platform,
             reference_space_type,
             stage_reference_space,
+            hvr_reference_space,
             view_reference_space,
             swapchains,
             last_good_view_params: [ViewParams::default(); 2],
@@ -273,6 +286,12 @@ impl StreamContext {
             decoder: None,
             use_custom_reprojection: uses_custom_reprojection(platform),
             hvr_video_frame_count: 0,
+            hvr_target_wait_frames: 0,
+            hvr_context_restores: 0,
+            hvr_swapchains_primed: false,
+            hvr_frame_index: 0,
+            hvr_previous_frame_at: None,
+            hvr_previous_had_video: None,
         };
 
         this.update_reference_space();
@@ -287,20 +306,28 @@ impl StreamContext {
     pub fn update_reference_space(&mut self) {
         self.input_thread_running.set(false);
 
-        self.stage_reference_space = Arc::new(if self.platform == Platform::Hvr {
-            interaction::get_hvr_floor_reference_space(&self.xr_session)
-        } else {
-            interaction::get_reference_space(&self.xr_session, self.reference_space_type)
-        });
+        // Recreating the Huawei space would re-anchor it to the current head pose, so the streamed
+        // world would face wherever the user happened to be looking. Keep the one created at
+        // session setup, which the lobby also uses.
+        if self.hvr_reference_space.is_none() {
+            self.stage_reference_space = Arc::new(interaction::get_reference_space(
+                &self.xr_session,
+                self.reference_space_type,
+            ));
+        }
         self.view_reference_space = Arc::new(interaction::get_reference_space(
             &self.xr_session,
             xr::ReferenceSpaceType::VIEW,
         ));
 
+        // Huawei's legacy runtime returns an error from xrGetReferenceSpaceBoundsRect, and it is
+        // called again on every ReferenceSpaceChangePending event, so unwrapping here crashed the
+        // client mid-session. A missing playspace is already a supported state.
         self.core_context.send_playspace(
             self.xr_session
                 .reference_space_bounds_rect(self.reference_space_type)
-                .unwrap()
+                .ok()
+                .flatten()
                 .map(|a| Vec2::new(a.width, a.height)),
         );
 
@@ -321,14 +348,12 @@ impl StreamContext {
             #[cfg(target_os = "android")]
             let platform = self.platform;
             move || {
-                // Huawei's OpenXR runtime performs JNI calls (e.g. inside xrSyncActions) on the
-                // calling thread. Unlike the render thread (attached in android_main), this input
-                // thread is not attached to the JVM, so those JNI calls dereference a null
-                // JNIEnv/array and crash in libvrsdk (art::JNI::GetArrayLength). Attach the thread
-                // for the lifetime of the loop; `vm` and `_env` must both stay alive because the
-                // attach guard borrows the vm.
+                // Huawei's OpenXR runtime and QiYu's Native SDK may call JNI from this input
+                // thread. Unlike the render thread (attached in android_main), this thread is not
+                // attached to the JVM by default. Keep it attached for the loop; `vm` and `_env`
+                // must both stay alive because the attach guard borrows the vm.
                 #[cfg(target_os = "android")]
-                let vm = (platform == Platform::Hvr)
+                let vm = (platform == Platform::Hvr || platform == Platform::Qiyu)
                     .then(|| {
                         let context = ndk_context::android_context();
                         unsafe { jni::JavaVM::from_raw(context.vm().cast()) }.ok()
@@ -336,9 +361,22 @@ impl StreamContext {
                     .flatten();
                 #[cfg(target_os = "android")]
                 let _env = vm.as_ref().and_then(|vm| match vm.attach_current_thread() {
-                    Ok(env) => Some(env),
+                    Ok(env) => {
+                        if platform == Platform::Qiyu {
+                            alvr_common::info!("[CTRL-BRIDGE] input thread attached to JVM");
+                        }
+                        Some(env)
+                    }
                     Err(e) => {
-                        alvr_common::error!("[HVR-DIAG] failed to attach input thread to JVM: {e}");
+                        if platform == Platform::Hvr {
+                            alvr_common::error!(
+                                "[HVR-DIAG] failed to attach input thread to JVM: {e}"
+                            );
+                        } else {
+                            alvr_common::error!(
+                                "[CTRL-BRIDGE] failed to attach input thread to JVM: {e}"
+                            );
+                        }
                         None
                     }
                 });
@@ -399,20 +437,24 @@ impl StreamContext {
         vsync_time: Duration,
     ) -> (ProjectionLayerBuilder, Duration) {
         let xr_vsync_time = xr::Time::from_nanos(vsync_time.as_nanos() as _);
-        let frame_poll_deadline = Instant::now()
-            + Duration::from_secs_f32(
-                frame_interval.as_secs_f32() * DECODER_MAX_TIMEOUT_MULTIPLIER,
-            );
+        let deadline = Instant::now() + frame_interval.mul_f32(0.8);
         let mut frame_result = None;
         if let Some((_, source)) = &mut self.decoder {
-            while frame_result.is_none() && Instant::now() < frame_poll_deadline {
+            loop {
                 frame_result = source.get_frame();
-                thread::sleep(Duration::from_micros(500));
+                if frame_result.is_some() || Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(
+                    Duration::from_micros(500)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
             }
         }
 
         let (timestamp, view_params, buffer_ptr) =
             if let Some((timestamp, buffer_ptr)) = frame_result {
+                video_decoder::report_video_perf(true);
                 let view_params = self.core_context.report_compositor_start(timestamp);
 
                 self.last_good_view_params = view_params;
@@ -424,10 +466,11 @@ impl StreamContext {
 
         let is_hvr = self.platform == Platform::Hvr;
 
-        if is_hvr && !buffer_ptr.is_null() {
+        if !buffer_ptr.is_null() {
             self.hvr_video_frame_count += 1;
-            if self.hvr_video_frame_count <= 2 || self.hvr_video_frame_count % 300 == 0 {
-                alvr_common::info!(
+            if is_hvr && (self.hvr_video_frame_count <= 2 || self.hvr_video_frame_count % 300 == 0)
+            {
+                alvr_common::error!(
                     "[HVR-DIAG] decoded video frame {}: timestamp={timestamp:?}, vsync={vsync_time:?}",
                     self.hvr_video_frame_count
                 );
@@ -435,6 +478,15 @@ impl StreamContext {
         }
 
         let left_swapchain_idx = if is_hvr {
+            // Populate the Huawei GL texture handles in one go, so the stream does not skip a frame
+            // per swapchain image while they trickle in. Only valid inside an active frame.
+            if !self.hvr_swapchains_primed {
+                self.hvr_swapchains_primed = true;
+                for swapchain in &self.swapchains {
+                    graphics::hvr_prime_swapchain(swapchain);
+                }
+            }
+
             graphics::hvr_acquire_image(&mut self.swapchains[0]).unwrap_or(0)
         } else {
             self.swapchains[0].acquire_image().unwrap()
@@ -457,6 +509,27 @@ impl StreamContext {
                 .unwrap();
         }
 
+        // Huawei's runtime binds its own EGL context on this thread inside the swapchain calls.
+        // Drawing without rebinding ours sends every GL command to the wrong context, which is why
+        // the streamed image intermittently freezes or goes black. The lobby already does this.
+        #[cfg(target_os = "android")]
+        if is_hvr {
+            match self.renderer.ensure_hvr_current() {
+                Ok(true) => {
+                    self.hvr_context_restores += 1;
+                    if self.hvr_context_restores <= 3 || self.hvr_context_restores % 600 == 0 {
+                        alvr_common::error!(
+                            "[HVR-DIAG] restored Huawei EGL context after stream swapchain wait \
+                             ({} times)",
+                            self.hvr_context_restores
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => alvr_common::error!("[HVR-DIAG] {error}"),
+            }
+        }
+
         // Huawei returns zero swapchain texture handles until the images are acquired/waited inside
         // an active frame. Now that they have been, re-enumerate and (re)build the render targets.
         if is_hvr && !self.renderer.render_targets_ready() {
@@ -468,11 +541,64 @@ impl StreamContext {
                 let right: Vec<u32> = right_handles.iter().map(|&h| h as u32).collect();
                 if left.iter().all(|&h| h != 0) && right.iter().all(|&h| h != 0) {
                     self.renderer.set_swapchain_textures([left, right]);
-                    alvr_common::info!(
+                    alvr_common::error!(
                         "[HVR-DIAG] stream render targets built from in-frame handles"
                     );
+                } else {
+                    // Until this succeeds the stream renderer draws nothing, so the headset shows
+                    // a frozen image. Report the progression (the lobby fills one handle per
+                    // acquired image) so a capture distinguishes "still filling" from "stuck".
+                    self.hvr_target_wait_frames += 1;
+                    if self.hvr_target_wait_frames <= 8 || self.hvr_target_wait_frames % 300 == 0 {
+                        alvr_common::error!(
+                            "[HVR-DIAG] stream targets not ready after \
+                             {} frames: acquired idx L={left_swapchain_idx} R={right_swapchain_idx}, \
+                             handles left={left:?} right={right:?}",
+                            self.hvr_target_wait_frames
+                        );
+                    }
                 }
+            } else {
+                alvr_common::error!("[HVR-DIAG] stream in-frame enumerate_images failed");
             }
+        }
+
+        // Probe: on HVR, record every frame that could be the one the user sees glitch. Sampling
+        // periodically missed it, so report on change instead: the first frames, any frame that
+        // took noticeably longer than a vsync, and every transition between having and not having
+        // a decoded video frame.
+        if is_hvr {
+            self.hvr_frame_index += 1;
+            let index = self.hvr_frame_index;
+
+            let has_video = !buffer_ptr.is_null();
+            let since_previous = self
+                .hvr_previous_frame_at
+                .map(|at| at.elapsed().as_millis())
+                .unwrap_or(0);
+
+            let slow = since_previous > 50;
+            let video_changed = self.hvr_previous_had_video != Some(has_video);
+            if index <= 20 || slow || video_changed || index % 600 == 0 {
+                let reason = if video_changed {
+                    "video-change"
+                } else if slow {
+                    "slow"
+                } else {
+                    "sample"
+                };
+                alvr_common::error!(
+                    "[HVR-PROBE] frame {index} ({reason}): dt={since_previous}ms video={has_video} \
+                     targets_ready={} decoder={} idx=L{left_swapchain_idx}/R{right_swapchain_idx} \
+                     pose={:?}",
+                    self.renderer.render_targets_ready(),
+                    self.decoder.is_some(),
+                    view_params[0].pose.position,
+                );
+            }
+
+            self.hvr_previous_had_video = Some(has_video);
+            self.hvr_previous_frame_at = Some(Instant::now());
         }
 
         let (flags, maybe_views) = self
@@ -607,14 +733,6 @@ impl StreamContext {
                         } | PassthroughMode::RgbChromaKey(_)
                             | PassthroughMode::HsvChromaKey(_)
                     ),
-                })
-                .or_else(|| {
-                    (self.platform == Platform::Hvr).then_some(ProjectionLayerAlphaConfig {
-                        // Wolvic always sets BLEND_TEXTURE_SOURCE_ALPHA on Huawei projection
-                        // layers. Stream output is opaque (alpha=1), so premultiplication is
-                        // equivalent while preserving Huawei's expected compositor contract.
-                        premultiplied: true,
-                    })
                 }),
             clientside_post_processing,
         );

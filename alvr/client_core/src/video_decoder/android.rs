@@ -42,6 +42,7 @@ type SharedMediaCodec = Arc<FakeThreadSafe<MediaCodec>>;
 
 pub struct VideoDecoderSink {
     inner: Arc<Mutex<Option<SharedMediaCodec>>>,
+    timestamps: Arc<Mutex<super::DecoderTimestamps>>,
 }
 
 unsafe impl Send for VideoDecoderSink {}
@@ -64,10 +65,18 @@ impl VideoDecoderSink {
                     )
                 };
 
-                // NB: the function expects the timestamp in micros, but nanos is used to have
-                // complete precision, so when converted back to Duration it can compare correctly
-                // to other Durations
-                decoder.queue_input_buffer(buffer, 0, data.len(), timestamp.as_nanos() as _, 0)?;
+                // Stream time is nanoseconds; MediaCodec input PTS is microseconds.
+                let timestamp_us = self
+                    .timestamps
+                    .lock()
+                    .reserve(timestamp)
+                    .ok_or_else(|| anyhow!("decoder timestamp exhausted"))?;
+                if let Err(error) =
+                    decoder.queue_input_buffer(buffer, 0, data.len(), timestamp_us, 0)
+                {
+                    self.timestamps.lock().take(timestamp_us);
+                    return Err(error.into());
+                }
 
                 Ok(true)
             }
@@ -198,9 +207,17 @@ fn decoder_lifecycle(
     decoder_ready_notifier: Arc<Condvar>,
     image_queue: Arc<Mutex<VecDeque<QueuedImage>>>,
     image_reader: &mut ImageReader,
+    timestamps: Arc<Mutex<super::DecoderTimestamps>>,
 ) -> Result<()> {
     // 2x: keep the target buffering in the middle of the max amount of queuable frames
-    let available_buffering_frames = (2. * config.max_buffering_frames).ceil() as usize;
+    //
+    // The queue owns images acquired from the ImageReader and only releases one when it is popped,
+    // so it can never hold more than the reader's max_images. Clamp accordingly: Huawei's OMX
+    // decoder needs a small max_images, and without this the queue grows past what the reader
+    // allows, every later acquire fails with MaxImagesAcquired, and video stalls on the last frame.
+    let max_queued_images = super::decoder_max_images().max(2) as usize - 1;
+    let available_buffering_frames =
+        ((2. * config.max_buffering_frames).ceil() as usize).min(max_queued_images);
     let acquired_frame_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     image_reader.set_image_listener(Box::new({
@@ -229,6 +246,7 @@ fn decoder_lifecycle(
                         callback(Ok(timestamp));
                     }
 
+                    super::report_video_perf(false);
                     image_queue_lock.push_back(QueuedImage {
                         timestamp,
                         image,
@@ -317,11 +335,23 @@ fn decoder_lifecycle(
     }
 
     let mut error_counter = 0;
+    let mut unmapped_outputs = 0u64;
     while running.value() {
         match decoder.dequeue_output_buffer(Duration::from_millis(1)) {
             Ok(DequeuedOutputBufferInfoResult::Buffer(buffer)) => {
-                // The buffer timestamp is actually nanoseconds
-                let presentation_time_ns = buffer.info().presentation_time_us();
+                // MediaCodec PTS is in microseconds; the output Surface timestamp is in nanoseconds.
+                let original = timestamps
+                    .lock()
+                    .take(buffer.info().presentation_time_us() as u64);
+                let Some(original) = original else {
+                    unmapped_outputs += 1;
+                    if unmapped_outputs <= 3 || unmapped_outputs % 300 == 0 {
+                        warn!("Discarding decoded frame without timestamp identity ({unmapped_outputs})");
+                    }
+                    decoder.release_output_buffer(buffer, false)?;
+                    continue;
+                };
+                let presentation_time_ns = original.as_nanos() as i64;
 
                 if let Err(e) = decoder.release_output_buffer_at_time(buffer, presentation_time_ns)
                 {
@@ -366,6 +396,7 @@ pub fn video_decoder_split(
     let decoder_sink = Arc::new(Mutex::new(None::<SharedMediaCodec>));
     let decoder_ready_notifier = Arc::new(Condvar::new());
     let image_queue = Arc::new(Mutex::new(VecDeque::<QueuedImage>::new()));
+    let timestamps = Arc::new(Mutex::new(super::DecoderTimestamps::default()));
 
     let dequeue_thread = thread::spawn({
         let config = config.clone();
@@ -373,6 +404,7 @@ pub fn video_decoder_split(
         let decoder_sink = Arc::clone(&decoder_sink);
         let decoder_ready_notifier = Arc::clone(&decoder_ready_notifier);
         let image_queue = Arc::clone(&image_queue);
+        let timestamps = Arc::clone(&timestamps);
         move || {
             let max_images = super::decoder_max_images();
             if alvr_system_info::platform() == alvr_system_info::Platform::Hvr {
@@ -405,11 +437,13 @@ pub fn video_decoder_split(
                 decoder_ready_notifier,
                 Arc::clone(&image_queue),
                 &mut image_reader,
+                Arc::clone(&timestamps),
             ) {
                 frame_result_callback(Err(e));
             }
 
             image_queue.lock().clear();
+            timestamps.lock().pending.clear();
             error!("FIXME: Leaking Imagereader!");
             Box::leak(Box::new(image_reader));
         }
@@ -428,6 +462,7 @@ pub fn video_decoder_split(
 
     let sink = VideoDecoderSink {
         inner: decoder_sink,
+        timestamps,
     };
     let source = VideoDecoderSource {
         running,

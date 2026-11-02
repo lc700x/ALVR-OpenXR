@@ -63,6 +63,33 @@ const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
 
 const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
 
+#[derive(Debug, PartialEq, Eq)]
+struct VideoPacketState {
+    stream_corrupted: bool,
+    should_decode: bool,
+}
+
+fn video_packet_state(
+    stream_corrupted: bool,
+    is_idr: bool,
+    packet_lost: bool,
+    avoid_video_glitching: bool,
+) -> VideoPacketState {
+    // Packet loss takes priority because a partial IDR cannot restore decoder state.
+    let stream_corrupted = if packet_lost {
+        true
+    } else if is_idr {
+        false
+    } else {
+        stream_corrupted
+    };
+
+    VideoPacketState {
+        stream_corrupted,
+        should_decode: !stream_corrupted || !avoid_video_glitching,
+    }
+}
+
 pub type DecoderCallback = dyn FnMut(Duration, &[u8]) -> bool + Send;
 
 #[derive(Default)]
@@ -330,17 +357,23 @@ fn connection_pipeline(
                     stats.report_video_packet_received(header.timestamp);
                 }
 
-                if header.is_idr {
-                    stream_corrupted = false;
-                } else if data.had_packet_loss() {
-                    stream_corrupted = true;
+                let packet_lost = data.had_packet_loss();
+                let packet_state = video_packet_state(
+                    stream_corrupted,
+                    header.is_idr,
+                    packet_lost,
+                    settings.connection.avoid_video_glitching,
+                );
+                stream_corrupted = packet_state.stream_corrupted;
+
+                if packet_lost {
                     if let Some(sender) = &mut *ctx.control_sender.lock() {
                         sender.send(&ClientControlPacket::RequestIdr).ok();
                     }
                     warn!("Network dropped video packet");
                 }
 
-                if !stream_corrupted || !settings.connection.avoid_video_glitching {
+                if packet_state.should_decode {
                     let submitted = ctx
                         .decoder_callback
                         .lock()
@@ -355,8 +388,10 @@ fn connection_pipeline(
                         warn!("Dropped video packet. Reason: Decoder saturation")
                     }
                 } else {
-                    if let Some(sender) = &mut *ctx.control_sender.lock() {
-                        sender.send(&ClientControlPacket::RequestIdr).ok();
+                    if !packet_lost {
+                        if let Some(sender) = &mut *ctx.control_sender.lock() {
+                            sender.send(&ClientControlPacket::RequestIdr).ok();
+                        }
                     }
                     warn!("Dropped video packet. Reason: Waiting for IDR frame")
                 }
@@ -613,4 +648,45 @@ fn connection_pipeline(
     dbg_connection!("connection_pipeline: End");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn video_packet_waits_for_complete_idr_after_packet_loss() {
+        let state = video_packet_state(false, true, true, true);
+        assert_eq!(
+            state,
+            VideoPacketState {
+                stream_corrupted: true,
+                should_decode: false,
+            }
+        );
+
+        let state = video_packet_state(state.stream_corrupted, false, false, true);
+        assert!(!state.should_decode);
+
+        let state = video_packet_state(state.stream_corrupted, true, false, true);
+        assert!(!state.stream_corrupted);
+        assert!(state.should_decode);
+    }
+
+    #[test]
+    fn video_packet_waits_for_first_complete_idr() {
+        let state = video_packet_state(true, false, false, true);
+        assert!(!state.should_decode);
+
+        let state = video_packet_state(state.stream_corrupted, true, false, true);
+        assert!(state.should_decode);
+    }
+
+    #[test]
+    fn video_packet_decodes_corrupted_stream_when_glitch_avoidance_is_disabled() {
+        let state = video_packet_state(false, false, true, false);
+
+        assert!(state.stream_corrupted);
+        assert!(state.should_decode);
+    }
 }

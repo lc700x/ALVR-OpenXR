@@ -11,8 +11,9 @@
 use openxr_sys as sys;
 // openxr_sys::Handle is not pub-exported at crate root in 0.10; methods are inherent
 use alvr_common::{once_cell::sync::Lazy, parking_lot::Mutex};
+use ash::vk;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     ffi::{c_char, CStr},
     time::{Duration, Instant},
 };
@@ -51,29 +52,109 @@ const SWAPCHAIN_HANDLE_BASE: u64 = 0x200;
 const PRIMARY_VIEW_CONFIG: sys::ViewConfigurationType = sys::ViewConfigurationType::PRIMARY_STEREO;
 /// Stereo => two views.
 const VIEW_COUNT: usize = 2;
+static VULKAN_BACKEND_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 /// Placeholder per-eye render resolution until the negotiated config is wired in.
 const RECOMMENDED_VIEW_WIDTH: u32 = 2016;
 const RECOMMENDED_VIEW_HEIGHT: u32 = 2240;
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AlvrOpenXrDrawDesc {
+    shared_handle: *mut std::ffi::c_void,
+    shared_type: u32,
+    format: i64,
+    array_slice: u32,
+    uv_bounds: [f32; 4],
+    clip_vertices: [f32; 16],
+    alpha_mode: u32,
+}
+
+fn next_acquirable_image(
+    states: &[crate::state::SwapchainImageState],
+    next_index: u32,
+) -> Option<usize> {
+    let count = states.len();
+    if count == 0 {
+        return None;
+    }
+    (0..count)
+        .map(|offset| (next_index as usize + offset) % count)
+        .find(|&index| !states[index].acquired && !states[index].reserved_for_composition)
+}
+
+fn next_unwaited_image(
+    order: &VecDeque<u32>,
+    states: &[crate::state::SwapchainImageState],
+) -> Option<u32> {
+    order.iter().copied().find(|&index| {
+        states
+            .get(index as usize)
+            .is_some_and(|state| !state.waited)
+    })
+}
+
+fn record_released_image(
+    states: &mut [crate::state::SwapchainImageState],
+    previous: &mut Option<u32>,
+    release_serial: &mut u64,
+    index: u32,
+) {
+    if let Some(previous) = *previous {
+        if let Some(state) = states.get_mut(previous as usize) {
+            state.reserved_for_composition = false;
+        }
+    }
+    *release_serial = (*release_serial).wrapping_add(1);
+    *previous = Some(index);
+    if let Some(state) = states.get_mut(index as usize) {
+        state.reserved_for_composition = true;
+    }
+}
+
+fn valid_array_slice(array_size: u32, array_slice: u32) -> bool {
+    array_slice < array_size
+}
+
+fn vk_wait_timeout_ns(timeout: sys::Duration) -> Result<u64, sys::Result> {
+    let timeout_ns = timeout.as_nanos();
+    if timeout_ns < -1 {
+        Err(sys::Result::ERROR_VALIDATION_FAILURE)
+    } else if timeout_ns < 0 {
+        Ok(u64::MAX)
+    } else {
+        Ok(timeout_ns as u64)
+    }
+}
+
+fn openxr_vk_wait_result(result: Result<(), vk::Result>) -> sys::Result {
+    match result {
+        Ok(()) => sys::Result::SUCCESS,
+        Err(vk::Result::TIMEOUT) => sys::Result::TIMEOUT_EXPIRED,
+        Err(_) => sys::Result::ERROR_RUNTIME_FAILURE,
+    }
+}
+
 unsafe extern "C" {
-    /// Submit a stereo frame to the reused C++ encoder (defined in glue.cpp).
+    /// Draw per-eye OpenXR composition layers and submit the composed frame.
     /// Safe no-op until the encoder is started.
-    fn alvr_openxr_encoder_submit(
-        shared_handle_left: *mut std::ffi::c_void,
-        shared_handle_right: *mut std::ffi::c_void,
+    fn alvr_openxr_encoder_submit_layers(
+        layers_left: *const AlvrOpenXrDrawDesc,
+        layer_count_left: u32,
+        layers_right: *const AlvrOpenXrDrawDesc,
+        layer_count_right: u32,
+        width_left: u32,
+        height_left: u32,
+        width_right: u32,
+        height_right: u32,
         fov_left: *const f32,
         fov_right: *const f32,
         eye_to_head_left: *const f32,
         eye_to_head_right: *const f32,
-        // Per-eye normalized UV crop [u_min, u_max, v_min, v_max] in the swapchain
-        // texture, derived from each view's sub_image.image_rect. Lets the encoder
-        // sample the correct region for double-wide / sub-rect / atlas swapchains.
-        bounds_left: *const f32,
-        bounds_right: *const f32,
         timestamp_ns: u64,
         idr: bool,
-        flip_v: bool,
     );
+    fn alvr_openxr_encoder_forget_texture(shared_handle: *mut std::ffi::c_void);
 }
 
 const RUNTIME_NAME: &str = "ALVR";
@@ -180,8 +261,8 @@ pub unsafe extern "system" fn create_instance(
 }
 
 pub unsafe extern "system" fn destroy_instance(_instance: sys::Instance) -> sys::Result {
-    // ponytail: single-instance runtime, nothing to free yet; real teardown
-    // lands with the session/streaming lifecycle.
+    // The loader may unload our DLL immediately after this call returns.
+    crate::streaming::shutdown();
     sys::Result::SUCCESS
 }
 
@@ -368,14 +449,62 @@ pub unsafe extern "system" fn create_session(
     let info = unsafe { &*create_info };
     unsafe { capture_graphics_binding(info.next) };
 
+    {
+        let mut graphics = crate::state::GRAPHICS.lock();
+        if graphics.api == crate::state::GraphicsApi::Vulkan {
+            graphics.vulkan = unsafe {
+                crate::vulkan::VulkanFns::load(
+                    graphics.vk_instance,
+                    graphics.vk_physical_device,
+                    graphics.vk_device,
+                    graphics.vk_queue_family_index,
+                    graphics.vk_queue_index,
+                )
+            }
+            .map(std::sync::Arc::new);
+            if graphics.vulkan.is_none() {
+                *graphics = crate::state::GraphicsState::default();
+                *state = crate::state::SessionState::default();
+                return sys::Result::ERROR_RUNTIME_FAILURE;
+            }
+        }
+    }
     unsafe { *session = sys::Session::from_raw(ALVR_SESSION_HANDLE) };
     sys::Result::SUCCESS
 }
 
 pub unsafe extern "system" fn destroy_session(_session: sys::Session) -> sys::Result {
+    // Stop the encoder before releasing shared textures or its D3D11 device.
+    crate::streaming::set_session_active(false);
+    let mut graphics = crate::state::GRAPHICS.lock();
+    let owns_d3d11_device = graphics.owns_d3d11_device;
+    let d3d11_device = graphics.d3d11_device;
+    let vk = if graphics.api == crate::state::GraphicsApi::Vulkan {
+        graphics.vulkan.clone()
+    } else {
+        None
+    };
+    if graphics.api == crate::state::GraphicsApi::Vulkan && vk.is_none() {
+        return sys::Result::ERROR_RUNTIME_FAILURE;
+    }
+    let api = graphics.api;
+    for swapchain in &mut graphics.swapchains {
+        if let Err(result) =
+            unsafe { destroy_swapchain_contents(api, d3d11_device, vk.as_deref(), swapchain) }
+        {
+            return result;
+        }
+    }
+    *graphics = crate::state::GraphicsState::default();
+    drop(graphics);
+    if owns_d3d11_device {
+        unsafe { crate::d3d11::release_device(d3d11_device) };
+    }
     let mut state = crate::state::SESSION.lock();
     *state = crate::state::SessionState::default();
     crate::actions::clear_buttons();
+    REFERENCE_SPACES.lock().clear();
+    *LOCAL_ORIGIN.lock() = None;
     sys::Result::SUCCESS
 }
 
@@ -406,7 +535,7 @@ pub unsafe extern "system" fn begin_session(
 
     // Bring up ALVR streaming (idempotent): connect to a client and start the
     // encoder event loop.
-    crate::streaming::ensure_started();
+    crate::streaming::set_session_active(true);
     sys::Result::SUCCESS
 }
 
@@ -471,6 +600,7 @@ pub unsafe extern "system" fn create_reference_space(
 }
 
 pub unsafe extern "system" fn destroy_space(_space: sys::Space) -> sys::Result {
+    REFERENCE_SPACES.lock().remove(&_space.into_raw());
     sys::Result::SUCCESS
 }
 
@@ -494,10 +624,7 @@ pub unsafe extern "system" fn get_d3d11_graphics_requirements(
             LowPart: low,
             HighPart: high,
         },
-        None => sys::platform::LUID {
-            LowPart: 0,
-            HighPart: 0,
-        },
+        None => return sys::Result::ERROR_GRAPHICS_DEVICE_INVALID,
     };
     // D3D_FEATURE_LEVEL_11_0
     req.min_feature_level = 0xb000;
@@ -620,7 +747,9 @@ pub unsafe extern "system" fn get_vulkan_graphics_device(
     if vk_physical_device.is_null() {
         return sys::Result::ERROR_VALIDATION_FAILURE;
     }
-    let luid = crate::vulkan::default_adapter_luid_bytes().unwrap_or([0u8; 8]);
+    let Some(luid) = crate::vulkan::default_adapter_luid_bytes() else {
+        return sys::Result::ERROR_GRAPHICS_DEVICE_INVALID;
+    };
     match unsafe { crate::vulkan::physical_device_for_luid(vk_instance as usize, luid) } {
         Some(pd) => {
             unsafe { *vk_physical_device = pd as sys::platform::VkPhysicalDevice };
@@ -640,10 +769,10 @@ pub unsafe extern "system" fn get_vulkan_graphics_device2(
         return sys::Result::ERROR_VALIDATION_FAILURE;
     }
     let info = unsafe { &*get_info };
-    let luid = crate::vulkan::default_adapter_luid_bytes().unwrap_or([0u8; 8]);
-    match unsafe {
-        crate::vulkan::physical_device_for_luid(info.vulkan_instance as usize, luid)
-    } {
+    let Some(luid) = crate::vulkan::default_adapter_luid_bytes() else {
+        return sys::Result::ERROR_GRAPHICS_DEVICE_INVALID;
+    };
+    match unsafe { crate::vulkan::physical_device_for_luid(info.vulkan_instance as usize, luid) } {
         Some(pd) => {
             unsafe { *vk_physical_device = pd as sys::platform::VkPhysicalDevice };
             sys::Result::SUCCESS
@@ -672,8 +801,8 @@ pub unsafe extern "system" fn create_vulkan_instance(
     let ok = unsafe {
         crate::vulkan::create_instance(
             gipa as usize,
-            info.vulkan_create_info.cast(),
-            info.vulkan_allocator.cast(),
+            info.vulkan_create_info.cast::<vk::InstanceCreateInfo<'_>>(),
+            info.vulkan_allocator.cast::<vk::AllocationCallbacks<'_>>(),
             &mut out_instance,
             &mut out_result,
         )
@@ -682,11 +811,8 @@ pub unsafe extern "system" fn create_vulkan_instance(
         *vulkan_instance = out_instance as sys::platform::VkInstance;
         *vulkan_result = out_result;
     }
-    if ok {
-        sys::Result::SUCCESS
-    } else {
-        sys::Result::ERROR_RUNTIME_FAILURE
-    }
+    let _ = ok;
+    sys::Result::SUCCESS
 }
 
 /// `xrCreateVulkanDeviceKHR` — create the app's VkDevice with the interop device
@@ -710,8 +836,8 @@ pub unsafe extern "system" fn create_vulkan_device(
         crate::vulkan::create_device(
             gipa as usize,
             info.vulkan_physical_device as usize,
-            info.vulkan_create_info.cast(),
-            info.vulkan_allocator.cast(),
+            info.vulkan_create_info.cast::<vk::DeviceCreateInfo<'_>>(),
+            info.vulkan_allocator.cast::<vk::AllocationCallbacks<'_>>(),
             &mut out_device,
             &mut out_result,
         )
@@ -720,11 +846,8 @@ pub unsafe extern "system" fn create_vulkan_device(
         *vulkan_device = out_device as sys::platform::VkDevice;
         *vulkan_result = out_result;
     }
-    if ok {
-        sys::Result::SUCCESS
-    } else {
-        sys::Result::ERROR_RUNTIME_FAILURE
-    }
+    let _ = ok;
+    sys::Result::SUCCESS
 }
 
 /// Inspect a session's graphics-binding chain and record the API + handles.
@@ -741,6 +864,7 @@ unsafe fn capture_graphics_binding(next: *const std::ffi::c_void) {
             let binding = cursor.cast::<sys::GraphicsBindingD3D11KHR>();
             graphics.api = crate::state::GraphicsApi::D3D11;
             graphics.d3d11_device = unsafe { (*binding).device } as usize;
+            graphics.owns_d3d11_device = false;
             return;
         }
         if ty == sys::StructureType::GRAPHICS_BINDING_OPENGL_WIN32_KHR {
@@ -817,6 +941,32 @@ pub unsafe extern "system" fn enumerate_swapchain_formats(
     enumerate(list, format_capacity_input, format_count_output, formats)
 }
 
+fn vulkan_image_usage(usage: sys::SwapchainUsageFlags) -> Option<vk::ImageUsageFlags> {
+    use sys::SwapchainUsageFlags as XrUsage;
+    if usage.contains(XrUsage::DEPTH_STENCIL_ATTACHMENT)
+        || usage.contains(XrUsage::UNORDERED_ACCESS)
+    {
+        return None;
+    }
+    // Every color swapchain is acquired in COLOR_ATTACHMENT_OPTIMAL, even when
+    // the application only requests transfer or sampled access.
+    let mut result = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT;
+    if usage.contains(XrUsage::TRANSFER_SRC) {
+        result |= vk::ImageUsageFlags::TRANSFER_SRC;
+    }
+    if usage.contains(XrUsage::TRANSFER_DST) {
+        result |= vk::ImageUsageFlags::TRANSFER_DST;
+    }
+    Some(result)
+}
+
+fn d3d11_bind_flags() -> u32 {
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+    };
+    (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32
+}
+
 pub unsafe extern "system" fn create_swapchain(
     _session: sys::Session,
     create_info: *const sys::SwapchainCreateInfo,
@@ -826,6 +976,21 @@ pub unsafe extern "system" fn create_swapchain(
         return sys::Result::ERROR_VALIDATION_FAILURE;
     }
     let info = unsafe { &*create_info };
+    let session_api = crate::state::GRAPHICS.lock().api;
+    let is_vk_session = session_api == crate::state::GraphicsApi::Vulkan;
+    if info.width == 0 || info.height == 0 || info.array_size == 0 {
+        return sys::Result::ERROR_VALIDATION_FAILURE;
+    }
+    if info.mip_count != 1 || info.face_count != 1 {
+        return sys::Result::ERROR_FEATURE_UNSUPPORTED;
+    }
+    if is_vk_session
+        && (info.sample_count != 1
+            || !crate::vulkan::is_supported_format(info.format)
+            || vulkan_image_usage(info.usage_flags).is_none())
+    {
+        return sys::Result::ERROR_FEATURE_UNSUPPORTED;
+    }
 
     // OpenGL and Vulkan sessions have no app D3D11 device; create a
     // runtime-owned one the encoder and interop share.
@@ -835,7 +1000,10 @@ pub unsafe extern "system" fn create_swapchain(
             || graphics.api == crate::state::GraphicsApi::Vulkan;
         if graphics.d3d11_device == 0 && needs_device {
             match unsafe { crate::d3d11::create_device() } {
-                Ok(dev) => graphics.d3d11_device = dev,
+                Ok(dev) => {
+                    graphics.d3d11_device = dev;
+                    graphics.owns_d3d11_device = true;
+                }
                 Err(_) => return sys::Result::ERROR_GRAPHICS_DEVICE_INVALID,
             }
         }
@@ -848,9 +1016,15 @@ pub unsafe extern "system" fn create_swapchain(
 
     // The backing textures are always D3D11. For OpenGL sessions the app's
     // `info.format` is a GL enum, so translate it to the matching DXGI format.
-    let session_api = crate::state::GRAPHICS.lock().api;
     let is_gl_session = session_api == crate::state::GraphicsApi::OpenGL;
-    let is_vk_session = session_api == crate::state::GraphicsApi::Vulkan;
+    let vk_usage = if is_vk_session {
+        match vulkan_image_usage(info.usage_flags) {
+            Some(usage) => usage,
+            None => return sys::Result::ERROR_FEATURE_UNSUPPORTED,
+        }
+    } else {
+        vk::ImageUsageFlags::empty()
+    };
     let dxgi_format = if is_gl_session {
         gl_format_to_dxgi(info.format) as i64
     } else if is_vk_session {
@@ -872,6 +1046,7 @@ pub unsafe extern "system" fn create_swapchain(
                 info.height,
                 info.array_size,
                 info.sample_count,
+                d3d11_bind_flags(),
             )
         } else {
             crate::d3d11::create_swapchain_textures(
@@ -935,8 +1110,8 @@ pub unsafe extern "system" fn create_swapchain(
     // fall back to a universal CPU-copy path: the app renders into runtime-owned
     // VkImages whose pixels are read back and uploaded into typed D3D11 textures
     // at submit time (works on every GPU/driver, mirroring the OpenGL fallback).
-    let (vk_images, nt_handles, vk_cpu_copy) = if graphics.api
-        == crate::state::GraphicsApi::Vulkan
+    let mut vk_fallback_reason = None;
+    let (vk_images, nt_handles, vk_cpu_copy) = if graphics.api == crate::state::GraphicsApi::Vulkan
     {
         match unsafe {
             import_vulkan_images(
@@ -946,14 +1121,15 @@ pub unsafe extern "system" fn create_swapchain(
                 info.width,
                 info.height,
                 info.array_size,
+                vk_usage,
             )
         } {
             Ok((imgs, handles)) => (imgs, handles, false),
-            Err(_) => {
+            Err(error) => {
+                vk_fallback_reason = Some(error);
                 // Zero-copy import unsupported — rebuild as a CPU-copy swapchain.
                 unsafe { crate::d3d11::release_textures(&textures) };
-                let typed_format =
-                    crate::vulkan::vk_format_to_dxgi_typed(info.format) as i64;
+                let typed_format = crate::vulkan::vk_format_to_dxgi_typed(info.format) as i64;
                 textures = match unsafe {
                     crate::d3d11::create_swapchain_textures(
                         device_ptr,
@@ -975,16 +1151,10 @@ pub unsafe extern "system" fn create_swapchain(
                         info.width,
                         info.height,
                         info.array_size,
+                        vk_usage,
                     )
                 } {
-                    Ok(imgs) => {
-                        eprintln!(
-                            "[alvr] create_swapchain: Vulkan CPU-copy fallback ({} images) \
-                             — universal GPU compatibility",
-                            imgs.len()
-                        );
-                        (imgs, Vec::new(), true)
-                    }
+                    Ok(imgs) => (imgs, Vec::new(), true),
                     Err(status) => {
                         unsafe { crate::d3d11::release_textures(&textures) };
                         return status;
@@ -996,17 +1166,62 @@ pub unsafe extern "system" fn create_swapchain(
         (Vec::new(), Vec::new(), false)
     };
 
+    let vk_commands = if is_vk_session {
+        let Some(vk) = graphics.vulkan.clone() else {
+            unsafe {
+                crate::d3d11::release_textures(&textures);
+                for handle in &nt_handles {
+                    crate::d3d11::close_handle(*handle);
+                }
+            }
+            return sys::Result::ERROR_RUNTIME_FAILURE;
+        };
+        match vk.create_command_resources(vk_images.len()) {
+            Ok(resources) => resources,
+            Err(_) => {
+                unsafe {
+                    free_vulkan_images(&vk, &vk_images);
+                    crate::d3d11::release_textures(&textures);
+                    for handle in &nt_handles {
+                        crate::d3d11::close_handle(*handle);
+                    }
+                }
+                return sys::Result::ERROR_RUNTIME_FAILURE;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    if is_vk_session && !VULKAN_BACKEND_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if vk_cpu_copy {
+            eprintln!(
+                "[alvr] Vulkan swapchain backend: CPU-copy fallback ({:?})",
+                vk_fallback_reason.unwrap_or(sys::Result::ERROR_RUNTIME_FAILURE)
+            );
+        } else {
+            eprintln!("[alvr] Vulkan swapchain backend: D3D11/Vulkan GPU interop");
+        }
+    }
+
+    let image_count = textures.len();
     graphics.swapchains.push(crate::state::Swapchain {
         textures,
         gl_textures,
         vk_images,
         nt_handles,
         vk_cpu_copy,
+        vk_commands,
         gl_interop_locked: vec![true; gl_interop_handles.len()],
         gl_interop_handles,
         cpu_copy,
         next_index: 0,
-        last_acquired_index: 0,
+        acquisition_order: VecDeque::new(),
+        last_released_index: None,
+        release_serial: 0,
+        image_states: vec![crate::state::SwapchainImageState::default(); image_count],
+        format: info.format,
+        array_size: info.array_size,
         width: info.width,
         height: info.height,
     });
@@ -1029,14 +1244,9 @@ unsafe fn import_vulkan_images(
     width: u32,
     height: u32,
     array_size: u32,
+    usage: vk::ImageUsageFlags,
 ) -> Result<(Vec<(u64, u64)>, Vec<usize>), sys::Result> {
-    let Some(vk) = (unsafe {
-        crate::vulkan::VulkanFns::load(
-            graphics.vk_instance,
-            graphics.vk_physical_device,
-            graphics.vk_device,
-        )
-    }) else {
+    let Some(vk) = graphics.vulkan.clone() else {
         eprintln!("[alvr] import_vulkan_images FAIL: could not load Vulkan device functions");
         return Err(sys::Result::ERROR_RUNTIME_FAILURE);
     };
@@ -1048,17 +1258,27 @@ unsafe fn import_vulkan_images(
         let Some(nt) = (unsafe { crate::d3d11::create_nt_shared_handle(tex) }) else {
             eprintln!("[alvr] import_vulkan_images FAIL: create_nt_shared_handle failed");
             unsafe { free_vulkan_images(&vk, &images) };
+            unsafe {
+                for handle in handles {
+                    crate::d3d11::close_handle(handle);
+                }
+            }
             return Err(sys::Result::ERROR_RUNTIME_FAILURE);
         };
-        let Some(pair) = (unsafe {
-            vk.import_shared_texture(nt, vk_format, width, height, array_size)
-        }) else {
+        handles.push(nt);
+        let Some(pair) =
+            (unsafe { vk.import_shared_texture(nt, vk_format, width, height, array_size, usage) })
+        else {
             eprintln!("[alvr] import_vulkan_images FAIL: import_shared_texture failed");
-            unsafe { free_vulkan_images(&vk, &images) };
+            unsafe {
+                free_vulkan_images(&vk, &images);
+                for handle in handles {
+                    crate::d3d11::close_handle(handle);
+                }
+            }
             return Err(sys::Result::ERROR_RUNTIME_FAILURE);
         };
         images.push(pair);
-        handles.push(nt);
     }
     Ok((images, handles))
 }
@@ -1086,20 +1306,15 @@ unsafe fn create_owned_vulkan_images(
     width: u32,
     height: u32,
     array_size: u32,
+    usage: vk::ImageUsageFlags,
 ) -> Result<Vec<(u64, u64)>, sys::Result> {
-    let Some(vk) = (unsafe {
-        crate::vulkan::VulkanFns::load(
-            graphics.vk_instance,
-            graphics.vk_physical_device,
-            graphics.vk_device,
-        )
-    }) else {
+    let Some(vk) = graphics.vulkan.clone() else {
         return Err(sys::Result::ERROR_RUNTIME_FAILURE);
     };
     let mut images = Vec::with_capacity(count);
     for _ in 0..count {
         let Some(pair) =
-            (unsafe { vk.create_owned_image(vk_format, width, height, array_size) })
+            (unsafe { vk.create_owned_image(vk_format, width, height, array_size, usage) })
         else {
             eprintln!("[alvr] create_owned_vulkan_images FAIL: create_owned_image");
             unsafe { free_vulkan_images(&vk, &images) };
@@ -1185,33 +1400,92 @@ pub unsafe extern "system" fn destroy_swapchain(swapchain: sys::Swapchain) -> sy
     if let Some(i) = swapchain_index(swapchain) {
         let mut graphics = crate::state::GRAPHICS.lock();
         let vk = if graphics.api == crate::state::GraphicsApi::Vulkan {
-            unsafe {
-                crate::vulkan::VulkanFns::load(
-                    graphics.vk_instance,
-                    graphics.vk_physical_device,
-                    graphics.vk_device,
-                )
-            }
+            graphics.vulkan.clone()
         } else {
             None
         };
-        if let Some(sc) = graphics.swapchains.get(i) {
-            if let Some(vk) = &vk {
-                for &(image, memory) in &sc.vk_images {
-                    unsafe { vk.destroy_image(image, memory) };
-                }
-            }
-            unsafe { crate::d3d11::release_textures(&sc.textures) };
-            for &nt in &sc.nt_handles {
-                unsafe { crate::d3d11::close_handle(nt) };
-            }
-            // Leave a tombstone (empty) so later handles stay valid.
-            graphics.swapchains[i].textures.clear();
-            graphics.swapchains[i].vk_images.clear();
-            graphics.swapchains[i].nt_handles.clear();
+        if graphics.api == crate::state::GraphicsApi::Vulkan && vk.is_none() {
+            return sys::Result::ERROR_RUNTIME_FAILURE;
+        }
+        let api = graphics.api;
+        let d3d11_device = graphics.d3d11_device;
+        let Some(sc) = graphics.swapchains.get_mut(i) else {
+            return sys::Result::ERROR_HANDLE_INVALID;
+        };
+        if !sc.acquisition_order.is_empty() {
+            return sys::Result::ERROR_CALL_ORDER_INVALID;
+        }
+        if let Err(result) =
+            unsafe { destroy_swapchain_contents(api, d3d11_device, vk.as_deref(), sc) }
+        {
+            return result;
         }
     }
     sys::Result::SUCCESS
+}
+
+/// Release all resources associated with one swapchain and leave its handle as
+/// a tombstone so later swapchain handles retain their stable indices.
+unsafe fn destroy_swapchain_contents(
+    api: crate::state::GraphicsApi,
+    d3d11_device: usize,
+    vk: Option<&crate::vulkan::VulkanFns>,
+    sc: &mut crate::state::Swapchain,
+) -> Result<(), sys::Result> {
+    if !sc.acquisition_order.is_empty() {
+        return Err(sys::Result::ERROR_CALL_ORDER_INVALID);
+    }
+    if api == crate::state::GraphicsApi::Vulkan && !sc.vk_cpu_copy {
+        for &texture in &sc.textures {
+            if !unsafe { crate::d3d11::synchronize_keyed_texture(texture) } {
+                return Err(sys::Result::ERROR_RUNTIME_FAILURE);
+            }
+        }
+    }
+    if let Some(vk) = vk {
+        for (index, command) in sc.vk_commands.iter().enumerate() {
+            if sc
+                .image_states
+                .get(index)
+                .is_some_and(|state| state.vk_fence_pending)
+            {
+                unsafe { vk.wait_fence(command.fence, u64::MAX) }
+                    .map_err(|_| sys::Result::ERROR_RUNTIME_FAILURE)?;
+            }
+        }
+        unsafe { vk.destroy_command_resources(&sc.vk_commands) };
+        for &(image, memory) in &sc.vk_images {
+            unsafe { vk.destroy_image(image, memory) };
+        }
+    }
+    for (index, &texture) in sc.textures.iter().enumerate() {
+        let handle = sc
+            .nt_handles
+            .get(index)
+            .copied()
+            .or_else(|| unsafe { crate::d3d11::shared_handle(texture) });
+        if let Some(handle) = handle {
+            unsafe { alvr_openxr_encoder_forget_texture(handle as *mut std::ffi::c_void) };
+        }
+    }
+    unsafe { crate::d3d11::release_textures(&sc.textures) };
+    for &handle in &sc.nt_handles {
+        unsafe { crate::d3d11::close_handle(handle) };
+    }
+    if api == crate::state::GraphicsApi::OpenGL && d3d11_device != 0 {
+        unsafe { crate::d3d11::flush_device(d3d11_device) };
+    }
+    sc.textures.clear();
+    sc.gl_textures.clear();
+    sc.vk_images.clear();
+    sc.nt_handles.clear();
+    sc.vk_commands.clear();
+    sc.gl_interop_handles.clear();
+    sc.gl_interop_locked.clear();
+    sc.image_states.clear();
+    sc.acquisition_order.clear();
+    sc.last_released_index = None;
+    Ok(())
 }
 
 pub unsafe extern "system" fn enumerate_swapchain_images(
@@ -1272,6 +1546,7 @@ pub unsafe extern "system" fn acquire_swapchain_image(
     _acquire_info: *const sys::SwapchainImageAcquireInfo,
     index: *mut u32,
 ) -> sys::Result {
+    let _perf = crate::vulkan::PerfScope::new("acquire_swapchain_image");
     if index.is_null() {
         return sys::Result::ERROR_VALIDATION_FAILURE;
     }
@@ -1279,18 +1554,54 @@ pub unsafe extern "system" fn acquire_swapchain_image(
         return sys::Result::ERROR_HANDLE_INVALID;
     };
     let mut graphics = crate::state::GRAPHICS.lock();
+    let api = graphics.api;
+    let vk = if api == crate::state::GraphicsApi::Vulkan {
+        graphics.vulkan.clone()
+    } else {
+        None
+    };
+    if api == crate::state::GraphicsApi::Vulkan && vk.is_none() {
+        return sys::Result::ERROR_RUNTIME_FAILURE;
+    }
     let is_gl = graphics.api == crate::state::GraphicsApi::OpenGL;
     let interop_device = graphics.gl_interop_device as *mut std::ffi::c_void;
     let Some(sc) = graphics.swapchains.get_mut(i) else {
         return sys::Result::ERROR_HANDLE_INVALID;
     };
-    if sc.textures.is_empty() {
+    if sc.textures.is_empty() || sc.image_states.is_empty() {
         return sys::Result::ERROR_HANDLE_INVALID;
     }
 
-    let acquired = sc.next_index;
-    sc.next_index = (sc.next_index + 1) % sc.textures.len() as u32;
-    sc.last_acquired_index = acquired;
+    let count = sc.image_states.len();
+    let acquired = next_acquirable_image(&sc.image_states, sc.next_index);
+    let Some(acquired) = acquired else {
+        return sys::Result::ERROR_CALL_ORDER_INVALID;
+    };
+    let acquired = acquired as u32;
+    sc.next_index = (acquired + 1) % count as u32;
+
+    if let Some(vk) = &vk {
+        let (image, memory) = sc.vk_images[acquired as usize];
+        let command = sc.vk_commands[acquired as usize];
+        let state = sc.image_states[acquired as usize];
+        if unsafe {
+            vk.acquire_image(
+                image,
+                memory,
+                sc.array_size,
+                command,
+                !sc.vk_cpu_copy,
+                !state.ever_acquired,
+                state.vk_fence_pending,
+            )
+        }
+        .is_err()
+        {
+            return sys::Result::ERROR_RUNTIME_FAILURE;
+        }
+        sc.image_states[acquired as usize].vk_fence_pending = true;
+        sc.image_states[acquired as usize].ever_acquired = true;
+    }
 
     if is_gl && !sc.cpu_copy && !sc.gl_interop_locked[acquired as usize] {
         let Some(interop) = (unsafe { crate::gl_interop::InteropFns::load() }) else {
@@ -1302,16 +1613,52 @@ pub unsafe extern "system" fn acquire_swapchain_image(
         }
         sc.gl_interop_locked[acquired as usize] = true;
     }
+    sc.image_states[acquired as usize].acquired = true;
+    sc.image_states[acquired as usize].waited = false;
+    sc.acquisition_order.push_back(acquired);
     unsafe { *index = acquired };
     sys::Result::SUCCESS
 }
 
 pub unsafe extern "system" fn wait_swapchain_image(
-    _swapchain: sys::Swapchain,
-    _wait_info: *const sys::SwapchainImageWaitInfo,
+    swapchain: sys::Swapchain,
+    wait_info: *const sys::SwapchainImageWaitInfo,
 ) -> sys::Result {
-    // Images are CPU-ready immediately (double/triple buffered); no GPU fence yet.
-    // ponytail: add a real fence wait when the encoder consumes in parallel.
+    let _perf = crate::vulkan::PerfScope::new("wait_swapchain_image");
+    if wait_info.is_null() {
+        return sys::Result::ERROR_VALIDATION_FAILURE;
+    }
+    let Some(i) = swapchain_index(swapchain) else {
+        return sys::Result::ERROR_HANDLE_INVALID;
+    };
+    let mut graphics = crate::state::GRAPHICS.lock();
+    let api = graphics.api;
+    let vk = if api == crate::state::GraphicsApi::Vulkan {
+        graphics.vulkan.clone()
+    } else {
+        None
+    };
+    if api == crate::state::GraphicsApi::Vulkan && vk.is_none() {
+        return sys::Result::ERROR_RUNTIME_FAILURE;
+    }
+    let Some(sc) = graphics.swapchains.get_mut(i) else {
+        return sys::Result::ERROR_HANDLE_INVALID;
+    };
+    let Some(index) = next_unwaited_image(&sc.acquisition_order, &sc.image_states) else {
+        return sys::Result::ERROR_CALL_ORDER_INVALID;
+    };
+    if let Some(vk) = &vk {
+        let timeout_ns = match vk_wait_timeout_ns(unsafe { (*wait_info).timeout }) {
+            Ok(timeout_ns) => timeout_ns,
+            Err(result) => return result,
+        };
+        let result = unsafe { vk.wait_fence(sc.vk_commands[index as usize].fence, timeout_ns) };
+        let result = openxr_vk_wait_result(result);
+        if result != sys::Result::SUCCESS {
+            return result;
+        }
+    }
+    sc.image_states[index as usize].waited = true;
     sys::Result::SUCCESS
 }
 
@@ -1319,18 +1666,36 @@ pub unsafe extern "system" fn release_swapchain_image(
     swapchain: sys::Swapchain,
     _release_info: *const sys::SwapchainImageReleaseInfo,
 ) -> sys::Result {
+    let _perf = crate::vulkan::PerfScope::new("release_swapchain_image");
     let Some(i) = swapchain_index(swapchain) else {
         return sys::Result::ERROR_HANDLE_INVALID;
     };
     let mut graphics = crate::state::GRAPHICS.lock();
+    let api = graphics.api;
+    let vk = if api == crate::state::GraphicsApi::Vulkan {
+        graphics.vulkan.clone()
+    } else {
+        None
+    };
+    if api == crate::state::GraphicsApi::Vulkan && vk.is_none() {
+        return sys::Result::ERROR_RUNTIME_FAILURE;
+    }
     let is_gl = graphics.api == crate::state::GraphicsApi::OpenGL;
+    let d3d11_device = graphics.d3d11_device;
     let interop_device = graphics.gl_interop_device as *mut std::ffi::c_void;
 
+    let Some(sc) = graphics.swapchains.get_mut(i) else {
+        return sys::Result::ERROR_HANDLE_INVALID;
+    };
+    let Some(&index) = sc.acquisition_order.front() else {
+        return sys::Result::ERROR_CALL_ORDER_INVALID;
+    };
+    if !sc.image_states[index as usize].waited {
+        return sys::Result::ERROR_CALL_ORDER_INVALID;
+    }
+    let index = index as usize;
+
     if is_gl {
-        let Some(sc) = graphics.swapchains.get_mut(i) else {
-            return sys::Result::ERROR_HANDLE_INVALID;
-        };
-        let index = sc.last_acquired_index as usize;
         if !sc.cpu_copy && sc.gl_interop_locked[index] {
             let Some(interop) = (unsafe { crate::gl_interop::InteropFns::load() }) else {
                 return sys::Result::ERROR_RUNTIME_FAILURE;
@@ -1353,33 +1718,42 @@ pub unsafe extern "system" fn release_swapchain_image(
         // so without this flush the consumer can read while the copy is still
         // pending, producing a half-old/half-new tear within one eye. The
         // D3D11-session path below already flushes; the GL path must too.
-        if graphics.d3d11_device != 0 {
-            unsafe { crate::d3d11::flush_device(graphics.d3d11_device) };
+        if d3d11_device != 0 {
+            unsafe { crate::d3d11::flush_device(d3d11_device) };
         }
     }
 
-    if graphics.api == crate::state::GraphicsApi::D3D11 && graphics.d3d11_device != 0 {
-        unsafe { crate::d3d11::flush_device(graphics.d3d11_device) };
+    if api == crate::state::GraphicsApi::D3D11 && d3d11_device != 0 {
+        unsafe { crate::d3d11::flush_device(d3d11_device) };
     }
 
-    // Vulkan sessions: the app rendered into a VkImage aliased onto the shared
-    // D3D11 texture. There is no cross-API fence, so wait for the app's GPU work
-    // to finish before the encoder opens the texture on its own D3D11 device,
-    // then flush the runtime device that owns the shared texture.
-    if graphics.api == crate::state::GraphicsApi::Vulkan {
-        if let Some(vk) = unsafe {
-            crate::vulkan::VulkanFns::load(
-                graphics.vk_instance,
-                graphics.vk_physical_device,
-                graphics.vk_device,
+    if let Some(vk) = &vk {
+        let (image, memory) = sc.vk_images[index];
+        if unsafe {
+            vk.release_image(
+                image,
+                memory,
+                sc.array_size,
+                sc.vk_commands[index],
+                !sc.vk_cpu_copy,
+                sc.image_states[index].vk_fence_pending,
             )
-        } {
-            unsafe { vk.wait_idle() };
         }
-        if graphics.d3d11_device != 0 {
-            unsafe { crate::d3d11::flush_device(graphics.d3d11_device) };
+        .is_err()
+        {
+            return sys::Result::ERROR_RUNTIME_FAILURE;
         }
+        sc.image_states[index].vk_fence_pending = true;
     }
+    sc.acquisition_order.pop_front();
+    sc.image_states[index].acquired = false;
+    sc.image_states[index].waited = false;
+    record_released_image(
+        &mut sc.image_states,
+        &mut sc.last_released_index,
+        &mut sc.release_serial,
+        index as u32,
+    );
     sys::Result::SUCCESS
 }
 
@@ -1394,23 +1768,39 @@ pub unsafe extern "system" fn wait_frame(
         return sys::Result::ERROR_VALIDATION_FAILURE;
     }
 
-    // Pace to the nominal refresh period so apps do not free-run thousands of
-    // frames per second. This removes the largest source of reprojection jitter.
+    // Pace frames to the nominal refresh period without returning a display time
+    // that has already passed. The scheduled instant is the start of the frame
+    // interval; OpenXR's predicted display time is its midpoint, leaving the app
+    // time to render before the compositor presents it.
     let (sleep_duration, display_time, period) = {
         let mut frame = crate::state::FRAME_LOOP.lock();
         let now = Instant::now();
         let period_duration = Duration::from_nanos(frame.frame_period_ns.max(1) as u64);
+        let half_period = Duration::from_nanos((period_duration.as_nanos() / 2) as u64);
         let origin = *frame.time_origin_instant.get_or_insert(now);
 
-        let target = match frame.next_wake_instant {
-            Some(t) => t,
-            None => now + period_duration,
-        };
-        frame.next_wake_instant = Some(target + period_duration);
-        frame.predicted_display_time_ns = target.duration_since(origin).as_nanos() as i64;
+        let mut interval_start = frame
+            .next_wake_instant
+            .unwrap_or_else(|| now + period_duration);
+        let mut predicted_display_time = interval_start + half_period;
+
+        // A slow app may finish after its predicted display interval. Skip expired
+        // intervals so the next frame receives a future display time instead of
+        // accumulating an ever-staler pose prediction.
+        if predicted_display_time <= now {
+            let lateness = now.duration_since(predicted_display_time);
+            let missed_intervals =
+                (lateness.as_nanos() / period_duration.as_nanos() + 1).min(u32::MAX as u128) as u32;
+            interval_start += period_duration * missed_intervals;
+            predicted_display_time = interval_start + half_period;
+        }
+
+        frame.next_wake_instant = Some(interval_start + period_duration);
+        frame.predicted_display_time_ns =
+            predicted_display_time.duration_since(origin).as_nanos() as i64;
 
         (
-            target.saturating_duration_since(now),
+            interval_start.saturating_duration_since(now),
             frame.predicted_display_time_ns,
             frame.frame_period_ns,
         )
@@ -1520,6 +1910,22 @@ fn sample_head_pose(_display_time_ns: i64) -> Option<(alvr_common::Pose, i64)> {
     Some((latest_pose, latest_ts.as_nanos() as i64))
 }
 
+fn take_render_sample(display_time_ns: i64) -> Option<(alvr_common::Pose, i64)> {
+    let mut samples = crate::state::RENDER_TRACKING_TS.lock();
+    let nearest = samples
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, &(sample_display_time_ns, _, _))| {
+            (sample_display_time_ns - display_time_ns).abs()
+        })
+        .map(|(index, &(_, tracking_ts, pose))| (index, pose, tracking_ts));
+
+    nearest.map(|(index, pose, tracking_ts)| {
+        samples.remove(index);
+        (pose, tracking_ts)
+    })
+}
+
 pub unsafe extern "system" fn locate_views(
     _session: sys::Session,
     view_locate_info: *const sys::ViewLocateInfo,
@@ -1535,22 +1941,18 @@ pub unsafe extern "system" fn locate_views(
         unsafe { *view_count_output = VIEW_COUNT as u32 };
     }
 
-    // VDXR all-or-nothing: until a real client head sample exists, report the
-    // views unavailable. Desktop2Stereo does not inspect `view_state_flags`; it
-    // consumes returned views directly and latches their Y on the first frame.
-    // Returning a default Y=0 would pin its Y-reset to the floor, so fail the
-    // call until a real sample arrives (the app already catches this and retries).
+    // Until a real client head sample exists, report the views as unavailable.
+    // OpenXR callers can keep the session alive and wait for tracking recovery
+    // when both validity flags are clear.
     let display_time_ns = unsafe { (*view_locate_info).display_time.as_nanos() };
     let sample = sample_head_pose(display_time_ns);
+    let head_pose = sample.map(|(head_pose, _)| head_pose);
     if !view_state.is_null() {
         let vs = unsafe { &mut *view_state };
         vs.ty = sys::StructureType::VIEW_STATE;
         vs.view_state_flags = sys::ViewStateFlags::EMPTY;
     }
-    let Some((head_pose, tracking_ts)) = sample else {
-        return sys::Result::ERROR_RUNTIME_FAILURE;
-    };
-    if !view_state.is_null() {
+    if head_pose.is_some() && !view_state.is_null() {
         unsafe {
             (*view_state).view_state_flags = sys::ViewStateFlags::ORIENTATION_VALID
                 | sys::ViewStateFlags::POSITION_VALID
@@ -1567,14 +1969,16 @@ pub unsafe extern "system" fn locate_views(
 
     // Express tracking-space poses in the caller's actual reference-space
     // origin (VIEW follows the head, LOCAL is fixed at session startup).
-    let base_offset_inv = reference_space_pose(unsafe { (*view_locate_info).space }, head_pose)
-        .map(|pose| pose.inverse());
+    let base_offset_inv = head_pose.and_then(|head_pose| {
+        reference_space_pose(unsafe { (*view_locate_info).space }, head_pose)
+            .map(|pose| pose.inverse())
+    });
 
     // Remember which real client tracking timestamp produced this frame's render
     // pose so end_frame can tag the encoded video with it (correct client ATW).
-    {
+    if let Some((render_pose, tracking_ts)) = sample {
         let mut map = crate::state::RENDER_TRACKING_TS.lock();
-        map.push_back((display_time_ns, tracking_ts));
+        map.push_back((display_time_ns, tracking_ts, render_pose));
         while map.len() > 32 {
             map.pop_front();
         }
@@ -1593,10 +1997,15 @@ pub unsafe extern "system" fn locate_views(
         // layer pose are both head_pose(tracking_ts), there is no double head
         // compensation — the earlier divergence was a timestamp/prediction
         // mismatch, now fixed by exact-ts frame tagging + no server-side predict.
-        let eye_pose = head_pose * local[i].pose;
-        let eye_pose = match base_offset_inv {
-            Some(inv) => inv * eye_pose,
-            None => eye_pose,
+        let eye_pose = match head_pose {
+            Some(head_pose) => {
+                let eye_pose = head_pose * local[i].pose;
+                match base_offset_inv {
+                    Some(inv) => inv * eye_pose,
+                    None => eye_pose,
+                }
+            }
+            None => local[i].pose,
         };
         view.pose = pose_to_xr(eye_pose);
         view.fov = sys::Fovf {
@@ -1687,232 +2096,365 @@ pub unsafe extern "system" fn end_frame(
     _session: sys::Session,
     frame_end_info: *const sys::FrameEndInfo,
 ) -> sys::Result {
+    let _perf = crate::vulkan::PerfScope::new("end_frame");
     if frame_end_info.is_null() {
         return sys::Result::ERROR_VALIDATION_FAILURE;
     }
     let info = unsafe { &*frame_end_info };
     let display_time_ns = info.display_time.as_nanos().max(0);
+    let mapped_render_sample = take_render_sample(display_time_ns);
+    let has_locate_views_sample = mapped_render_sample.is_some();
+    let render_sample = mapped_render_sample.or_else(|| sample_head_pose(display_time_ns));
+    let fallback_tracking_ts = render_sample
+        .as_ref()
+        .map(|(_, tracking_ts)| (*tracking_ts).max(0) as u64);
 
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    // Tag the encoded frame with the real client tracking timestamp whose pose
-    // rendered it (recorded in locate_views), not the synthetic display time, so
-    // the client's async timewarp reprojects from the correct pose. Match the
-    // nearest recorded display time rather than requiring exact equality: some
-    // apps pass a slightly adjusted predicted_display_time to xrEndFrame vs
-    // xrLocateViews, and an exact-match miss would fall back to the synthetic
-    // timestamp for that frame only, mixing two time domains and making the
-    // client's reprojection jump (visible as flicker / eye desync).
-    let timestamp_ns = {
-        let mut map = crate::state::RENDER_TRACKING_TS.lock();
-        let nearest = map
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, &(d, _))| (d - display_time_ns).abs())
-            .map(|(i, &(_, t))| (i, t));
-
-        static TS_LOG: AtomicU32 = AtomicU32::new(0);
+    // Reuse the exact pose sampled by xrLocateViews for this display time. A
+    // newer tracking sample may arrive between rendering and xrEndFrame; pairing
+    // that newer pose with the earlier image causes translational wobble and
+    // reprojects from a different origin.
+    static TS_LOG: AtomicU32 = AtomicU32::new(0);
+    let timestamp_ns = if has_locate_views_sample {
+        fallback_tracking_ts.unwrap_or(display_time_ns.max(0) as u64)
+    } else {
         let m = TS_LOG.fetch_add(1, Ordering::Relaxed);
-        match nearest {
-            Some((i, tracking_ts)) => {
-                map.remove(i);
-                tracking_ts.max(0) as u64
-            }
-            None => {
-                if m < 5 || m % 300 == 0 {
-                    eprintln!(
-                        "[alvr] end_frame: no tracking-ts mapping (miss #{m}); \
-                         using display time {display_time_ns}"
-                    );
-                }
-                display_time_ns.max(0) as u64
+        if m < 5 || m % 300 == 0 {
+            if let Some(tracking_ts) = fallback_tracking_ts {
+                eprintln!(
+                    "[alvr] end_frame: no locate_views sample (miss #{m}); \
+                     using latest client tracking timestamp {tracking_ts}"
+                );
+            } else {
+                eprintln!(
+                    "[alvr] end_frame: no tracking pose (miss #{m}); \
+                     falling back to display time {display_time_ns}"
+                );
             }
         }
+        fallback_tracking_ts.unwrap_or(display_time_ns.max(0) as u64)
     };
 
-    // Find the projection layer (the streamed content). Quad and other layer
-    // types are accepted without error but not composited yet.
-    for i in 0..info.layer_count {
-        let layer_ptr = unsafe { *info.layers.add(i as usize) };
+    if info.layer_count == 0 || info.layers.is_null() {
+        return sys::Result::SUCCESS;
+    }
+
+    let head_pose = render_sample.map(|(pose, _)| pose).unwrap_or_default();
+    let local_views = *crate::state::LOCAL_VIEW_PARAMS.read();
+    let mut eye_basis = [
+        CompositionEyeBasis::from_local(head_pose, local_views[0]),
+        CompositionEyeBasis::from_local(head_pose, local_views[1]),
+    ];
+    let mut eye_width = [RECOMMENDED_VIEW_WIDTH; VIEW_COUNT];
+    let mut eye_height = [RECOMMENDED_VIEW_HEIGHT; VIEW_COUNT];
+
+    // Projection views provide the coordinate frame and FOV used to project
+    // quad layers. Capture the first valid stereo projection before walking the
+    // submitted layer list so layer order remains exactly the app's order.
+    for i in 0..info.layer_count as usize {
+        let layer_ptr = unsafe { *info.layers.add(i) };
+        if layer_ptr.is_null()
+            || unsafe { (*layer_ptr).ty } != sys::StructureType::COMPOSITION_LAYER_PROJECTION
+        {
+            continue;
+        }
+        let projection = unsafe { &*layer_ptr.cast::<sys::CompositionLayerProjection>() };
+        if projection.view_count < VIEW_COUNT as u32 || projection.views.is_null() {
+            continue;
+        }
+        let Some(origin) = reference_space_pose(projection.space, head_pose) else {
+            continue;
+        };
+        for eye in 0..VIEW_COUNT {
+            let view = unsafe { *projection.views.add(eye) };
+            eye_basis[eye] = CompositionEyeBasis {
+                fov: [
+                    view.fov.angle_left,
+                    view.fov.angle_right,
+                    view.fov.angle_up,
+                    view.fov.angle_down,
+                ],
+                eye_pose_in_stage: origin * xr_to_pose(view.pose),
+            };
+            eye_width[eye] = view.sub_image.image_rect.extent.width.max(1) as u32;
+            eye_height[eye] = view.sub_image.image_rect.extent.height.max(1) as u32;
+        }
+        break;
+    }
+
+    let mut layers = [Vec::<AlvrOpenXrDrawDesc>::new(), Vec::new()];
+    let mut fallback_copies = HashSet::new();
+    for i in 0..info.layer_count as usize {
+        let layer_ptr = unsafe { *info.layers.add(i) };
         if layer_ptr.is_null() {
             continue;
         }
-        let ty = unsafe { (*layer_ptr).ty };
-        if ty == sys::StructureType::COMPOSITION_LAYER_PROJECTION {
-            let proj = layer_ptr.cast::<sys::CompositionLayerProjection>();
-            // `timestamp_ns` is the real client tracking sample selected by
-            // `locate_views()` for this rendered frame. Do not replace it with
-            // an orientation-only history match: repeated orientations and pure
-            // translations can select a different sample during fast movement,
-            // making client reprojection start from the wrong pose.
-            unsafe { submit_projection(&*proj, timestamp_ns) };
+        let header = unsafe { &*layer_ptr };
+        match header.ty {
+            sys::StructureType::COMPOSITION_LAYER_PROJECTION => {
+                let projection = unsafe { &*layer_ptr.cast::<sys::CompositionLayerProjection>() };
+                if projection.view_count < VIEW_COUNT as u32 || projection.views.is_null() {
+                    continue;
+                }
+                let clip = projection_clip_vertices();
+                for eye in 0..VIEW_COUNT {
+                    let view = unsafe { *projection.views.add(eye) };
+                    if let Some(desc) = unsafe {
+                        draw_descriptor_for_subimage(
+                            view.sub_image,
+                            header.layer_flags,
+                            clip,
+                            &mut fallback_copies,
+                        )
+                    } {
+                        layers[eye].push(desc);
+                    }
+                }
+            }
+            sys::StructureType::COMPOSITION_LAYER_QUAD => {
+                let quad = unsafe { &*layer_ptr.cast::<sys::CompositionLayerQuad>() };
+                let Some(quad_origin) = reference_space_pose(quad.space, head_pose) else {
+                    continue;
+                };
+                let quad_pose_in_stage = quad_origin * xr_to_pose(quad.pose);
+                let clip = [
+                    quad_clip_vertices(quad_pose_in_stage, eye_basis[0], quad.size),
+                    quad_clip_vertices(quad_pose_in_stage, eye_basis[1], quad.size),
+                ];
+                for eye in 0..VIEW_COUNT {
+                    let visible = match quad.eye_visibility {
+                        sys::EyeVisibility::LEFT => eye == 0,
+                        sys::EyeVisibility::RIGHT => eye == 1,
+                        _ => true,
+                    };
+                    if !visible {
+                        continue;
+                    }
+                    let Some(clip) = clip[eye] else { continue };
+                    if let Some(desc) = unsafe {
+                        draw_descriptor_for_subimage(
+                            quad.sub_image,
+                            header.layer_flags,
+                            clip,
+                            &mut fallback_copies,
+                        )
+                    } {
+                        layers[eye].push(desc);
+                    }
+                }
+            }
+            _ => {}
         }
-        // ponytail: COMPOSITION_LAYER_QUAD accepted (no reject) — quad
-        // compositing over the projection lands with FrameRender layer support.
-    }
-    sys::Result::SUCCESS
-}
-
-/// Extract the two per-eye shared textures from a projection layer and hand
-/// them to the C++ encoder.
-///
-/// # Safety
-/// `proj` must be a valid projection layer with at least `VIEW_COUNT` views.
-unsafe fn submit_projection(proj: &sys::CompositionLayerProjection, timestamp_ns: u64) {
-    if (proj.view_count as usize) < VIEW_COUNT || proj.views.is_null() {
-        eprintln!(
-            "[alvr] submit_projection SKIP: view_count={} views_null={}",
-            proj.view_count,
-            proj.views.is_null()
-        );
-        return;
     }
 
-    let mut handles = [std::ptr::null_mut::<std::ffi::c_void>(); VIEW_COUNT];
-    let mut fovs = [[0.0f32; 4]; VIEW_COUNT];
-    let local_views = crate::state::LOCAL_VIEW_PARAMS.read();
     let eye_to_head = [
         local_views[0].pose.position.to_array(),
         local_views[1].pose.position.to_array(),
     ];
-    // Per-eye normalized UV crop [u_min, u_max, v_min, v_max]; defaults to the
-    // full texture and is narrowed below from each view's sub_image.image_rect.
-    let mut bounds = [[0.0f32, 1.0, 0.0, 1.0]; VIEW_COUNT];
-
-    let graphics = crate::state::GRAPHICS.lock();
-    let is_gl = graphics.api == crate::state::GraphicsApi::OpenGL;
-
-    for eye in 0..VIEW_COUNT {
-        let view = unsafe { &*proj.views.add(eye) };
-        fovs[eye] = [
-            view.fov.angle_left,
-            view.fov.angle_right,
-            view.fov.angle_up,
-            view.fov.angle_down,
-        ];
-
-        let Some(sc_index) = swapchain_index(view.sub_image.swapchain) else {
-            eprintln!("[alvr] submit_projection SKIP: bad swapchain handle eye={eye}");
-            return;
-        };
-        let Some(sc) = graphics.swapchains.get(sc_index) else {
-            eprintln!("[alvr] submit_projection SKIP: swapchain index {sc_index} missing");
-            return;
-        };
-        let Some(&texture) = sc.textures.get(sc.last_acquired_index as usize) else {
-            eprintln!("[alvr] submit_projection SKIP: no texture at index");
-            return;
-        };
-
-        // Honor the app's per-eye viewport: many engines render both eyes into a
-        // single double-wide swapchain (or a sub-rect of a larger texture) and
-        // select each eye via image_rect. Encoding the full texture then squashes
-        // the content and warps geometry. Convert the rect to normalized UVs so
-        // the encoder samples exactly the eye's region.
-        let rect = view.sub_image.image_rect;
-        let tex_w = sc.width.max(1) as f32;
-        let tex_h = sc.height.max(1) as f32;
-        let u_min = (rect.offset.x as f32 / tex_w).clamp(0.0, 1.0);
-        let v_min = (rect.offset.y as f32 / tex_h).clamp(0.0, 1.0);
-        let u_max = ((rect.offset.x + rect.extent.width) as f32 / tex_w).clamp(0.0, 1.0);
-        let v_max = ((rect.offset.y + rect.extent.height) as f32 / tex_h).clamp(0.0, 1.0);
-        // Guard against zero/inverted rects (some apps leave image_rect empty):
-        // fall back to the full texture rather than collapsing the crop.
-        if u_max > u_min && v_max > v_min {
-            bounds[eye] = [u_min, u_max, v_min, v_max];
-        }
-
-        // CPU-copy fallback (universal GPU path): read back the app's GL texture
-        // and upload it into the D3D11 texture the encoder reads.
-        if is_gl && sc.cpu_copy {
-            if let Some(&gl_name) = sc.gl_textures.get(sc.last_acquired_index as usize) {
-                if let Some(copy) = unsafe { crate::gl_interop::GlCopyFns::load() } {
-                    let size = (sc.width as usize) * (sc.height as usize) * 4;
-                    let mut buf = vec![0u8; size];
-                    unsafe { copy.read_pixels(gl_name, &mut buf) };
-                    unsafe {
-                        crate::d3d11::update_texture_rgba(
-                            graphics.d3d11_device,
-                            texture,
-                            sc.width,
-                            &buf,
-                        );
-                        // Consumer encoder opens this texture on another D3D11
-                        // device; submit the CPU upload before sharing it.
-                        crate::d3d11::flush_device(graphics.d3d11_device);
-                    }
-                }
-            }
-        }
-
-        // Vulkan CPU-copy fallback (universal GPU path): read back the app's
-        // owned VkImage and upload it into the D3D11 texture the encoder reads.
-        if graphics.api == crate::state::GraphicsApi::Vulkan && sc.vk_cpu_copy {
-            if let Some(&(vk_image, _)) = sc.vk_images.get(sc.last_acquired_index as usize) {
-                if let Some(vk) = unsafe {
-                    crate::vulkan::VulkanFns::load(
-                        graphics.vk_instance,
-                        graphics.vk_physical_device,
-                        graphics.vk_device,
-                    )
-                } {
-                    if let Some(buf) = unsafe {
-                        vk.readback_image(
-                            vk_image,
-                            sc.width,
-                            sc.height,
-                            graphics.vk_queue_family_index,
-                            graphics.vk_queue_index,
-                        )
-                    } {
-                        unsafe {
-                            crate::d3d11::update_texture_rgba(
-                                graphics.d3d11_device,
-                                texture,
-                                sc.width,
-                                &buf,
-                            );
-                            crate::d3d11::flush_device(graphics.d3d11_device);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Vulkan zero-copy sessions back the swapchain with NT-shared textures
-        // whose legacy KMT handle (GetSharedHandle) is unavailable; reuse the NT
-        // handle created at import (the encoder opens it via
-        // OpenSharedResource1). The Vulkan CPU-copy fallback and all other
-        // sessions use the KMT shared handle of the runtime-owned texture.
-        let shared = if graphics.api == crate::state::GraphicsApi::Vulkan && !sc.vk_cpu_copy {
-            sc.nt_handles.get(sc.last_acquired_index as usize).copied()
-        } else {
-            unsafe { crate::d3d11::shared_handle(texture) }
-        };
-        let Some(shared) = shared else {
-            eprintln!("[alvr] submit_projection SKIP: shared_handle failed eye={eye}");
-            return;
-        };
-        handles[eye] = shared as *mut std::ffi::c_void;
-    }
-
+    let idr = crate::state::REQUEST_IDR.swap(false, std::sync::atomic::Ordering::Relaxed);
     unsafe {
-        let idr = crate::state::REQUEST_IDR.swap(false, std::sync::atomic::Ordering::Relaxed);
-        // OpenGL renders with a bottom-left origin, so the aliased D3D11 texture
-        // is vertically flipped versus D3D11's top-left origin. Flip V for GL.
-        alvr_openxr_encoder_submit(
-            handles[0],
-            handles[1],
-            fovs[0].as_ptr(),
-            fovs[1].as_ptr(),
+        alvr_openxr_encoder_submit_layers(
+            layers[0].as_ptr(),
+            layers[0].len() as u32,
+            layers[1].as_ptr(),
+            layers[1].len() as u32,
+            eye_width[0],
+            eye_height[0],
+            eye_width[1],
+            eye_height[1],
+            eye_basis[0].fov.as_ptr(),
+            eye_basis[1].fov.as_ptr(),
             eye_to_head[0].as_ptr(),
             eye_to_head[1].as_ptr(),
-            bounds[0].as_ptr(),
-            bounds[1].as_ptr(),
             timestamp_ns,
             idr,
-            is_gl,
         );
+    }
+    sys::Result::SUCCESS
+}
+
+#[derive(Clone, Copy)]
+struct CompositionEyeBasis {
+    fov: [f32; 4],
+    eye_pose_in_stage: alvr_common::Pose,
+}
+
+impl CompositionEyeBasis {
+    fn from_local(head_pose: alvr_common::Pose, view: alvr_common::ViewParams) -> Self {
+        Self {
+            fov: [view.fov.left, view.fov.right, view.fov.up, view.fov.down],
+            eye_pose_in_stage: head_pose * view.pose,
+        }
+    }
+}
+
+fn alpha_mode(flags: sys::CompositionLayerFlags) -> u32 {
+    if !flags.contains(sys::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA) {
+        0
+    } else if flags.contains(sys::CompositionLayerFlags::UNPREMULTIPLIED_ALPHA) {
+        2
+    } else {
+        1
+    }
+}
+
+fn projection_clip_vertices() -> [f32; 16] {
+    [
+        -1.0, 1.0, 0.5, 1.0, 1.0, 1.0, 0.5, 1.0, -1.0, -1.0, 0.5, 1.0, 1.0, -1.0, 0.5, 1.0,
+    ]
+}
+
+fn quad_clip_vertices(
+    quad_pose_in_stage: alvr_common::Pose,
+    eye: CompositionEyeBasis,
+    size: sys::Extent2Df,
+) -> Option<[f32; 16]> {
+    let pose = eye.eye_pose_in_stage.inverse() * quad_pose_in_stage;
+    let corners = [
+        (-0.5 * size.width, 0.5 * size.height),
+        (0.5 * size.width, 0.5 * size.height),
+        (-0.5 * size.width, -0.5 * size.height),
+        (0.5 * size.width, -0.5 * size.height),
+    ];
+    let tan_left = eye.fov[0].tan();
+    let tan_right = eye.fov[1].tan();
+    let tan_up = eye.fov[2].tan();
+    let tan_down = eye.fov[3].tan();
+    if !(tan_right > tan_left && tan_up > tan_down) {
+        return None;
+    }
+    let mut clip = [0.0; 16];
+    for (index, (x, y)) in corners.into_iter().enumerate() {
+        let point = pose.orientation * alvr_common::glam::Vec3::new(x, y, 0.0) + pose.position;
+        let depth = -point.z;
+        if !depth.is_finite() || depth <= 0.001 {
+            return None;
+        }
+        let ndc_x = 2.0 * ((point.x / depth - tan_left) / (tan_right - tan_left)) - 1.0;
+        let ndc_y = 2.0 * ((point.y / depth - tan_down) / (tan_up - tan_down)) - 1.0;
+        let offset = index * 4;
+        clip[offset] = ndc_x * depth;
+        clip[offset + 1] = ndc_y * depth;
+        clip[offset + 2] = depth * 0.5;
+        clip[offset + 3] = depth;
+    }
+    Some(clip)
+}
+
+/// Build a private compositor descriptor for the most recently released image.
+/// The Vulkan fallback reads only the selected array layer and restores its
+/// COLOR_ATTACHMENT layout before returning it to the application queue.
+unsafe fn draw_descriptor_for_subimage(
+    sub_image: sys::SwapchainSubImage,
+    flags: sys::CompositionLayerFlags,
+    clip_vertices: [f32; 16],
+    fallback_copies: &mut HashSet<(usize, u32, u32)>,
+) -> Option<AlvrOpenXrDrawDesc> {
+    let sc_index = swapchain_index(sub_image.swapchain)?;
+    let graphics = crate::state::GRAPHICS.lock();
+    let sc = graphics.swapchains.get(sc_index)?;
+    let released_index = sc.last_released_index?;
+    let image_index = released_index as usize;
+    let texture = *sc.textures.get(image_index)?;
+    if !valid_array_slice(sc.array_size, sub_image.image_array_index) {
+        return None;
+    }
+    let layer = sub_image.image_array_index;
+
+    if graphics.api == crate::state::GraphicsApi::OpenGL && sc.cpu_copy {
+        if fallback_copies.insert((sc_index, released_index, layer)) {
+            if let (Some(&gl_name), Some(copy)) = (sc.gl_textures.get(image_index), unsafe {
+                crate::gl_interop::GlCopyFns::load()
+            }) {
+                let size = (sc.width as usize) * (sc.height as usize) * 4;
+                let mut pixels = vec![0; size];
+                unsafe { copy.read_pixels(gl_name, &mut pixels) };
+                unsafe {
+                    crate::d3d11::update_texture_rgba_layer(
+                        graphics.d3d11_device,
+                        texture,
+                        sc.width,
+                        layer,
+                        &pixels,
+                    );
+                    crate::d3d11::flush_device(graphics.d3d11_device);
+                }
+            }
+        }
+    }
+
+    if graphics.api == crate::state::GraphicsApi::Vulkan && sc.vk_cpu_copy {
+        if fallback_copies.insert((sc_index, released_index, layer)) {
+            let (image, _) = *sc.vk_images.get(image_index)?;
+            let vk = graphics.vulkan.clone()?;
+            let pixels = unsafe {
+                vk.readback_image(
+                    image,
+                    sc.width,
+                    sc.height,
+                    layer,
+                    *sc.vk_commands.get(image_index)?,
+                    sc.image_states.get(image_index)?.vk_fence_pending,
+                )
+            }?;
+            unsafe {
+                crate::d3d11::update_texture_rgba_layer(
+                    graphics.d3d11_device,
+                    texture,
+                    sc.width,
+                    layer,
+                    &pixels,
+                );
+                crate::d3d11::flush_device(graphics.d3d11_device);
+            }
+        }
+    }
+
+    let is_vulkan_interop = graphics.api == crate::state::GraphicsApi::Vulkan && !sc.vk_cpu_copy;
+    let shared_handle = if is_vulkan_interop {
+        *sc.nt_handles.get(image_index)?
+    } else {
+        unsafe { crate::d3d11::shared_handle(texture) }?
+    };
+    let format = match graphics.api {
+        crate::state::GraphicsApi::Vulkan => crate::vulkan::vk_format_to_dxgi_typed(sc.format),
+        crate::state::GraphicsApi::OpenGL => gl_format_to_dxgi(sc.format),
+        _ => sc.format as i32,
+    };
+    let rect = sub_image.image_rect;
+    let mut uv = rect_uv_bounds(rect, sc.width, sc.height);
+    if graphics.api == crate::state::GraphicsApi::OpenGL {
+        uv.swap(2, 3);
+    }
+    Some(AlvrOpenXrDrawDesc {
+        shared_handle: shared_handle as *mut std::ffi::c_void,
+        shared_type: u32::from(is_vulkan_interop),
+        format: i64::from(format),
+        array_slice: layer,
+        uv_bounds: uv,
+        clip_vertices,
+        alpha_mode: alpha_mode(flags),
+    })
+}
+
+fn rect_uv_bounds(rect: sys::Rect2Di, width: u32, height: u32) -> [f32; 4] {
+    let width = width.max(1) as f32;
+    let height = height.max(1) as f32;
+    let left = rect.offset.x as f32;
+    let top = rect.offset.y as f32;
+    let right = left + rect.extent.width as f32;
+    let bottom = top + rect.extent.height as f32;
+    let bounds = [
+        (left / width).clamp(0.0, 1.0),
+        (right / width).clamp(0.0, 1.0),
+        (top / height).clamp(0.0, 1.0),
+        (bottom / height).clamp(0.0, 1.0),
+    ];
+    if bounds[1] > bounds[0] && bounds[3] > bounds[2] {
+        bounds
+    } else {
+        [0.0, 1.0, 0.0, 1.0]
     }
 }
 
@@ -2071,6 +2613,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn end_frame_uses_the_pose_recorded_for_its_display_time() {
+        use alvr_common::glam::{Quat, Vec3};
+
+        let rendered_pose = alvr_common::Pose {
+            orientation: Quat::IDENTITY,
+            position: Vec3::new(0.1, 1.6, -0.2),
+        };
+        let newer_pose = alvr_common::Pose {
+            orientation: Quat::from_rotation_y(0.2),
+            position: Vec3::new(0.2, 1.6, -0.2),
+        };
+        {
+            let mut samples = crate::state::RENDER_TRACKING_TS.lock();
+            samples.clear();
+            samples.push_back((100, 10, rendered_pose));
+            samples.push_back((200, 20, newer_pose));
+        }
+
+        let (pose, tracking_ts) = take_render_sample(102).unwrap();
+
+        assert_eq!(tracking_ts, 10);
+        assert!(pose.position.abs_diff_eq(rendered_pose.position, 1e-6));
+        assert_eq!(crate::state::RENDER_TRACKING_TS.lock().len(), 1);
+        crate::state::RENDER_TRACKING_TS.lock().clear();
+    }
+
+    #[test]
     fn grip_to_aim_matches_vdxr_calibration() {
         use alvr_common::glam::{Quat, Vec3};
 
@@ -2102,8 +2671,9 @@ mod tests {
     }
 
     #[test]
-    fn locate_views_rejects_pretracking_default_pose() {
+    fn locate_views_keeps_session_running_before_tracking() {
         crate::state::HEAD_POSE_QUEUE.lock().clear();
+        crate::state::RENDER_TRACKING_TS.lock().clear();
         let info = sys::ViewLocateInfo {
             ty: sys::StructureType::VIEW_LOCATE_INFO,
             next: std::ptr::null(),
@@ -2129,8 +2699,50 @@ mod tests {
             )
         };
 
-        assert_eq!(result, sys::Result::ERROR_RUNTIME_FAILURE);
+        assert_eq!(result, sys::Result::SUCCESS);
         assert_eq!(state.view_state_flags, sys::ViewStateFlags::EMPTY);
+        assert_eq!(count, VIEW_COUNT as u32);
+        assert!(crate::state::RENDER_TRACKING_TS.lock().is_empty());
+
+        let mut views: [sys::View; VIEW_COUNT] = std::array::from_fn(|_| sys::View {
+            ty: sys::StructureType::VIEW,
+            next: std::ptr::null_mut(),
+            pose: sys::Posef {
+                orientation: sys::Quaternionf {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                    w: 1.0,
+                },
+                position: sys::Vector3f {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            },
+            fov: sys::Fovf {
+                angle_left: 0.0,
+                angle_right: 0.0,
+                angle_up: 0.0,
+                angle_down: 0.0,
+            },
+        });
+        let result = unsafe {
+            locate_views(
+                sys::Session::NULL,
+                &info,
+                &mut state,
+                VIEW_COUNT as u32,
+                &mut count,
+                views.as_mut_ptr(),
+            )
+        };
+
+        assert_eq!(result, sys::Result::SUCCESS);
+        assert_eq!(state.view_state_flags, sys::ViewStateFlags::EMPTY);
+        assert_eq!(count, VIEW_COUNT as u32);
+        assert!(views.iter().all(|view| view.ty == sys::StructureType::VIEW));
+        assert!(crate::state::RENDER_TRACKING_TS.lock().is_empty());
     }
 
     #[test]
@@ -2236,6 +2848,215 @@ mod tests {
     fn resolve_known_and_unknown() {
         assert!(resolve(c"xrCreateInstance").is_some());
         assert!(resolve(c"xrNoSuchFunction").is_none());
+    }
+
+    #[test]
+    fn swapchain_selection_obeys_acquire_wait_release_order() {
+        let mut states = vec![crate::state::SwapchainImageState::default(); 3];
+        states[0].acquired = true;
+        states[1].acquired = true;
+        let order = VecDeque::from([0, 1]);
+        assert_eq!(next_acquirable_image(&states, 0), Some(2));
+        assert_eq!(next_unwaited_image(&order, &states), Some(0));
+        states[0].waited = true;
+        assert_eq!(next_unwaited_image(&order, &states), Some(1));
+        states[1].waited = true;
+        assert_eq!(next_unwaited_image(&order, &states), None);
+    }
+
+    #[test]
+    fn newest_released_image_stays_reserved_until_replaced() {
+        let mut states = vec![crate::state::SwapchainImageState::default(); 3];
+        let mut latest = None;
+        let mut serial = 0;
+        record_released_image(&mut states, &mut latest, &mut serial, 1);
+        assert_eq!(latest, Some(1));
+        assert!(states[1].reserved_for_composition);
+        record_released_image(&mut states, &mut latest, &mut serial, 2);
+        assert_eq!(latest, Some(2));
+        assert_eq!(serial, 2);
+        assert!(!states[1].reserved_for_composition);
+        assert!(states[2].reserved_for_composition);
+        assert_eq!(next_acquirable_image(&states, 2), Some(0));
+    }
+
+    #[test]
+    fn wait_timeout_maps_infinite_finite_and_retry_results() {
+        assert_eq!(
+            vk_wait_timeout_ns(sys::Duration::from_nanos(-1)),
+            Ok(u64::MAX)
+        );
+        assert_eq!(vk_wait_timeout_ns(sys::Duration::from_nanos(0)), Ok(0));
+        assert_eq!(vk_wait_timeout_ns(sys::Duration::from_nanos(12)), Ok(12));
+        assert_eq!(
+            vk_wait_timeout_ns(sys::Duration::from_nanos(-2)),
+            Err(sys::Result::ERROR_VALIDATION_FAILURE)
+        );
+        assert_eq!(
+            openxr_vk_wait_result(Err(vk::Result::TIMEOUT)),
+            sys::Result::TIMEOUT_EXPIRED
+        );
+    }
+
+    #[test]
+    fn vulkan_transfer_only_swapchains_support_runtime_attachment_layout() {
+        use sys::SwapchainUsageFlags as XrUsage;
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+        };
+
+        for (requested, expected) in [
+            (XrUsage::TRANSFER_DST, vk::ImageUsageFlags::TRANSFER_DST),
+            (XrUsage::TRANSFER_SRC, vk::ImageUsageFlags::TRANSFER_SRC),
+            (
+                XrUsage::TRANSFER_DST | XrUsage::TRANSFER_SRC,
+                vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC,
+            ),
+            (XrUsage::SAMPLED, vk::ImageUsageFlags::SAMPLED),
+        ] {
+            let usage = vulkan_image_usage(requested).unwrap();
+            assert!(usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT));
+            assert!(usage.contains(expected));
+        }
+        let bind_flags = d3d11_bind_flags();
+        assert_ne!(bind_flags & D3D11_BIND_RENDER_TARGET.0 as u32, 0);
+        assert_ne!(bind_flags & D3D11_BIND_SHADER_RESOURCE.0 as u32, 0);
+        assert!(vulkan_image_usage(XrUsage::DEPTH_STENCIL_ATTACHMENT).is_none());
+        assert!(vulkan_image_usage(XrUsage::UNORDERED_ACCESS).is_none());
+    }
+
+    #[test]
+    fn array_slice_and_rect_uv_are_selected_independently() {
+        assert!(valid_array_slice(2, 0));
+        assert!(valid_array_slice(2, 1));
+        assert!(!valid_array_slice(2, 2));
+        let rect = sys::Rect2Di {
+            offset: sys::Offset2Di { x: 25, y: 10 },
+            extent: sys::Extent2Di {
+                width: 50,
+                height: 40,
+            },
+        };
+        assert_eq!(rect_uv_bounds(rect, 100, 100), [0.25, 0.75, 0.1, 0.5]);
+    }
+
+    #[test]
+    fn quad_projection_preserves_pose_and_perspective_clip_coordinates() {
+        use alvr_common::glam::{Quat, Vec3};
+        let eye = CompositionEyeBasis {
+            fov: [
+                -45.0_f32.to_radians(),
+                45.0_f32.to_radians(),
+                45.0_f32.to_radians(),
+                -45.0_f32.to_radians(),
+            ],
+            eye_pose_in_stage: alvr_common::Pose::default(),
+        };
+        let quad = alvr_common::Pose {
+            orientation: Quat::IDENTITY,
+            position: Vec3::new(0.0, 0.0, -1.0),
+        };
+        let clip = quad_clip_vertices(
+            quad,
+            eye,
+            sys::Extent2Df {
+                width: 2.0,
+                height: 2.0,
+            },
+        )
+        .unwrap();
+        assert!((clip[0] / clip[3] + 1.0).abs() < 1e-5);
+        assert!((clip[1] / clip[3] - 1.0).abs() < 1e-5);
+        assert!((clip[4] / clip[7] - 1.0).abs() < 1e-5);
+        assert!((clip[13] / clip[15] + 1.0).abs() < 1e-5);
+        assert!(quad_clip_vertices(
+            alvr_common::Pose {
+                position: Vec3::new(0.0, 0.0, 1.0),
+                ..quad
+            },
+            eye,
+            sys::Extent2Df {
+                width: 2.0,
+                height: 2.0
+            },
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn alpha_modes_and_private_descriptor_layout_match_cpp() {
+        use std::mem::size_of;
+        assert_eq!(alpha_mode(sys::CompositionLayerFlags::from_raw(0)), 0);
+        assert_eq!(
+            alpha_mode(sys::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA),
+            1
+        );
+        assert_eq!(
+            alpha_mode(
+                sys::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA
+                    | sys::CompositionLayerFlags::UNPREMULTIPLIED_ALPHA
+            ),
+            2
+        );
+        assert_eq!(size_of::<AlvrOpenXrDrawDesc>(), 112);
+    }
+
+    #[test]
+    fn swapchain_cleanup_leaves_a_reusable_tombstone() {
+        let mut swapchain = crate::state::Swapchain {
+            textures: Vec::new(),
+            gl_textures: Vec::new(),
+            vk_images: Vec::new(),
+            nt_handles: Vec::new(),
+            vk_cpu_copy: false,
+            vk_commands: Vec::new(),
+            gl_interop_handles: Vec::new(),
+            gl_interop_locked: Vec::new(),
+            cpu_copy: false,
+            next_index: 0,
+            acquisition_order: VecDeque::new(),
+            last_released_index: Some(0),
+            release_serial: 1,
+            image_states: Vec::new(),
+            format: 0,
+            array_size: 1,
+            width: 1,
+            height: 1,
+        };
+        unsafe {
+            destroy_swapchain_contents(crate::state::GraphicsApi::D3D11, 0, None, &mut swapchain)
+                .unwrap();
+        }
+        assert!(swapchain.textures.is_empty());
+        assert!(swapchain.vk_commands.is_empty());
+        assert_eq!(swapchain.last_released_index, None);
+    }
+
+    #[test]
+    fn failed_vulkan_dispatch_initialization_allows_session_retry() {
+        *crate::state::SESSION.lock() = crate::state::SessionState::default();
+        *crate::state::GRAPHICS.lock() = crate::state::GraphicsState {
+            api: crate::state::GraphicsApi::Vulkan,
+            ..Default::default()
+        };
+        let info = sys::SessionCreateInfo {
+            ty: sys::StructureType::SESSION_CREATE_INFO,
+            next: std::ptr::null(),
+            create_flags: Default::default(),
+            system_id: sys::SystemId::from_raw(ALVR_SYSTEM_ID),
+        };
+        let mut session = sys::Session::from_raw(0);
+        assert_eq!(
+            unsafe { create_session(sys::Instance::from_raw(1), &info, &mut session) },
+            sys::Result::ERROR_RUNTIME_FAILURE
+        );
+        assert!(!crate::state::SESSION.lock().created);
+        assert!(crate::state::GRAPHICS.lock().vulkan.is_none());
+        assert_eq!(
+            unsafe { create_session(sys::Instance::from_raw(1), &info, &mut session) },
+            sys::Result::SUCCESS
+        );
+        *crate::state::SESSION.lock() = crate::state::SessionState::default();
     }
 
     #[test]

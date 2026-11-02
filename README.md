@@ -1,13 +1,13 @@
 <p align="center"> <img width="500" src="resources/ALVR-Grey.svg"/> </p>
 
-# ALVR 20.14.0 — Native OpenXR & QiYu / Huawei VR fork
+# ALVR 20.14.0 — QiYu / Huawei VR fork
 
 Stream VR games from your PC to your headset over Wi-Fi.
 
 This is a fork of [ALVR](https://github.com/alvr-org/ALVR) pinned to **20.14.0**, adding support for
 two headsets upstream does not cover:
 
-- **iQIYI QiYu** — OpenXR path with the vendor extensions enabled, plus a Native SDK
+- **iQIYI QiYu (奇遇) 3 / A091** — OpenXR path with the vendor extensions enabled, plus a Native SDK
   bridge that recovers the full controller button set.
 - **Huawei VR (HVR)** — its legacy OpenXR runtime needs hand subaction paths, a pose-only binding
   fallback, and a floor-height reference space.

@@ -73,3 +73,27 @@ CMakeLists.txt
 cmake-build-debug/
 
 *.jks
+# HVR session scratch (not source)
+*.local.txt
+build-*.log
+build[0-9]*.log
+logs/
+
+# local archives of the workspace
+*.7z
+build-*.ps1
+capture-*.ps1
+parse-*.ps1
+grepdemo*.ps1
+test-hello*.ps1
+test-helloxr*.ps1
+prepare-android.log
+d11_*.log
+vk_*.log
+vk_*.txt
+logfile.txt
+alvr/client_openxr/logfile.txt
+.cline_storage/
+.codegraph/
+test-logs/
+手柄方位标定说明.md

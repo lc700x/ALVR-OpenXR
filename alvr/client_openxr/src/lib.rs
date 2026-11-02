@@ -228,7 +228,9 @@ pub fn entry_point() {
         | Platform::Pico4Pro
         | Platform::Pico4Enterprise => "_pico_old",
         p if p.is_yvr() => "_yvr",
-        Platform::Lynx => "_lynx",
+        // The checkout does not package a Lynx-specific loader; use the standard Android
+        // loader so it can discover the active runtime through the Khronos runtime broker.
+        Platform::Lynx => "",
         Platform::Hvr => "_hvr",
         // QiYu SDK v1 is SXR, not an OpenXR loader. Newer firmware can expose
         // the Android generic OpenXR loader; native SXR libraries are packaged
@@ -274,6 +276,10 @@ pub fn entry_point() {
     exts.fb_foveation_configuration = available_extensions.fb_foveation_configuration;
     exts.fb_passthrough = available_extensions.fb_passthrough;
     exts.fb_swapchain_update_state = available_extensions.fb_swapchain_update_state;
+    if platform.is_quest() {
+        exts.fb_touch_controller_pro = available_extensions.fb_touch_controller_pro;
+        exts.meta_touch_controller_plus = available_extensions.meta_touch_controller_plus;
+    }
     exts.htc_facial_tracking = available_extensions.htc_facial_tracking;
     exts.htc_passthrough = available_extensions.htc_passthrough;
     exts.htc_vive_focus3_controller_interaction =
@@ -412,6 +418,8 @@ pub fn entry_point() {
             exts.other.clone(),
             xr_system,
             platform,
+            exts.fb_touch_controller_pro,
+            exts.meta_touch_controller_plus,
         )));
 
         // Session lifecycle state. Populated by the SessionState::READY event in the render loop
@@ -422,6 +430,14 @@ pub fn entry_point() {
         let mut session_running = false;
         let mut passthrough_layer = None;
 
+        // Huawei re-anchors LOCAL to the current head pose every time the space is created, so a
+        // space created when streaming starts points wherever the user happened to be looking.
+        // HVRSDK_XrDemo creates its LOCAL space once at session setup and reuses it; do the same
+        // and hand the one space to both the lobby and the stream so they share an origin.
+        let hvr_reference_space = (platform == Platform::Hvr).then(|| {
+            Arc::new(interaction::get_hvr_floor_reference_space(&xr_session))
+        });
+
         let mut lobby = Lobby::new(
             xr_session.clone(),
             Rc::clone(&graphics_context),
@@ -429,6 +445,7 @@ pub fn entry_point() {
             platform,
             default_view_resolution,
             &last_lobby_message,
+            hvr_reference_space.clone(),
         );
         let lobby_body_tracking_config = BodyTrackingSourcesConfig {
             body_tracking_fb: Switch::Disabled,
@@ -447,6 +464,9 @@ pub fn entry_point() {
             .select_sources(&lobby_interaction_sources);
 
         let mut logged_first_frame = false;
+        let mut hvr_end_frame_index: u32 = 0;
+        let mut hvr_end_frame_errors: u32 = 0;
+        let mut logged_hvr_should_render_false = false;
         let mut hvr_stream_frame_diag_count: u32 = 0;
         let mut stream_context = None::<StreamContext>;
         let opaque_blend_mode = environment_blend_mode(platform);
@@ -567,6 +587,7 @@ pub fn entry_point() {
                             Arc::clone(&interaction_context),
                             platform,
                             config,
+                            hvr_reference_space.clone(),
                         );
 
                         if !context.uses_passthrough() {
@@ -721,7 +742,14 @@ pub fn entry_point() {
                 Err(e) => panic!("xrBeginFrame failed: {e:?}"),
             }
 
-            if !frame_state.should_render {
+            // Huawei's runtime drops shouldRender to false whenever its SDK considers the app
+            // backgrounded (visible in logcat as "App is on background, do nothing"), and it does
+            // so while the session is still focused and rendering. Submitting zero layers then
+            // leaves the compositor with nothing to show, which is exactly the flash-then-black
+            // symptom. The official HVRSDK_XrDemo never reads shouldRender: its render loop calls
+            // RenderFrame unconditionally while the session runs, and always submits the projection
+            // layer. Follow the sample on HVR and keep the spec-correct skip everywhere else.
+            if !frame_state.should_render && !is_hvr {
                 xr_frame_stream
                     .end(
                         frame_state.predicted_display_time,
@@ -733,15 +761,27 @@ pub fn entry_point() {
                 continue;
             }
 
+            if is_hvr && !frame_state.should_render && !logged_hvr_should_render_false {
+                logged_hvr_should_render_false = true;
+                error!(
+                    "[HVR-DIAG] shouldRender went false; rendering anyway to match HVRSDK_XrDemo"
+                );
+            }
+
             // todo: allow rendering lobby and stream layers at the same time and add cross fade
             let (layer, display_time) = if let Some(stream) = &mut stream_context {
                 if is_hvr && hvr_stream_frame_diag_count < 10 {
                     error!("[HVR-DIAG] entering stream.render (frame diag {hvr_stream_frame_diag_count})");
                 }
+                // The stream layer is blank until the first decoded video frame arrives. Presenting
+                // the lobby in the meantime was tried and made things worse on Huawei: the lobby
+                // never appeared and the stream stayed black after taking over, so rendering both
+                // per frame evidently upsets the runtime. Submit the stream layer from the start.
                 let out = stream.render(frame_interval, vsync_time);
                 if is_hvr && hvr_stream_frame_diag_count < 10 {
                     error!("[HVR-DIAG] returned from stream.render (frame diag {hvr_stream_frame_diag_count})");
                 }
+
                 out
             } else {
                 (lobby.render(vsync_time), vsync_time)
@@ -760,6 +800,26 @@ pub fn entry_point() {
                 graphics_context.make_current();
             }
             let res = xr_frame_stream.end(to_xr_time(display_time), environment_blend_mode, layers);
+
+            // Probe: HVR swallows xrEndFrame errors, so count them instead of losing them, and
+            // record what was actually submitted. Report on error rather than on a schedule: a
+            // periodic sample missed the frame the user sees glitch.
+            if is_hvr {
+                hvr_end_frame_index += 1;
+                if res.is_err() {
+                    hvr_end_frame_errors += 1;
+                }
+                if res.is_err() || hvr_end_frame_index <= 20 || hvr_end_frame_index % 600 == 0 {
+                    error!(
+                        "[HVR-PROBE] endFrame {hvr_end_frame_index}: res={res:?} errors={hvr_end_frame_errors} \
+                         layers={} passthrough={} blend={environment_blend_mode:?} streaming={} \
+                         display_time={display_time:?}",
+                        layers.len(),
+                        passthrough_layer.is_some(),
+                        stream_context.is_some(),
+                    );
+                }
+            }
 
             if is_hvr && !logged_first_frame {
                 info!("[HVR-DIAG] first rendered frame result: {res:?}");
@@ -828,8 +888,8 @@ fn android_main(app: android_activity::AndroidApp) {
     // official Java VRActivity architecture (custom Activity + SurfaceView + HandlerThread),
     // which this NativeActivity-based client does not provide. Confirmed by tombstone:
     //   #00 QVR_Init+200 libqiyivrsdkcore.so (null deref)  #01 qiyu_Init libqiyuapi.so
-    // So only legacy SXR headsets (A5/A6-B) use the native backend; A091 falls through to the
-    // working OpenXR path (video + ray-following controller via khr/simple_controller).
+    // So only legacy SXR headsets (A5/A6-B) use the native backend; A091 uses OpenXR for display
+    // and poses, with its full Native SDK button state overlaid by interaction.rs.
     if platform == Platform::Qiyu && alvr_system_info::qiyu_uses_native_sxr() {
         qiyu::entry_point(app);
         return;

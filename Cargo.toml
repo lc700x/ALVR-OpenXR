@@ -3,7 +3,7 @@ resolver = "2"
 members = ["alvr/*"]
 
 [workspace.package]
-version = "20.14.1"
+version = "20.14.0"
 edition = "2021"
 rust-version = "1.82"
 authors = ["alvr-org"]
@@ -21,6 +21,7 @@ alvr_gui_common = { path = "alvr/gui_common" }
 alvr_packets = { path = "alvr/packets" }
 alvr_server_core = { path = "alvr/server_core"}
 alvr_server_io = { path = "alvr/server_io" }
+alvr_server_openxr = { path = "alvr/server_openxr" }
 alvr_session = { path = "alvr/session" }
 alvr_sockets = { path = "alvr/sockets" }
 alvr_system_info = { path = "alvr/system_info" }

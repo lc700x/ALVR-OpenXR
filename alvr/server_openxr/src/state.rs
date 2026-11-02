@@ -44,13 +44,11 @@ pub static CONTROLLER_POSES: Lazy<RwLock<[Pose; 2]>> = Lazy::new(|| {
 /// leave a stale ray active in the application.
 pub static CONTROLLER_TRACKED: Lazy<RwLock<[bool; 2]>> = Lazy::new(|| RwLock::new([false; 2]));
 pub static HEAD_POSE_QUEUE: Mutex<VecDeque<(Duration, Pose)>> = Mutex::new(VecDeque::new());
-/// Maps a frame's OpenXR `predicted_display_time` (ns) to the real client
-/// tracking-sample timestamp (ns) whose pose was used to render it. The video
-/// frame must be tagged with this tracking timestamp so the client's
-/// asynchronous timewarp reprojects from the correct render pose; tagging with
-/// the synthetic display time makes the client reproject against the wrong pose,
-/// which warps and jitters the image whenever the head moves.
-pub static RENDER_TRACKING_TS: Mutex<VecDeque<(i64, i64)>> = Mutex::new(VecDeque::new());
+/// Maps a frame's OpenXR `predicted_display_time` (ns) to the exact client
+/// tracking sample and pose used by `xrLocateViews`. `xrEndFrame` must use that
+/// same pose when composing the image and tag it with that sample's timestamp,
+/// so the client's asynchronous timewarp starts from the pose that rendered it.
+pub static RENDER_TRACKING_TS: Mutex<VecDeque<(i64, i64, Pose)>> = Mutex::new(VecDeque::new());
 pub static REQUEST_IDR: AtomicBool = AtomicBool::new(false);
 /// Number of pending OpenXR recenter events. VDXR emits two events for one
 /// physical recenter: LOCAL first, then STAGE.
@@ -104,10 +102,14 @@ pub enum GraphicsApi {
 /// `Send`/`Sync`; access is single-threaded through the OpenXR call sequence.
 #[derive(Default)]
 pub struct GraphicsState {
+    pub vulkan: Option<std::sync::Arc<crate::vulkan::VulkanFns>>,
     pub api: GraphicsApi,
     /// `*mut ID3D11Device` as usize. For OpenGL sessions this is a runtime-owned
     /// device the encoder + interop share; for D3D11 sessions it's the app's.
     pub d3d11_device: usize,
+    /// True when `d3d11_device` was created by this runtime rather than supplied
+    /// in the application's graphics binding.
+    pub owns_d3d11_device: bool,
     /// `HDC` / `HGLRC` from `GraphicsBindingOpenGLWin32KHR`, 0 if not OpenGL.
     pub gl_hdc: usize,
     pub gl_hglrc: usize,
@@ -143,6 +145,8 @@ pub struct Swapchain {
     /// and CPU-copied into the D3D11 textures at submit time (universal
     /// fallback for drivers that reject D3D11<->Vulkan external memory).
     pub vk_cpu_copy: bool,
+    /// Command pools, command buffers and fences used only by Vulkan sessions.
+    pub vk_commands: Vec<crate::vulkan::CommandResources>,
     /// WGL interop object handles per image (OpenGL sessions only).
     pub gl_interop_handles: Vec<usize>,
     /// Whether each WGL interop object is currently locked for GL ownership.
@@ -154,16 +158,36 @@ pub struct Swapchain {
     pub cpu_copy: bool,
     /// Index the app will next acquire (round-robin).
     pub next_index: u32,
-    /// Index most recently acquired — the image the next release/submit refers to.
-    pub last_acquired_index: u32,
+    /// FIFO required because OpenXR acquire/wait/release calls do not pass an
+    /// image index except from acquire.
+    pub acquisition_order: VecDeque<u32>,
+    /// The most recently released image is the one composition layers consume.
+    pub last_released_index: Option<u32>,
+    pub release_serial: u64,
+    pub image_states: Vec<SwapchainImageState>,
+    pub format: i64,
+    pub array_size: u32,
     /// Width/height, needed for the CPU-copy readback.
     pub width: u32,
     pub height: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SwapchainImageState {
+    pub acquired: bool,
+    pub waited: bool,
+    pub ever_acquired: bool,
+    /// True while this image is protected for use by the next xrEndFrame.
+    pub reserved_for_composition: bool,
+    /// The per-image Vulkan fence has an outstanding acquire or release submit.
+    pub vk_fence_pending: bool,
+}
+
 pub static GRAPHICS: Mutex<GraphicsState> = Mutex::new(GraphicsState {
+    vulkan: None,
     api: GraphicsApi::None,
     d3d11_device: 0,
+    owns_d3d11_device: false,
     gl_hdc: 0,
     gl_hglrc: 0,
     gl_interop_device: 0,

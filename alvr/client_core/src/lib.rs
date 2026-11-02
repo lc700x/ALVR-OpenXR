@@ -264,13 +264,15 @@ impl ClientCoreContext {
             if *id == *HEAD_ID {
                 *motion = motion.predict(poll_timestamp, target_timestamp);
 
-                let mut head_pose_queue = self.connection_context.head_pose_queue.write();
+                {
+                    let mut head_pose_queue = self.connection_context.head_pose_queue.write();
+                    head_pose_queue.push_back((reported_timestamp, motion.pose));
 
-                head_pose_queue.push_back((reported_timestamp, motion.pose));
-
-                while head_pose_queue.len() > 1024 {
-                    head_pose_queue.pop_front();
+                    while head_pose_queue.len() > 1024 {
+                        head_pose_queue.pop_front();
+                    }
                 }
+                *self.connection_context.last_good_head_pose.write() = motion.pose;
 
                 // This is done for backward compatibiity for the v20 protocol. Will be removed with the
                 // tracking rewrite protocol extension.
@@ -369,13 +371,10 @@ impl ClientCoreContext {
             stats.report_compositor_start(timestamp);
         }
 
-        let mut head_pose = *self.connection_context.last_good_head_pose.read();
-        for (ts, pose) in &*self.connection_context.head_pose_queue.read() {
-            if *ts == timestamp {
-                head_pose = *pose;
-                break;
-            }
-        }
+        let fallback_head_pose = *self.connection_context.last_good_head_pose.read();
+        let head_pose =
+            head_pose_at_timestamp(&self.connection_context.head_pose_queue.read(), timestamp)
+                .unwrap_or(fallback_head_pose);
         let view_params = self.connection_context.view_params.read();
 
         [
@@ -405,6 +404,29 @@ impl ClientCoreContext {
             }
         }
     }
+}
+
+const HEAD_POSE_TIMESTAMP_TOLERANCE: Duration = Duration::from_micros(1);
+
+fn head_pose_at_timestamp(
+    head_pose_queue: &VecDeque<(Duration, Pose)>,
+    timestamp: Duration,
+) -> Option<Pose> {
+    let mut nearest: Option<(Duration, Pose)> = None;
+    for &(sample_timestamp, pose) in head_pose_queue {
+        let delta = if sample_timestamp >= timestamp {
+            sample_timestamp - timestamp
+        } else {
+            timestamp - sample_timestamp
+        };
+        if nearest.map_or(true, |(nearest_delta, _)| delta < nearest_delta) {
+            nearest = Some((delta, pose));
+        }
+    }
+
+    nearest
+        .filter(|(delta, _)| *delta <= HEAD_POSE_TIMESTAMP_TOLERANCE)
+        .map(|(_, pose)| pose)
 }
 
 impl Drop for ClientCoreContext {
@@ -491,5 +513,33 @@ pub fn canted_view_to_proportional_circumscribed_orthogonal(
     ViewParams {
         pose: viewpose_orth,
         fov: fov_orth_corrected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alvr_common::glam::{Quat, Vec3};
+
+    #[test]
+    fn compositor_pose_matches_media_codec_microsecond_timestamp() {
+        let expected = Pose {
+            orientation: Quat::IDENTITY,
+            position: Vec3::new(0.1, 1.6, -0.2),
+        };
+        let timestamp = Duration::from_nanos(1_826_299_205_123);
+        let decoded_timestamp = Duration::from_nanos(1_826_299_205_000);
+        let queue = VecDeque::from([(timestamp, expected)]);
+
+        let pose = head_pose_at_timestamp(&queue, decoded_timestamp).unwrap();
+
+        assert!(pose.position.abs_diff_eq(expected.position, 1e-6));
+    }
+
+    #[test]
+    fn compositor_pose_rejects_a_different_tracking_sample() {
+        let queue = VecDeque::from([(Duration::from_nanos(1_000), Pose::default())]);
+
+        assert!(head_pose_at_timestamp(&queue, Duration::from_nanos(2_001)).is_none());
     }
 }

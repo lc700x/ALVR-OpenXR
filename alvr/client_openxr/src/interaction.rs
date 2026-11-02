@@ -23,13 +23,11 @@ use xr::SpaceLocationFlags;
 
 const IPD_CHANGE_EPS: f32 = 0.001;
 const HVR_CONTROLLER_PROFILE_PATH: &str = "/interaction_profiles/huawei/6dof_controller";
-
-// Probe flag: when true, QiYu suggests only the Oculus Touch profile. log_qiyu44 settled this —
-// the runtime accepts the Touch suggestion but never activates it, leaving both hands at
-// '<unknown>' with no input at all, while khr/simple_controller does get activated. Keep this
-// false; the QiYu OpenXR runtime supports no vendor controller profile, matching its docs, which
-// describe controllers only through the Native SDK and UnityXR.
-const QIYU_FORCE_TOUCH_PROFILE: bool = false;
+const QUEST_TOUCH_PRO_CONTROLLER_PROFILE_PATH: &str =
+    "/interaction_profiles/facebook/touch_controller_pro";
+const QUEST_TOUCH_PLUS_CONTROLLER_PROFILE_PATH: &str =
+    "/interaction_profiles/meta/touch_controller_plus";
+const QIYU_SIMPLE_CONTROLLER_PROFILE_PATH: &str = "/interaction_profiles/khr/simple_controller";
 
 // QiYu native controller bridge.
 //
@@ -476,6 +474,8 @@ impl InteractionContext {
         extra_extensions: Vec<String>,
         xr_system: xr::SystemId,
         platform: Platform,
+        quest_touch_pro_enabled: bool,
+        quest_touch_plus_enabled: bool,
     ) -> Self {
         let xr_instance = xr_session.instance();
 
@@ -512,7 +512,8 @@ impl InteractionContext {
         }
 
         let controllers_profile_path = match platform {
-            p if p.is_quest() => QUEST_CONTROLLER_PROFILE_PATH, // todo: create new controller profile for quest pro and 3
+            // Keep ALVR's Oculus Touch button IDs for server-side input mapping.
+            p if p.is_quest() => QUEST_CONTROLLER_PROFILE_PATH,
             Platform::PicoG3 => PICO_G3_CONTROLLER_PROFILE_PATH,
             Platform::PicoNeo3 => PICO_NEO3_CONTROLLER_PROFILE_PATH,
             Platform::Pico4Ultra => PICO4S_CONTROLLER_PROFILE_PATH,
@@ -531,10 +532,16 @@ impl InteractionContext {
             Platform::Qiyu => QUEST_CONTROLLER_PROFILE_PATH,
             _ => QUEST_CONTROLLER_PROFILE_PATH,
         };
-        let interaction_profile_path = if platform == Platform::Hvr {
-            HVR_CONTROLLER_PROFILE_PATH
-        } else {
-            controllers_profile_path
+        let interaction_profile_path = match platform {
+            Platform::Hvr => HVR_CONTROLLER_PROFILE_PATH,
+            Platform::Qiyu => QIYU_SIMPLE_CONTROLLER_PROFILE_PATH,
+            Platform::Quest3 | Platform::Quest3S if quest_touch_plus_enabled => {
+                QUEST_TOUCH_PLUS_CONTROLLER_PROFILE_PATH
+            }
+            Platform::QuestPro if quest_touch_pro_enabled => {
+                QUEST_TOUCH_PRO_CONTROLLER_PROFILE_PATH
+            }
+            _ => controllers_profile_path,
         };
         let controllers_profile_id = alvr_common::hash_string(controllers_profile_path);
 
@@ -705,12 +712,17 @@ impl InteractionContext {
         }
 
         // Apply bindings:
-        let bindings_result = xr_instance.suggest_interaction_profile_bindings(
-            xr_instance
-                .string_to_path(interaction_profile_path)
-                .unwrap(),
-            &bindings,
-        );
+        let bindings_result = if platform == Platform::Qiyu {
+            info!("[QIYU] skipping unsupported Oculus Touch profile suggestion; native bridge supplies Touch button ids");
+            Ok(())
+        } else {
+            xr_instance.suggest_interaction_profile_bindings(
+                xr_instance
+                    .string_to_path(interaction_profile_path)
+                    .unwrap(),
+                &bindings,
+            )
+        };
         if platform == Platform::Hvr {
             if let Err(error) = bindings_result {
                 // Huawei's legacy runtime rejects the whole suggestion atomically if any single
@@ -738,31 +750,28 @@ impl InteractionContext {
                     info!("[HVR-DIAG] pose-only bindings accepted");
                 }
             }
-        } else {
-            bindings_result.unwrap();
+        } else if let Err(error) = bindings_result {
+            if platform.is_quest() && interaction_profile_path != controllers_profile_path {
+                warn!(
+                    "[PROFILE-DIAG] {interaction_profile_path} bindings rejected: {error}; \
+                     retrying with {controllers_profile_path}"
+                );
+                xr_instance
+                    .suggest_interaction_profile_bindings(
+                        xr_instance.string_to_path(controllers_profile_path).unwrap(),
+                        &bindings,
+                    )
+                    .unwrap();
+            } else {
+                panic!("{error}");
+            }
+        } else if platform.is_quest() && interaction_profile_path != controllers_profile_path {
+            info!("[PROFILE-DIAG] Quest controller bindings accepted: {interaction_profile_path}");
         }
 
-        // QiYu's OpenXR runtime (Monado-based) does not activate the Oculus Touch
-        // profile for its physical controllers and exposes no vendor controller
-        // interaction extension, so the suggestion above yields no controller input.
-        // Every conformant runtime must support the Khronos simple controller, which
-        // Monado maps real controllers onto, so additionally suggest those bindings to
-        // recover controller pose, trigger (select) and menu input.
-        //
-        // Set QIYU_FORCE_TOUCH_PROFILE to skip the simple-controller fallback. With both
-        // profiles suggested the runtime always picks the simple one, so this is the only way
-        // to observe whether it would ever activate Touch and expose the full button set.
+        // QiYu uses simple_controller only for OpenXR poses and basic select/menu actions; the
+        // Native SDK bridge supplies the full Touch button inventory below.
         if platform == Platform::Qiyu {
-            match &bindings_result {
-                Ok(()) => info!(
-                    "[QIYU] oculus/touch_controller bindings accepted (profile: {interaction_profile_path})"
-                ),
-                Err(error) => {
-                    warn!("[QIYU] oculus/touch_controller bindings rejected: {error}")
-                }
-            }
-        }
-        if platform == Platform::Qiyu && !QIYU_FORCE_TOUCH_PROFILE {
             let mut simple_bindings = vec![
                 binding(&left_grip_action, "/user/hand/left/input/grip/pose"),
                 binding(&right_grip_action, "/user/hand/right/input/grip/pose"),
@@ -771,13 +780,11 @@ impl InteractionContext {
                 binding(&left_vibration_action, "/user/hand/left/output/haptic"),
                 binding(&right_vibration_action, "/user/hand/right/output/haptic"),
             ];
-            if let Some(ButtonAction::Scalar(action)) =
-                button_actions.get(&*LEFT_TRIGGER_VALUE_ID)
+            if let Some(ButtonAction::Scalar(action)) = button_actions.get(&*LEFT_TRIGGER_VALUE_ID)
             {
                 simple_bindings.push(binding(action, "/user/hand/left/input/select/click"));
             }
-            if let Some(ButtonAction::Scalar(action)) =
-                button_actions.get(&*RIGHT_TRIGGER_VALUE_ID)
+            if let Some(ButtonAction::Scalar(action)) = button_actions.get(&*RIGHT_TRIGGER_VALUE_ID)
             {
                 simple_bindings.push(binding(action, "/user/hand/right/input/select/click"));
             }
@@ -791,7 +798,7 @@ impl InteractionContext {
 
             let res = xr_instance.suggest_interaction_profile_bindings(
                 xr_instance
-                    .string_to_path("/interaction_profiles/khr/simple_controller")
+                    .string_to_path(QIYU_SIMPLE_CONTROLLER_PROFILE_PATH)
                     .unwrap(),
                 &simple_bindings,
             );
@@ -855,8 +862,7 @@ impl InteractionContext {
         xr_session.attach_action_sets(&[&action_set]).unwrap();
 
         // Diagnostic: log the interaction profile the runtime actually activated for each hand.
-        // On QiYu this reveals the real /interaction_profiles/... path (if any) so controller
-        // bindings can be tailored precisely instead of relying on khr/simple_controller.
+        // QiYu uses simple_controller for poses/basic actions and the Native SDK for full buttons.
         for (hand_name, hand_path) in [
             ("left", "/user/hand/left"),
             ("right", "/user/hand/right"),

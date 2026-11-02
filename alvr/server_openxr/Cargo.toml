@@ -35,6 +35,7 @@ bincode = { version = "2", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 
 [target.'cfg(windows)'.dependencies]
+ash = { version = "0.38", default-features = false, features = ["loaded"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",

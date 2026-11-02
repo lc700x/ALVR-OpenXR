@@ -615,6 +615,11 @@ mod tests {
     }
 
     #[test]
+    fn test_video_glitch_avoidance_is_enabled_by_default() {
+        assert!(session_settings_default().connection.avoid_video_glitching);
+    }
+
+    #[test]
     fn test_session_extrapolation_trivial() {
         SessionConfig::default()
             .merge_from_json(&json::to_value(SessionConfig::default()).unwrap())
