@@ -38,6 +38,15 @@ fn uses_custom_reprojection(platform: Platform) -> bool {
     platform.is_yvr() || platform == Platform::Hvr
 }
 
+pub(crate) fn hvr_corrected_controller_y(
+    initial_head_y: f32,
+    initial_controller_y: f32,
+    current_controller_y: f32,
+) -> f32 {
+    let reflected_initial_y = initial_head_y - (initial_controller_y - initial_head_y);
+    reflected_initial_y + (current_controller_y - initial_controller_y)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,6 +56,19 @@ mod tests {
         assert!(uses_custom_reprojection(Platform::Hvr));
         assert!(uses_custom_reprojection(Platform::Yvr));
         assert!(!uses_custom_reprojection(Platform::Quest2));
+    }
+
+    #[test]
+    fn hvr_controller_height_reflects_start_and_preserves_motion() {
+        let head_y = 1.47;
+        let initial_controller_y = 2.54;
+        let corrected_initial_y =
+            hvr_corrected_controller_y(head_y, initial_controller_y, initial_controller_y);
+        let corrected_moved_y =
+            hvr_corrected_controller_y(head_y, initial_controller_y, initial_controller_y + 0.25);
+
+        assert!((corrected_initial_y - 0.40).abs() < 0.0001);
+        assert!((corrected_moved_y - corrected_initial_y - 0.25).abs() < 0.0001);
     }
 }
 
@@ -749,6 +771,7 @@ fn stream_input_loop(
     let platform = alvr_system_info::platform();
 
     let mut last_controller_poses = [Pose::default(); 2];
+    let mut hvr_controller_y_calibrations = [None, None];
     let mut last_palm_poses = [Pose::default(); 2];
     let mut last_view_params = [ViewParams::default(); 2];
     let mut next_hvr_controller_log = Instant::now();
@@ -794,7 +817,7 @@ fn stream_input_loop(
 
         device_motions.push((*HEAD_ID, head_motion));
 
-        let (left_hand_motion, left_hand_skeleton) = crate::interaction::get_hand_data(
+        let (mut left_hand_motion, left_hand_skeleton) = crate::interaction::get_hand_data(
             &xr_session,
             platform,
             stage_reference_space,
@@ -804,7 +827,7 @@ fn stream_input_loop(
             &mut last_controller_poses[0],
             &mut last_palm_poses[0],
         );
-        let (right_hand_motion, right_hand_skeleton) = crate::interaction::get_hand_data(
+        let (mut right_hand_motion, right_hand_skeleton) = crate::interaction::get_hand_data(
             &xr_session,
             platform,
             stage_reference_space,
@@ -815,11 +838,43 @@ fn stream_input_loop(
             &mut last_palm_poses[1],
         );
 
+        if platform == Platform::Hvr {
+            let head_y = head_motion.pose.position.y;
+            for (calibration, (hand_name, motion)) in
+                hvr_controller_y_calibrations.iter_mut().zip([
+                    ("left", &mut left_hand_motion),
+                    ("right", &mut right_hand_motion),
+                ])
+            {
+                if let Some(motion) = motion {
+                    let raw_controller_y = motion.pose.position.y;
+                    let newly_calibrated = calibration.is_none();
+                    let (initial_head_y, initial_controller_y) =
+                        *calibration.get_or_insert((head_y, raw_controller_y));
+                    motion.pose.position.y = hvr_corrected_controller_y(
+                        initial_head_y,
+                        initial_controller_y,
+                        raw_controller_y,
+                    );
+
+                    if newly_calibrated {
+                        alvr_common::info!(
+                            "[HVR-DIAG] reflected {hand_name} controller height: \
+                             head_y={initial_head_y:.3}, raw_y={initial_controller_y:.3}, \
+                             corrected_y={:.3}",
+                            motion.pose.position.y
+                        );
+                    }
+                }
+            }
+        }
+
         if platform == Platform::Hvr && Instant::now() >= next_hvr_controller_log {
             alvr_common::info!(
-                "[HVR-DIAG] controller motions: left={}, right={}",
-                left_hand_motion.is_some(),
-                right_hand_motion.is_some()
+                "[HVR-DIAG] controller poses in shared reference space: head={:?}, left={:?}, right={:?}",
+                head_motion.pose.position,
+                left_hand_motion.map(|motion| motion.pose.position),
+                right_hand_motion.map(|motion| motion.pose.position)
             );
             next_hvr_controller_log = Instant::now() + Duration::from_secs(1);
         }

@@ -22,6 +22,8 @@ pub struct Lobby {
     swapchains: [xr::Swapchain<xr::OpenGlEs>; 2],
     view_resolution: UVec2,
     reference_space_type: xr::ReferenceSpaceType,
+    next_hvr_pose_log: Duration,
+    hvr_controller_y_calibrations: [Option<(f32, f32)>; 2],
     renderer: LobbyRenderer,
 }
 
@@ -103,6 +105,8 @@ impl Lobby {
             swapchains,
             view_resolution,
             reference_space_type,
+            next_hvr_pose_log: Duration::ZERO,
+            hvr_controller_y_calibrations: [None, None],
             renderer,
         }
     }
@@ -152,7 +156,7 @@ impl Lobby {
 
         // future_time doesn't have to be any particular value, just something after vsync_time
         let future_time = vsync_time + Duration::from_millis(80);
-        let left_hand_data = interaction::get_hand_data(
+        let mut left_hand_data = interaction::get_hand_data(
             &self.xr_session,
             self.platform,
             &self.reference_space,
@@ -162,7 +166,7 @@ impl Lobby {
             &mut Pose::default(),
             &mut Pose::default(),
         );
-        let right_hand_data = interaction::get_hand_data(
+        let mut right_hand_data = interaction::get_hand_data(
             &self.xr_session,
             self.platform,
             &self.reference_space,
@@ -172,6 +176,49 @@ impl Lobby {
             &mut Pose::default(),
             &mut Pose::default(),
         );
+
+        if self.platform == Platform::Hvr {
+            let head_y = (views[0].pose.position.y + views[1].pose.position.y) * 0.5;
+            for (calibration, (hand_name, hand_data)) in
+                self.hvr_controller_y_calibrations.iter_mut().zip([
+                    ("left", &mut left_hand_data),
+                    ("right", &mut right_hand_data),
+                ])
+            {
+                if let Some(motion) = &mut hand_data.0 {
+                    let raw_controller_y = motion.pose.position.y;
+                    let newly_calibrated = calibration.is_none();
+                    let (initial_head_y, initial_controller_y) =
+                        *calibration.get_or_insert((head_y, raw_controller_y));
+                    motion.pose.position.y = crate::stream::hvr_corrected_controller_y(
+                        initial_head_y,
+                        initial_controller_y,
+                        raw_controller_y,
+                    );
+
+                    if newly_calibrated {
+                        alvr_common::info!(
+                            "[HVR-DIAG] reflected lobby {hand_name} controller height: \
+                             head_y={initial_head_y:.3}, raw_y={initial_controller_y:.3}, \
+                             corrected_y={:.3}",
+                            motion.pose.position.y
+                        );
+                    }
+                }
+            }
+        }
+
+        if self.platform == Platform::Hvr && vsync_time >= self.next_hvr_pose_log {
+            alvr_common::info!(
+                "[HVR-DIAG] lobby poses in shared reference space: head_left={:?}, \
+                 head_right={:?}, left={:?}, right={:?}",
+                views[0].pose.position,
+                views[1].pose.position,
+                left_hand_data.0.map(|motion| motion.pose.position),
+                right_hand_data.0.map(|motion| motion.pose.position)
+            );
+            self.next_hvr_pose_log = vsync_time + Duration::from_secs(1);
+        }
 
         let additional_motions = self
             .interaction_ctx
