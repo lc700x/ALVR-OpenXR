@@ -38,6 +38,28 @@ fn uses_custom_reprojection(platform: Platform) -> bool {
     platform.is_yvr() || platform == Platform::Hvr
 }
 
+/// Guards the layer against degenerate view parameters (a pose at 1e20 projects the whole image
+/// away and the headset goes black). Only affects values that are already broken; valid parameters
+/// pass through untouched on every platform.
+fn view_params_are_sane(view: &ViewParams) -> bool {
+    let position = view.pose.position;
+    let orientation = view.pose.orientation;
+    let fov = view.fov;
+
+    position.is_finite()
+        && position.length() < 10.0
+        && orientation.x.is_finite()
+        && orientation.y.is_finite()
+        && orientation.z.is_finite()
+        && orientation.w.is_finite()
+        && fov.left.is_finite()
+        && fov.right.is_finite()
+        && fov.up.is_finite()
+        && fov.down.is_finite()
+        && (fov.right - fov.left) > 0.1
+        && (fov.up - fov.down) > 0.1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,6 +69,34 @@ mod tests {
         assert!(uses_custom_reprojection(Platform::Hvr));
         assert!(uses_custom_reprojection(Platform::Yvr));
         assert!(!uses_custom_reprojection(Platform::Quest2));
+    }
+
+    #[test]
+    fn degenerate_view_params_are_rejected() {
+        let sane = ViewParams {
+            pose: alvr_common::Pose::default(),
+            fov: alvr_common::Fov {
+                left: -0.7,
+                right: 0.7,
+                up: 0.7,
+                down: -0.7,
+            },
+        };
+        assert!(view_params_are_sane(&sane));
+
+        // Measured on device: the server once echoed a z of -3.6e35.
+        let mut runaway = sane;
+        runaway.pose.position = alvr_common::glam::Vec3::new(0.0, 1.4, -3.6e35);
+        assert!(!view_params_are_sane(&runaway));
+
+        let mut empty_fov = sane;
+        empty_fov.fov = alvr_common::Fov {
+            left: 0.0,
+            right: 0.0,
+            up: 0.0,
+            down: 0.0,
+        };
+        assert!(!view_params_are_sane(&empty_fov));
     }
 }
 
@@ -624,8 +674,29 @@ impl StreamContext {
         }
 
         // The poses and FoVs we received from the PC runtime, which may differ and/or include
-        // altered FoVs based on settings and view conversions done for canting.
-        let input_view_params = view_params;
+        // altered FoVs based on settings and view conversions done for canting. A degenerate value
+        // must never reach the layer: a view pose at 1e35 projects the whole image away and the
+        // headset goes black, which has been observed twice (1e20 and 3.6e35 in z). Fall back to
+        // the poses the runtime itself reports.
+        let input_view_params = if view_params.iter().all(view_params_are_sane) {
+            view_params
+        } else {
+            alvr_common::error!(
+                "[HVR-DIAG] rejecting degenerate view params from the server: left={:?} right={:?}",
+                view_params[0].pose.position,
+                view_params[1].pose.position
+            );
+            [
+                ViewParams {
+                    pose: crate::from_xr_pose(current_headset_views[0].pose),
+                    fov: crate::from_xr_fov(current_headset_views[0].fov),
+                },
+                ViewParams {
+                    pose: crate::from_xr_pose(current_headset_views[1].pose),
+                    fov: crate::from_xr_fov(current_headset_views[1].fov),
+                },
+            ]
+        };
         let mut output_view_params = input_view_params;
         // Avoid passing invalid timestamp to runtime.
         // `timestamp` is generally a current vsync time, but may be repeated if frames are
