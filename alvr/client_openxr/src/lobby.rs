@@ -161,16 +161,11 @@ impl Lobby {
             vec![crate::default_view(), crate::default_view()]
         };
 
-        // Huawei's xrLocateViews ignores the requested reference space and returns the head at the
-        // origin; the VIEW space relation carries the real floor-relative pose. Shift the eyes by
-        // the difference so their separation survives.
+        // HVR is a single panel and its per-eye offsets are noise, so both eyes follow the head.
         if let Some(view_space) = &self.hvr_view_space {
             if let Ok((location, _)) = view_space.relate(&self.reference_space, xr_vsync_time) {
-                let delta = crate::from_xr_vec3(location.pose.position)
-                    - crate::from_xr_vec3(views[0].pose.position);
                 for view in &mut views {
-                    view.pose.position =
-                        crate::to_xr_vec3(crate::from_xr_vec3(view.pose.position) + delta);
+                    view.pose.position = location.pose.position;
                 }
             }
         }

@@ -199,9 +199,15 @@ impl StreamContext {
         let xr_exts = xr_session.instance().exts();
 
         if xr_exts.fb_display_refresh_rate.is_some() {
-            xr_session
-                .request_display_refresh_rate(config.refresh_rate_hint)
-                .unwrap();
+            // Huawei rejects rates it does not offer, and panicking here killed the client when a
+            // 72 Hz request went to a 90 Hz panel. Keep the runtime's rate and carry on.
+            if let Err(error) = xr_session.request_display_refresh_rate(config.refresh_rate_hint) {
+                alvr_common::error!(
+                    "[HVR-DIAG] display refresh rate {:.0} Hz refused ({error}); using the runtime's \
+                     rate",
+                    config.refresh_rate_hint
+                );
+            }
         }
 
         let foveation_profile = if let Some(config) = &config.clientside_foveation_config {
@@ -655,20 +661,15 @@ impl StreamContext {
             vec![crate::default_view(), crate::default_view()]
         };
 
-        // Huawei's xrLocateViews ignores the requested reference space; the VIEW space relation
-        // carries the real floor-relative pose. Shift the eyes by the difference so their
-        // separation survives.
+        // HVR is a single panel and its per-eye offsets are noise, so both eyes follow the head.
         let mut current_headset_views = current_headset_views;
         if self.platform == Platform::Hvr {
             if let Ok((location, _)) = self
                 .view_reference_space
                 .relate(&self.stage_reference_space, xr_vsync_time)
             {
-                let delta = crate::from_xr_vec3(location.pose.position)
-                    - crate::from_xr_vec3(current_headset_views[0].pose.position);
                 for view in &mut current_headset_views {
-                    view.pose.position =
-                        crate::to_xr_vec3(crate::from_xr_vec3(view.pose.position) + delta);
+                    view.pose.position = location.pose.position;
                 }
             }
         }

@@ -1191,15 +1191,13 @@ pub fn get_head_data(
     }
 
     // Huawei's xrLocateViews ignores the requested reference space and returns the head at the
-    // origin, while the VIEW space relation carries the real floor-relative pose. Shift the eyes by
-    // the difference instead of overwriting them, so their separation (IPD) survives.
+    // origin, while the VIEW space relation carries the real floor-relative pose. HVR is a single
+    // panel: both eyes sit on the head, and their reported separation is noise, so use the head
+    // pose for both rather than shifting per-eye offsets into the layer.
     let mut views = views;
     if platform == Platform::Hvr {
-        let delta = crate::from_xr_vec3(head_location.pose.position)
-            - crate::from_xr_vec3(views[0].pose.position);
         for view in &mut views {
-            view.pose.position =
-                crate::to_xr_vec3(crate::from_xr_vec3(view.pose.position) + delta);
+            view.pose.position = head_location.pose.position;
         }
     }
 
