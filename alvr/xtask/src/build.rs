@@ -73,7 +73,7 @@ pub fn build_server_lib(profile: Profile, root: Option<String>, reproducible: bo
 
 /// Build the standalone OpenXR runtime (no SteamVR) and assemble a package under
 /// `build/alvr_openxr_runtime_[platform]` with the runtime DLL + native deps.
-pub fn build_streamer_openxr(profile: Profile, gpl: bool, reproducible: bool) {
+pub fn build_streamer_openxr(profile: Profile, gpl: bool, reproducible: bool, keep_config: bool) {
     let sh = Shell::new().unwrap();
 
     let mut flags = vec![];
@@ -99,8 +99,21 @@ pub fn build_streamer_openxr(profile: Profile, gpl: bool, reproducible: bool) {
     let build_dir = afs::build_dir().join("alvr_openxr_runtime_windows");
     let bin_dir = build_dir.join("bin/win64");
 
+    let session = keep_config
+        .then(|| fs::read(bin_dir.join("session.json")).ok())
+        .flatten();
     sh.remove_path(&build_dir).ok();
     sh.create_dir(&bin_dir).unwrap();
+    if let Some(session) = session {
+        fs::write(bin_dir.join("session.json"), session).unwrap();
+    }
+    fs::write(
+        bin_dir.join("alvr_openxr_runtime.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({"file_format_version": "1.0.0",
+            "runtime": {"name": "ALVR", "library_path": "./alvr_server_openxr.dll"}}))
+        .unwrap(),
+    )
+    .unwrap();
 
     {
         let _push_guard = sh.push_dir(afs::crate_dir("server_openxr"));
@@ -460,14 +473,26 @@ fn add_android_vendor_runtime(sh: &Shell, apk_path: &Path, profile: Profile, key
     sh.create_dir(&work_dir).unwrap();
 
     let mut jars = Vec::new();
+    let mut native_libs = Vec::new();
     for name in aar_names {
         let aar_path = sdk_lib_dir.join(format!("{name}-v8a-{variant}.aar"));
         let extract_dir = work_dir.join(name);
         sh.create_dir(&extract_dir).unwrap();
-        cmd!(sh, "tar -xf {aar_path} -C {extract_dir} classes.jar")
+        cmd!(sh, "tar -xf {aar_path} -C {extract_dir}")
             .run()
             .unwrap();
         jars.push(extract_dir.join("classes.jar"));
+
+        let native_lib_dir = extract_dir.join("jni/arm64-v8a");
+        for lib_path in sh.read_dir(&native_lib_dir).unwrap() {
+            if lib_path
+                .extension()
+                .is_some_and(|extension| extension == "so")
+            {
+                let file_name = lib_path.file_name().unwrap().to_string_lossy().into_owned();
+                native_libs.push((lib_path, file_name));
+            }
+        }
     }
 
     let hvr_bridge = afs::workspace_dir()
@@ -508,20 +533,24 @@ fn add_android_vendor_runtime(sh: &Shell, apk_path: &Path, profile: Profile, key
     let java_home = PathBuf::from(env::var("JAVA_HOME").expect("JAVA_HOME not set"));
     let javac = java_home.join("bin").join(afs::exec_fname("javac"));
     let jar_tool = java_home.join("bin").join(afs::exec_fname("jar"));
-    let vractivity_src = afs::workspace_dir()
-        .join("alvr/client_openxr/android/java/alvr/client/VRActivity.java");
+    let vractivity_src =
+        afs::workspace_dir().join("alvr/client_openxr/android/java/alvr/client/VRActivity.java");
     let vractivity_classes_dir = work_dir.join("vractivity_classes");
     sh.create_dir(&vractivity_classes_dir).unwrap();
+    // D8 rejects empty synthetic parameter names emitted by newer javac versions.
     cmd!(
         sh,
-        "{javac} -source 8 -target 8 -classpath {android_jar} -d {vractivity_classes_dir} {vractivity_src}"
+        "{javac} -parameters -source 8 -target 8 -classpath {android_jar} -d {vractivity_classes_dir} {vractivity_src}"
     )
     .run()
     .unwrap();
     let vractivity_jar = work_dir.join("vractivity.jar");
-    cmd!(sh, "{jar_tool} cf {vractivity_jar} -C {vractivity_classes_dir} .")
-        .run()
-        .unwrap();
+    cmd!(
+        sh,
+        "{jar_tool} cf {vractivity_jar} -C {vractivity_classes_dir} ."
+    )
+    .run()
+    .unwrap();
     jars.push(vractivity_jar);
 
     let dex_dir = work_dir.join("dex");
@@ -536,7 +565,29 @@ fn add_android_vendor_runtime(sh: &Shell, apk_path: &Path, profile: Profile, key
 
     let package_dir = work_dir.join("package");
     let assets_dir = package_dir.join("assets");
+    let native_lib_dir = package_dir.join("lib/arm64-v8a");
     sh.create_dir(&assets_dir).unwrap();
+    sh.create_dir(&native_lib_dir).unwrap();
+    let mut native_lib_entries = Vec::new();
+    for (lib_path, file_name) in native_libs {
+        sh.copy_file(lib_path, native_lib_dir.join(&file_name))
+            .unwrap();
+        native_lib_entries.push(format!("lib/arm64-v8a/{file_name}"));
+    }
+    for required_lib in [
+        "libsxrapi.so",
+        "libashreader.so",
+        "libqiyivrsdkcore.so",
+        "libqiyuapi.so",
+    ] {
+        assert!(
+            native_lib_entries
+                .iter()
+                .any(|entry| entry.ends_with(required_lib)),
+            "QiYu SDK library {required_lib} was not found in its pinned AAR"
+        );
+    }
+    native_lib_entries.sort();
     sh.copy_file(dex_dir.join("classes.dex"), package_dir.join("classes.dex"))
         .unwrap();
     sh.copy_file(
@@ -547,15 +598,16 @@ fn add_android_vendor_runtime(sh: &Shell, apk_path: &Path, profile: Profile, key
 
     {
         let _push_guard = sh.push_dir(&package_dir);
+        let native_lib_entries_ref = &native_lib_entries;
         cmd!(
             sh,
-            "{aapt} remove {apk_path} classes.dex assets/qiyu_recenter.png"
+            "{aapt} remove {apk_path} classes.dex assets/qiyu_recenter.png {native_lib_entries_ref...}"
         )
         .run()
         .ok();
         cmd!(
             sh,
-            "{aapt} add {apk_path} classes.dex assets/qiyu_recenter.png"
+            "{aapt} add {apk_path} classes.dex assets/qiyu_recenter.png {native_lib_entries_ref...}"
         )
         .run()
         .unwrap();
@@ -592,13 +644,29 @@ fn add_android_vendor_runtime(sh: &Shell, apk_path: &Path, profile: Profile, key
             "android:launchMode=\"singleTask\" android:name=\"android.app.NativeActivity\" ",
             "android:screenOrientation=\"landscape\">"
         );
+        let native_activity_immersive_open = concat!(
+            "<activity android:configChanges=\"density|keyboard|keyboardHidden|navigation|",
+            "orientation|screenLayout|screenSize|uiMode\" android:exported=\"true\" ",
+            "android:launchMode=\"singleTask\" android:name=\"android.app.NativeActivity\" ",
+            "android:screenOrientation=\"landscape\" android:resizeableActivity=\"false\" ",
+            "android:theme=\"@android:style/Theme.Black.NoTitleBar.Fullscreen\">"
+        );
+        let native_activity_immersive_filter = concat!(
+            "<intent-filter>",
+            "<action android:name=\"android.intent.action.MAIN\"/>",
+            "<category android:name=\"com.oculus.intent.category.VR\"/>",
+            "<category android:name=\"com.yvr.intent.category.VR\"/>",
+            "<category android:name=\"org.khronos.openxr.intent.category.IMMERSIVE_HMD\"/>",
+            "</intent-filter>"
+        );
         // Insert a VRActivity launcher that mirrors the NativeActivity intent-filters, and demote
         // the NativeActivity so it no longer advertises itself as the launcher.
         let vractivity_block = concat!(
             "<activity android:configChanges=\"density|keyboard|keyboardHidden|navigation|",
             "orientation|screenLayout|screenSize|uiMode\" android:exported=\"true\" ",
             "android:launchMode=\"singleTask\" android:name=\"alvr.client.VRActivity\" ",
-            "android:screenOrientation=\"landscape\">",
+            "android:screenOrientation=\"landscape\" android:resizeableActivity=\"false\" ",
+            "android:theme=\"@android:style/Theme.Black.NoTitleBar.Fullscreen\">",
             "<intent-filter>",
             "<action android:name=\"android.intent.action.MAIN\"/>",
             "<category android:name=\"android.intent.category.LAUNCHER\"/>",
@@ -614,7 +682,8 @@ fn add_android_vendor_runtime(sh: &Shell, apk_path: &Path, profile: Profile, key
             "<activity android:configChanges=\"density|keyboard|keyboardHidden|navigation|",
             "orientation|screenLayout|screenSize|uiMode\" android:exported=\"true\" ",
             "android:launchMode=\"singleTask\" android:name=\"android.app.NativeActivity\" ",
-            "android:screenOrientation=\"landscape\">"
+            "android:screenOrientation=\"landscape\" android:resizeableActivity=\"false\" ",
+            "android:theme=\"@android:style/Theme.Black.NoTitleBar.Fullscreen\">"
         );
         assert!(
             manifest.contains(native_activity_open),
@@ -629,7 +698,7 @@ fn add_android_vendor_runtime(sh: &Shell, apk_path: &Path, profile: Profile, key
         // "start activity success", no process starts, and the session ends on a dark screen.
         // Strip the filters structurally rather than by matching the serialized text, which is
         // whitespace- and line-ending-sensitive (apktool writes CRLF).
-        let native_activity_start = manifest.rfind(native_activity_open).unwrap();
+        let native_activity_start = manifest.rfind(native_activity_immersive_open).unwrap();
         let native_activity_end = manifest[native_activity_start..]
             .find("</activity>")
             .map(|offset| native_activity_start + offset)
@@ -653,6 +722,7 @@ fn add_android_vendor_runtime(sh: &Shell, apk_path: &Path, profile: Profile, key
              {removed_filters}; apktool output changed"
         );
         stripped.push_str(rest);
+        stripped.push_str(native_activity_immersive_filter);
         let manifest = format!(
             "{}{stripped}{}",
             &manifest[..native_activity_start],

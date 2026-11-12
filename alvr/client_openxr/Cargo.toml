@@ -144,9 +144,8 @@ name = "com.oculus.intent.category.VR"
 value = "vr_only"
 [[package.metadata.android.application.meta_data]]
 name = "com.oculus.supportedDevices"
-# Note: value is changed for the Meta store, which requires an explicit list of platforms.
-# "all" is required to support Quest 1 which doesn't have newer platform names registered.
-value = "all"
+# Keep the legacy Quest identifier and advertise all current Meta VR devices.
+value = "quest|quest2|questpro|quest3|quest3s|vrglasses"
 [[package.metadata.android.application.meta_data]]
 name = "com.oculus.vr.focusaware"
 value = "true"
@@ -191,7 +190,7 @@ name = "wave.feature.eyetracking"
 required = false
 [[package.metadata.android.uses_feature]]
 name = "wave.feature.handtracking"
-required = true
+required = false
 [[package.metadata.android.uses_feature]]
 name = "wave.feature.lipexpression"
 required = false

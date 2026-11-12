@@ -463,6 +463,7 @@ dependencies = [
  "alvr_server_core",
  "alvr_server_io",
  "alvr_session",
+ "ash",
  "bincode 2.0.1",
  "bindgen 0.72.1",
  "cc",

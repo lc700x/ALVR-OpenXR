@@ -29,7 +29,9 @@ devices a change touches before making it.
 | EGL context | The runtime binds its own context on the render thread inside the swapchain calls | GL commands afterwards go to the wrong context unless rebound |
 | `eglMakeCurrent` from another thread | Fails with `EGL_BAD_ACCESS` | Treat as non-fatal, do not panic |
 | `xrGetReferenceSpaceBoundsRect` | Returns an error | Never `unwrap()` it |
-| Reference spaces | Only `LOCAL`, re-anchored to the head pose *each time a space is created* | Two spaces created at different moments face different directions |
+| Reference spaces | `LOCAL`, `STAGE` and `LOCAL_FLOOR` are all accepted, but a space is anchored to the head pose in effect *when it is created*, and `STAGE` only comes out floor-anchored if it is created after the session is running | Two spaces created at different moments face different directions; a `STAGE` created at setup behaves like `LOCAL` |
+| `xrLocateViews` | Ignores the reference space it is given and returns the head at that space's origin | The head never translates, whatever space is passed; the real pose has to come from a `VIEW` space relation |
+| Controller aim pose | Floor-referenced, in the same frame as a floor-anchored `STAGE` space | Correct once `STAGE` is used; against `LOCAL` it reads one eye height high |
 | `xrEndFrame` and the swapchain calls | Return non-success codes but keep working; the sample ignores them | Tolerate errors instead of panicking, but count them |
 | `ImageReader` | `maxImages` is 3, against a default of 10 | The decoder queue must be clamped or it dies with `MaxImagesAcquired` |
 | logd | Drops `info`/`warn` records while the vendor SDK floods the buffer | HVR diagnostics must be logged at `error` level |
@@ -107,6 +109,47 @@ event. `.ok().flatten()` — a missing playspace is already a supported state.
 - Per-hand subaction paths are required; a shared path reports both hands at the same pose.
 
 *`alvr/client_openxr/src/interaction.rs`*
+
+### 8. Controllers floated at head height — the wrong reference space, then a second bug under it
+
+The hands sat about 1.5 m above where they were held while the views were correct. Two runtime
+quirks stacked up, and the first fix only cancelled the symptom:
+
+- **ALVR asked for the wrong space.** It created `LOCAL` and pushed it down by `1.5 m` so the floor
+  would land under the user's feet, because HVR was believed to support only `LOCAL`. The runtime
+  accepts `STAGE` and `LOCAL_FLOOR` as well, and `STAGE` is floor-anchored with the real eye height
+  (`1.36-1.50 m`) and a real 6DoF head pose. Against `LOCAL` the aim pose — which is floor-referenced
+  — reads one eye height high, which is where the 1.5 m subtraction came from.
+- **`xrLocateViews` ignores the space.** It returns the head at the origin of whatever space it is
+  given, so even with `STAGE` the head stayed put and the hands kept sliding when the headset moved.
+  The pose has to come from `xrLocateSpace(VIEW, space)`, which returns the real floor-relative pose.
+
+Measured on device (ELS-AN00, HVRSDK 3.5.0.79) in the same frame, with `STAGE` as the app space:
+
+```
+views (xrLocateViews)      = (0.001, 1.399, 0.000)   <- only the space's origin
+related (VIEW -> STAGE)    = (0.000, 1.399, 0.000)   <- the real head pose
+left controller (aim)      = (-0.278, 0.952, -0.403) <- floor-referenced, same frame
+```
+
+Two further details, both measured:
+
+- A space is anchored to the head pose in effect **when it is created**. A `STAGE` created at session
+  setup comes out head-anchored (head y ~ 0); one created once the session is running comes out
+  floor-anchored. ALVR therefore creates it on the first running frame and installs it into the lobby
+  and the stream.
+- The controllers are rotation-stable: turning the head ~68 deg moved the aim pose 6 mm
+  (`(-0.288, 2.447, -0.308)` to `(-0.282, 2.451, -0.306)`), so nothing in the controller path needed
+  to change.
+
+The controller eye-height subtraction (`fix_hvr_controller_pose`) and a later head pin
+(`pin_hvr_head_views`) were both attempts to compensate for the wrong space. Both are gone: with
+`STAGE` and the `VIEW` relation the poses line up as they are, and this matches the official sample,
+which locates the `AimPose` action spaces in the app space and uses the result verbatim
+(`jni/xr_demo.cpp` 349-356 and 920-932; `xr_demo.h:174` binds `AimPose` to `aim/pose`, the path ALVR
+binds for HVR).
+
+*`alvr/client_openxr/src/interaction.rs`, `lobby.rs`, `stream.rs`, `lib.rs`*
 
 ## Still open
 

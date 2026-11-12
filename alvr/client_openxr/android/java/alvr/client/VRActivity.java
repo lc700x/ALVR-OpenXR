@@ -140,6 +140,10 @@ public class VRActivity extends Activity {
             Log.i(TAG, "Non-QiYu device, delegating to NativeActivity (OpenXR path).");
             Intent intent = new Intent();
             intent.setClassName(getPackageName(), "android.app.NativeActivity");
+            intent.setAction(Intent.ACTION_MAIN);
+            intent.addCategory("com.oculus.intent.category.VR");
+            intent.addCategory("com.yvr.intent.category.VR");
+            intent.addCategory("org.khronos.openxr.intent.category.IMMERSIVE_HMD");
             intent.addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION);
             startActivity(intent);
             finish();

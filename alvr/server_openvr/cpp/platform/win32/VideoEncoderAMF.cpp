@@ -97,7 +97,8 @@ void AMFPipeline::Run(bool hasQueryTimeout) {
 //
 
 VideoEncoderAMF::VideoEncoderAMF(std::shared_ptr<CD3DRender> d3dRender, int width, int height)
-    : m_d3dRender(d3dRender)
+    : m_pipeline(nullptr)
+    , m_d3dRender(d3dRender)
     , m_codec(Settings::Instance().m_codec)
     , m_refreshRate(Settings::Instance().m_refreshRate)
     , m_renderWidth(width)
@@ -706,14 +707,18 @@ void VideoEncoderAMF::Shutdown() {
     Debug("Shutting down VideoEncoderAMF.\n");
 
     delete m_pipeline;
+    m_pipeline = nullptr;
 
+    // AMF owns these objects; terminate them before releasing their smart-pointer references.
     for (auto& component : m_amfComponents) {
-        component->Release();
-        delete component;
+        component->Terminate();
     }
+    m_amfComponents.clear();
 
-    m_amfContext->Terminate();
-    m_amfContext = NULL;
+    if (m_amfContext) {
+        m_amfContext->Terminate();
+        m_amfContext = NULL;
+    }
 
     g_AMFFactory.Terminate();
 

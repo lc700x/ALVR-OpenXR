@@ -1,0 +1,119 @@
+QiYu 手柄之修，凡三步，皆因一根：**其手柄不走 OpenXR**
+
+**一、斷因**（`9054fcea`）
+
+日誌 `log_qiyu43/44` 證：QiYu 之 OpenXR 運行時僅激活 `khr/simple_controller`。薦以 Oculus Touch，其受而不用，兩手皆懸於 `<unknown>`，無輸入。查其文檔，手柄唯由 Native SDK 與 UnityXR 二途定義——OpenXR 無其 profile，亦無插件可啟。
+
+故不循 OpenXR，改自 `libqiyuapi.so` 直讀 `qiyu_GetControllerData`，而以 ALVR 早已協商之 Oculus Touch 按鍵 id 發布之。服務端無須新增 interaction profile。
+
+由是復得 simple_controller 所不能載者：面鍵、搖桿之軸與其按下、模擬握力、模擬扳機。震動同循此橋。而顯示、追蹤、手柄位姿，仍由 OpenXR 供之。
+
+**二、SIGSEGV**（`a1937b7f`）
+
+橋僅以 `dlopen` 抵 `qiyu_Init`，然 `QVR_Init` 解引用之全局變量，唯 `libqiyivrsdkcore` 之 `JNI_OnLoad` 能初始化，而 `dlopen` 不執 `JNI_OnLoad`——遂空指針而死。
+
+改以 `System.loadLibrary` 先載 SXR 諸庫，而後委於 OpenXR；諸庫有一未載，則橋不調 `qiyu_Init`。
+
+**三、模塊未初始**（`6853a478`）
+
+`qiyu_IsControllerInit` 恒偽，直至 `qiyu_Init` 既行。故橋自任其事，取 activity 與 JavaVM 於 `ndk_context`。手柄模塊或遲至，故「橋不可用」之報改為周期性，非僅一次。
+
+同時撤去 Android 輸入探測——捕獲既明，此手柄於 Android 輸入隊列一無所報。
+
+**其要**：`qiyu_Init` 之調用，須避與 OpenXR 運行時相爭。故橋不觸 `qiyu_StartVR`。若手柄模塊終未初始，則 poll 失敗而 OpenXR 之按鍵狀態不動——退而不壞。`[CTRL-BRIDGE]` 諸行可辨二者之何。
+
+碼在 interaction.rs 與 qiyu_backend.cpp。
+
+
+
+Java 橋接之細，凡四端。
+
+## 一、庫載之序（`VRActivity.onCreate`）
+
+```java
+boolean sxrLoaded = loadQiyuLibrary("qiyivrsdkcore");
+sxrLoaded &= loadQiyuLibrary("sxrapi");
+sxrLoaded &= loadQiyuLibrary("ashreader");
+sxrLoaded &= loadQiyuLibrary("qiyuapi");
+setSxrLibrariesLoadedNative(sxrLoaded);
+```
+
+**必以 `System.loadLibrary`，不可以 `dlopen`。**其別在：前者觸 `JNI_OnLoad`，後者不觸。`QVR_Init`（在 `libqiyivrsdkcore.so` 內）解引用之全局，唯 `JNI_OnLoad` 能立——故 `dlopen` 之後調 `qiyu_Init`，必空指針而死。
+
+序亦有定：core/base 諸庫在前，`qiyuapi` 依之，故在後。
+
+四庫有一不載，`sxrLoaded` 即偽，native 側遂棄 `qiyu_Init`（見下）。
+
+## 二、閘之所在
+
+Java 之布爾，經 `setSxrLibrariesLoadedNative` 傳至 native 側一原子變量：
+
+```cpp
+std::atomic_bool sxr_libraries_loaded = false;
+```
+
+橋於調 `qiyu_Init` 前必驗之：
+
+```cpp
+if (!sxr_libraries_loaded.load()) {
+    log(ANDROID_LOG_WARN,
+        "[CTRL-BRIDGE] SXR libraries not loaded through System.loadLibrary; skipping "
+        "qiyu_Init to avoid the QVR_Init null dereference");
+    return true;
+}
+```
+
+返 `true` 而非 `false`——庫既載而 `qiyu_Init` 未行，仍可讀狀態，唯手柄模塊或未初。退而不壞。
+
+## 三、載庫在委派之前
+
+此為關要。`onCreate` 之中，載庫在此段之**前**：
+
+```java
+if (!isQiyu()) {
+    Intent intent = new Intent();
+    intent.setClassName(getPackageName(), "android.app.NativeActivity");
+    startActivity(intent);
+    finish();
+    return;
+}
+```
+
+其故：`USE_SXR_ON_QIYU = false`，故 QiYu 今亦走 OpenXR 之路，即走委派。然 OpenXR 之路上，native 之手柄橋仍調 `qiyu_Init`。若載庫在委派之後，則永不執行，`QVR_Init` 復死於空指針。
+
+**故載庫必在委派之前，雖此路終不用 SXR 渲染。**
+
+## 四、線程與引用（native 側）
+
+`QVR_Init` 解引用**當前線程之 JNIEnv**，且**留存 activity 對象**。故橋須自任二事：
+
+```cpp
+if (vm != nullptr && vm->GetEnv(..., JNI_VERSION_1_6) == JNI_EDETACHED) {
+    JavaVMAttachArgs args{JNI_VERSION_1_6, "alvr_qiyu_controllers", nullptr};
+    vm->AttachCurrentThread(&jni_env, &args);
+}
+jobject activity_ref = static_cast<jobject>(activity);
+if (jni_env != nullptr && activity_ref != nullptr) {
+    activity_ref = jni_env->NewGlobalRef(activity_ref);   // 局部引用出帧即失效
+}
+```
+
+activity 與 JavaVM 取自 `ndk_context`。局部引用必轉全局——`QVR_Init` 留之，而局部引用出其帧即廢。
+
+## 五、SurfaceView 之陷（僅 SXR 路徑）
+
+雖今未用，記之以備：
+
+```java
+Surface newSurface = holder.getSurface();
+if (newSurface == mScreenSurface) {
+    Log.i(TAG, "surfaceChanged: same surface, skipping restart");
+    return;
+}
+```
+
+Android 於 `surfaceCreated` 之後必再發一 `surfaceChanged`，其 Surface 未變。若不辨而暫停復啟，則重入 `alvr_qiyu_start`，重建 SXR 上下文，殺方啟之渲染循環——黑屏。
+
+---
+
+**一言蔽之**：Java 側所司唯二——**以正序 `System.loadLibrary` 載四庫**，**告知 native 是否全載**。二者皆不可由 native 自為，因 `dlopen` 不觸 `JNI_OnLoad`。餘皆在 native。

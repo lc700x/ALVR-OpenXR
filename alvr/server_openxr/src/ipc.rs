@@ -10,6 +10,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     io::{self, Read, Write},
     net::TcpStream,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 pub const HOST_ADDR: &str = "127.0.0.1:9941";
@@ -81,8 +82,45 @@ pub fn send<T: Serialize>(stream: &mut TcpStream, message: &T) -> io::Result<()>
 }
 
 pub fn receive<T: DeserializeOwned>(stream: &mut TcpStream) -> io::Result<T> {
+    receive_with(|buffer| stream.read_exact(buffer))
+}
+
+/// Preserve partial frames across read timeouts while allowing a worker to stop.
+/// The stream must have a finite read timeout.
+pub fn receive_interruptible<T: DeserializeOwned>(
+    stream: &mut TcpStream,
+    stop: &AtomicBool,
+) -> io::Result<T> {
+    receive_with(|mut buffer| {
+        while !buffer.is_empty() {
+            if stop.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "IPC worker stopped",
+                ));
+            }
+            match stream.read(buffer) {
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(count) => buffer = &mut buffer[count..],
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    })
+}
+
+fn receive_with<T: DeserializeOwned>(
+    mut read_exact: impl FnMut(&mut [u8]) -> io::Result<()>,
+) -> io::Result<T> {
     let mut length = [0u8; 4];
-    stream.read_exact(&mut length)?;
+    read_exact(&mut length)?;
     let length = u32::from_le_bytes(length) as usize;
     if length > MAX_MESSAGE_SIZE {
         return Err(io::Error::new(
@@ -92,7 +130,7 @@ pub fn receive<T: DeserializeOwned>(stream: &mut TcpStream) -> io::Result<T> {
     }
 
     let mut payload = vec![0u8; length];
-    stream.read_exact(&mut payload)?;
+    read_exact(&mut payload)?;
     bincode::serde::decode_from_slice(&payload, bincode::config::standard())
         .map(|(message, _)| message)
         .map_err(io::Error::other)

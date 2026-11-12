@@ -942,7 +942,7 @@ extern "C" bool alvr_qiyu_initialize(void *activity, void *java_vm) {
     alvr_initialize_logging();
     // Build marker: lets a captured log prove which APK the device actually ran, so a missing
     // diagnostic can be told apart from a stale install.
-    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build54 %s %s", __DATE__, __TIME__);
+    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build55 %s %s", __DATE__, __TIME__);
     log(ANDROID_LOG_INFO, "init step 1: enter (activity=%p vm=%p)", activity, java_vm);
     state.java_vm = static_cast<JavaVM *>(java_vm);
 
@@ -1213,7 +1213,10 @@ struct ControllerBridge {
     decltype(&qiyu_GetControllerData) get_data = nullptr;
     decltype(&qiyu_StartControllerVibration) start_vibration = nullptr;
     decltype(&qiyu_StopControllerVibration) stop_vibration = nullptr;
+    JavaVM *java_vm = nullptr;
+    jobject activity_ref = nullptr;
     bool loaded = false;
+    bool init_attempted = false;
 };
 
 ControllerBridge bridge;
@@ -1238,38 +1241,42 @@ struct AlvrQiyuController {
 };
 
 extern "C" bool alvr_qiyu_controller_bridge_init(void *activity, void *java_vm) {
-    if (bridge.loaded) {
+    if (!bridge.loaded) {
+        // The OpenXR path never reaches alvr_qiyu_initialize, so repeat the build marker here to
+        // keep captures able to tell a stale install apart from a missing diagnostic.
+        log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build55 %s %s", __DATE__, __TIME__);
+        bridge.library = dlopen("libqiyuapi.so", RTLD_NOW | RTLD_LOCAL);
+        if (bridge.library == nullptr) {
+            log(ANDROID_LOG_WARN, "[CTRL-BRIDGE] cannot load libqiyuapi.so: %s", dlerror());
+            return false;
+        }
+        bridge.init = reinterpret_cast<decltype(bridge.init)>(dlsym(bridge.library, "qiyu_Init"));
+        bridge.is_initialized = reinterpret_cast<decltype(bridge.is_initialized)>(
+            dlsym(bridge.library, "qiyu_IsControllerInit"));
+        bridge.get_data = reinterpret_cast<decltype(bridge.get_data)>(
+            dlsym(bridge.library, "qiyu_GetControllerData"));
+        bridge.start_vibration = reinterpret_cast<decltype(bridge.start_vibration)>(
+            dlsym(bridge.library, "qiyu_StartControllerVibration"));
+        bridge.stop_vibration = reinterpret_cast<decltype(bridge.stop_vibration)>(
+            dlsym(bridge.library, "qiyu_StopControllerVibration"));
+        if (bridge.is_initialized == nullptr || bridge.get_data == nullptr) {
+            log(ANDROID_LOG_WARN, "[CTRL-BRIDGE] controller symbols missing");
+            dlclose(bridge.library);
+            bridge.library = nullptr;
+            return false;
+        }
+        bridge.loaded = true;
+        log(ANDROID_LOG_WARN, "[CTRL-BRIDGE] libqiyuapi.so loaded, controller_init=%d",
+            bridge.is_initialized() ? 1 : 0);
+    }
+
+    if (bridge.init_attempted) {
         return true;
     }
-    // The OpenXR path never reaches alvr_qiyu_initialize, so repeat the build marker here to keep
-    // captures able to tell a stale install apart from a missing diagnostic.
-    log(ANDROID_LOG_WARN, "[BUILD-ID] qiyu_backend build54 %s %s", __DATE__, __TIME__);
-    bridge.library = dlopen("libqiyuapi.so", RTLD_NOW | RTLD_LOCAL);
-    if (bridge.library == nullptr) {
-        log(ANDROID_LOG_WARN, "[CTRL-BRIDGE] cannot load libqiyuapi.so: %s", dlerror());
-        return false;
-    }
-    bridge.init = reinterpret_cast<decltype(bridge.init)>(dlsym(bridge.library, "qiyu_Init"));
-    bridge.is_initialized = reinterpret_cast<decltype(bridge.is_initialized)>(
-        dlsym(bridge.library, "qiyu_IsControllerInit"));
-    bridge.get_data = reinterpret_cast<decltype(bridge.get_data)>(
-        dlsym(bridge.library, "qiyu_GetControllerData"));
-    bridge.start_vibration = reinterpret_cast<decltype(bridge.start_vibration)>(
-        dlsym(bridge.library, "qiyu_StartControllerVibration"));
-    bridge.stop_vibration = reinterpret_cast<decltype(bridge.stop_vibration)>(
-        dlsym(bridge.library, "qiyu_StopControllerVibration"));
-    if (bridge.is_initialized == nullptr || bridge.get_data == nullptr) {
-        log(ANDROID_LOG_WARN, "[CTRL-BRIDGE] controller symbols missing");
-        dlclose(bridge.library);
-        bridge.library = nullptr;
-        return false;
-    }
-    bridge.loaded = true;
-    log(ANDROID_LOG_WARN, "[CTRL-BRIDGE] libqiyuapi.so loaded, controller_init=%d",
-        bridge.is_initialized() ? 1 : 0);
 
     if (bridge.init == nullptr) {
         log(ANDROID_LOG_WARN, "[CTRL-BRIDGE] qiyu_Init symbol missing");
+        bridge.init_attempted = true;
         return true;
     }
     if (!sxr_libraries_loaded.load()) {
@@ -1279,24 +1286,45 @@ extern "C" bool alvr_qiyu_controller_bridge_init(void *activity, void *java_vm) 
         return true;
     }
 
-    // QVR_Init dereferences the JNIEnv of the calling thread and keeps the activity object, so
-    // attach the thread and hand it a global reference, the same way the SXR path does.
+    // QVR_Init dereferences the JNIEnv of the calling thread and retains the Activity, so only
+    // call it with a valid environment and a strong global reference. Keep the thread attached
+    // because the SDK may retain its thread-local JNI state.
     auto *vm = static_cast<JavaVM *>(java_vm);
-    JNIEnv *jni_env = nullptr;
-    if (vm != nullptr && vm->GetEnv(reinterpret_cast<void **>(&jni_env), JNI_VERSION_1_6) ==
-                             JNI_EDETACHED) {
-        JavaVMAttachArgs args{JNI_VERSION_1_6, "alvr_qiyu_controllers", nullptr};
-        if (vm->AttachCurrentThread(&jni_env, &args) != JNI_OK) {
-            jni_env = nullptr;
-        }
-    }
-    jobject activity_ref = static_cast<jobject>(activity);
-    if (jni_env != nullptr && activity_ref != nullptr) {
-        activity_ref = jni_env->NewGlobalRef(activity_ref);
+    auto *local_activity = static_cast<jobject>(activity);
+    if (vm == nullptr || local_activity == nullptr) {
+        log(ANDROID_LOG_ERROR, "[CTRL-BRIDGE] missing Activity or JavaVM; skipping qiyu_Init");
+        return false;
     }
 
-    const bool init_ok = bridge.init(activity_ref, vm, qiyu_GraphicsApi::GA_OpenGLES,
-                                     qiyu_TrackingOriginMode::TM_Ground, false);
+    JNIEnv *jni_env = nullptr;
+    const jint env_status = vm->GetEnv(reinterpret_cast<void **>(&jni_env), JNI_VERSION_1_6);
+    if (env_status == JNI_EDETACHED) {
+        JavaVMAttachArgs args{JNI_VERSION_1_6, "alvr_qiyu_controllers", nullptr};
+        if (vm->AttachCurrentThread(&jni_env, &args) != JNI_OK) {
+            log(ANDROID_LOG_ERROR, "[CTRL-BRIDGE] failed to attach qiyu_Init thread to JVM");
+            return false;
+        }
+    } else if (env_status != JNI_OK) {
+        log(ANDROID_LOG_ERROR, "[CTRL-BRIDGE] JavaVM::GetEnv failed: %d", env_status);
+        return false;
+    }
+
+    if (jni_env == nullptr) {
+        log(ANDROID_LOG_ERROR, "[CTRL-BRIDGE] JavaVM returned a null JNIEnv");
+        return false;
+    }
+
+    bridge.activity_ref = jni_env->NewGlobalRef(local_activity);
+    if (bridge.activity_ref == nullptr) {
+        log(ANDROID_LOG_ERROR, "[CTRL-BRIDGE] failed to retain Activity global reference");
+        return false;
+    }
+    bridge.java_vm = vm;
+    bridge.init_attempted = true;
+
+    const bool init_ok = bridge.init(
+        bridge.activity_ref, bridge.java_vm, qiyu_GraphicsApi::GA_OpenGLES,
+        qiyu_TrackingOriginMode::TM_Ground, false);
     log(ANDROID_LOG_WARN, "[CTRL-BRIDGE] qiyu_Init=%d controller_init=%d", init_ok ? 1 : 0,
         bridge.is_initialized() ? 1 : 0);
     return true;

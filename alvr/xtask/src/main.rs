@@ -232,7 +232,9 @@ fn main() {
                 "build-streamer" => {
                     build::build_streamer(profile, gpl, None, false, profiling, keep_config)
                 }
-                "build-streamer-openxr" => build::build_streamer_openxr(profile, gpl, false),
+                "build-streamer-openxr" => {
+                    build::build_streamer_openxr(profile, gpl, false, keep_config)
+                }
                 "build-launcher" => build::build_launcher(profile, false),
                 "build-server-lib" => build::build_server_lib(profile, None, false),
                 "build-client" => build::build_android_client(profile),

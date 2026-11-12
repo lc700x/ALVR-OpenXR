@@ -33,38 +33,6 @@ fn main() {
         }
     }
 
-    // On each headset connection, make sure ALVR is still the active OpenXR
-    // runtime so the next OpenXR app launch loads our runtime. Another runtime
-    // (SteamVR, VDXR, Oculus) may have hijacked `ActiveRuntime` since startup.
-    // `--auto` is a silent no-op when already active and self-elevates only when
-    // a registry write is actually needed.
-    fn ensure_runtime_registered() {
-        use alvr_server_openxr::registration;
-        use std::os::windows::process::CommandExt;
-
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-        let dll_path = registration::default_dll_path();
-        if registration::is_active(&dll_path) {
-            return;
-        }
-
-        if let Some(register_exe) = std::env::current_exe()
-            .ok()
-            .and_then(|path| {
-                path.parent()
-                    .map(|dir| dir.join("alvr_openxr_register.exe"))
-            })
-            .filter(|path| path.exists())
-        {
-            std::process::Command::new(register_exe)
-                .arg("--auto")
-                .creation_flags(CREATE_NO_WINDOW)
-                .spawn()
-                .ok();
-        }
-    }
-
     if let Some(parent_pid) = std::env::args()
         .skip_while(|arg| arg != "--parent")
         .nth(1)
@@ -105,7 +73,6 @@ fn main() {
             while let Ok(event) = events.recv() {
                 match event {
                     ServerCoreEvent::ClientConnected => {
-                        ensure_runtime_registered();
                         snapshot.lock().connected = true;
                         send(&writer, &HostEvent::ClientConnected);
                     }
@@ -167,10 +134,9 @@ fn main() {
                         send(&writer, &HostEvent::Buttons(entries))
                     }
                     ServerCoreEvent::PlayspaceSync(_) => {
-                        // Long-press Home / guardian recenter: tell the runtime to
-                        // emit an OpenXR reference-space-change event so the app
-                        // re-seats to the current head gaze.
-                        send(&writer, &HostEvent::Recenter);
+                        // This event carries client boundary dimensions, not a recenter request.
+                        // Echoing it as Recenter makes clients that resend bounds on
+                        // reference-space changes repeatedly reposition OpenXR apps.
                     }
                     _ => {}
                 }

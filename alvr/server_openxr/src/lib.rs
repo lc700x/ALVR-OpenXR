@@ -63,3 +63,20 @@ pub extern "C" fn alvr_openxr_unregister_runtime() -> i32 {
         Err(_) => -1,
     }
 }
+
+#[cfg(all(test, windows))]
+mod tests {
+    unsafe extern "C" {
+        fn alvr_openxr_test_compositor(adapter_index: u32) -> bool;
+    }
+
+    #[test]
+    #[ignore = "requires a Windows D3D11 adapter; run with --ignored --test-threads=1"]
+    fn d3d11_compositor_gpu_regression() {
+        crate::encoder_ffi::initialize_callbacks();
+        let adapter_index = crate::streaming::selected_adapter_index();
+
+        // # Safety: the native helper serializes access to its owned D3D11 resources.
+        assert!(unsafe { alvr_openxr_test_compositor(adapter_index) });
+    }
+}

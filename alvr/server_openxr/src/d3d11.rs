@@ -8,8 +8,8 @@
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_RESOURCE_MISC_SHARED, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT,
+    D3D11_RESOURCE_MISC_SHARED, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
+    D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::IDXGIResource;
@@ -25,11 +25,15 @@ pub const SWAPCHAIN_IMAGE_COUNT: usize = 3;
 /// `DXGI_ERROR_NOT_FOUND` if the runtime reports a zero LUID, so we must return
 /// a real one.
 pub fn default_adapter_luid() -> Option<(u32, i32)> {
+    adapter_luid(crate::streaming::selected_adapter_index())
+}
+
+pub fn adapter_luid(index: u32) -> Option<(u32, i32)> {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
 
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-        let adapter = factory.EnumAdapters(0).ok()?;
+        let adapter = factory.EnumAdapters(index).ok()?;
         let desc = adapter.GetDesc().ok()?;
         Some((desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart))
     }
@@ -42,16 +46,20 @@ pub fn default_adapter_luid() -> Option<(u32, i32)> {
 /// Calls into D3D11; no external invariants, but returns a leaked COM ref that
 /// lives for the process (single device).
 pub unsafe fn create_device() -> Result<usize, windows::core::Error> {
-    use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
+    use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0};
     use windows::Win32::Graphics::Direct3D11::{
         D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
     };
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
 
+    let adapter_index = crate::streaming::selected_adapter_index();
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
+    let adapter = unsafe { factory.EnumAdapters(adapter_index)? };
     let mut device: Option<ID3D11Device> = None;
     unsafe {
         D3D11CreateDevice(
-            None,
-            D3D_DRIVER_TYPE_HARDWARE,
+            Some(&adapter),
+            D3D_DRIVER_TYPE_UNKNOWN,
             windows::Win32::Foundation::HMODULE::default(),
             D3D11_CREATE_DEVICE_BGRA_SUPPORT,
             Some(&[D3D_FEATURE_LEVEL_11_0]),
@@ -63,6 +71,16 @@ pub unsafe fn create_device() -> Result<usize, windows::core::Error> {
     };
     let device = device.ok_or_else(windows::core::Error::from_thread)?;
     Ok(device.into_raw() as usize)
+}
+
+/// Release a D3D11 device created by [`create_device`].
+///
+/// # Safety
+/// `device_ptr` must be an owned reference returned by `create_device`.
+pub unsafe fn release_device(device_ptr: usize) {
+    if device_ptr != 0 {
+        unsafe { drop(ID3D11Device::from_raw(device_ptr as *mut _)) };
+    }
 }
 
 /// Create `SWAPCHAIN_IMAGE_COUNT` textures on the app's device.
@@ -81,7 +99,18 @@ pub unsafe fn create_swapchain_textures(
     array_size: u32,
     sample_count: u32,
 ) -> Result<Vec<usize>, windows::core::Error> {
-    unsafe { create_swapchain_textures_impl(device_ptr, format, width, height, array_size, sample_count, false) }
+    unsafe {
+        create_swapchain_textures_impl(
+            device_ptr,
+            format,
+            width,
+            height,
+            array_size,
+            sample_count,
+            false,
+            (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+        )
+    }
 }
 
 /// Like [`create_swapchain_textures`] but creates the textures with
@@ -99,8 +128,20 @@ pub unsafe fn create_swapchain_textures_nt(
     height: u32,
     array_size: u32,
     sample_count: u32,
+    bind_flags: u32,
 ) -> Result<Vec<usize>, windows::core::Error> {
-    unsafe { create_swapchain_textures_impl(device_ptr, format, width, height, array_size, sample_count, true) }
+    unsafe {
+        create_swapchain_textures_impl(
+            device_ptr,
+            format,
+            width,
+            height,
+            array_size,
+            sample_count,
+            true,
+            bind_flags,
+        )
+    }
 }
 
 unsafe fn create_swapchain_textures_impl(
@@ -111,6 +152,7 @@ unsafe fn create_swapchain_textures_impl(
     array_size: u32,
     sample_count: u32,
     nt_handle: bool,
+    bind_flags: u32,
 ) -> Result<Vec<usize>, windows::core::Error> {
     // # Safety: caller guarantees a valid device pointer; we borrow without
     // taking ownership.
@@ -119,10 +161,7 @@ unsafe fn create_swapchain_textures_impl(
         .ok_or_else(windows::core::Error::from_thread)?;
 
     let misc_flags = if nt_handle {
-        // NT-shared (CreateSharedHandle) — the form Vulkan external-memory
-        // import accepts on AMD/Intel. NVIDIA rejects it at vkBindImageMemory,
-        // so the Vulkan path falls back to a CPU copy there (universal).
-        D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 | D3D11_RESOURCE_MISC_SHARED.0
+        D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0
     } else {
         D3D11_RESOURCE_MISC_SHARED.0
     };
@@ -138,7 +177,7 @@ unsafe fn create_swapchain_textures_impl(
             Quality: 0,
         },
         Usage: D3D11_USAGE_DEFAULT,
-        BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+        BindFlags: bind_flags,
         CPUAccessFlags: 0,
         // Shared so the encoder's separate D3D11 device can open these textures
         // by handle (ALVR's cross-device design).
@@ -212,6 +251,27 @@ pub unsafe fn release_textures(textures: &[usize]) {
     }
 }
 
+/// Wait until Vulkan and the encoder have both returned key 0 before tearing
+/// down a keyed shared texture.
+///
+/// # Safety
+/// `texture_ptr` must be a live D3D11 texture with a keyed mutex.
+pub unsafe fn synchronize_keyed_texture(texture_ptr: usize) -> bool {
+    use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
+
+    let texture_raw = texture_ptr as *mut _;
+    let Some(texture) = (unsafe { ID3D11Texture2D::from_raw_borrowed(&texture_raw) }) else {
+        return false;
+    };
+    let Ok(keyed_mutex) = texture.cast::<IDXGIKeyedMutex>() else {
+        return false;
+    };
+    if unsafe { keyed_mutex.AcquireSync(0, u32::MAX) }.is_err() {
+        return false;
+    }
+    unsafe { keyed_mutex.ReleaseSync(0) }.is_ok()
+}
+
 /// Submit pending commands on the app-provided D3D11 device before another
 /// device opens and reads its shared swapchain texture.
 ///
@@ -240,12 +300,18 @@ pub unsafe fn shared_handle(texture_ptr: usize) -> Option<usize> {
     Some(handle.0 as usize)
 }
 
-/// Upload CPU-side RGBA8 pixels into a D3D11 texture via the device's immediate
-/// context (used by the universal OpenGL CPU-copy fallback).
+/// Upload RGBA8 pixels into a selected array layer of a D3D11 texture.
 ///
 /// # Safety
-/// `device_ptr`/`texture_ptr` valid; `data` at least `width*height*4` bytes.
-pub unsafe fn update_texture_rgba(device_ptr: usize, texture_ptr: usize, width: u32, data: &[u8]) {
+/// `device_ptr`/`texture_ptr` valid; `data` at least `width*height*4` bytes and
+/// `array_slice` is within the texture's array size.
+pub unsafe fn update_texture_rgba_layer(
+    device_ptr: usize,
+    texture_ptr: usize,
+    width: u32,
+    array_slice: u32,
+    data: &[u8],
+) {
     let device_raw = device_ptr as *mut _;
     let Some(device) = (unsafe { ID3D11Device::from_raw_borrowed(&device_raw) }) else {
         return;
@@ -265,6 +331,13 @@ pub unsafe fn update_texture_rgba(device_ptr: usize, texture_ptr: usize, width: 
     };
     let row_pitch = width * 4;
     unsafe {
-        context.UpdateSubresource(&resource, 0, None, data.as_ptr().cast(), row_pitch, 0);
+        context.UpdateSubresource(
+            &resource,
+            array_slice,
+            None,
+            data.as_ptr().cast(),
+            row_pitch,
+            0,
+        );
     }
 }
