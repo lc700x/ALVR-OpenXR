@@ -606,15 +606,19 @@ impl StreamContext {
         };
 
         // Huawei's xrLocateViews ignores the requested reference space; the VIEW space relation
-        // carries the real floor-relative pose.
+        // carries the real floor-relative pose. Shift the eyes by the difference so their
+        // separation survives.
         let mut current_headset_views = current_headset_views;
         if self.platform == Platform::Hvr {
             if let Ok((location, _)) = self
                 .view_reference_space
                 .relate(&self.stage_reference_space, xr_vsync_time)
             {
+                let delta = crate::from_xr_vec3(location.pose.position)
+                    - crate::from_xr_vec3(current_headset_views[0].pose.position);
                 for view in &mut current_headset_views {
-                    view.pose = location.pose;
+                    view.pose.position =
+                        crate::to_xr_vec3(crate::from_xr_vec3(view.pose.position) + delta);
                 }
             }
         }

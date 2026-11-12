@@ -1191,12 +1191,15 @@ pub fn get_head_data(
     }
 
     // Huawei's xrLocateViews ignores the requested reference space and returns the head at the
-    // origin, while the VIEW space relation carries the real floor-relative pose. Use that pose for
-    // the eyes so the reported view offsets match the head.
+    // origin, while the VIEW space relation carries the real floor-relative pose. Shift the eyes by
+    // the difference instead of overwriting them, so their separation (IPD) survives.
     let mut views = views;
     if platform == Platform::Hvr {
+        let delta = crate::from_xr_vec3(head_location.pose.position)
+            - crate::from_xr_vec3(views[0].pose.position);
         for view in &mut views {
-            view.pose = head_location.pose;
+            view.pose.position =
+                crate::to_xr_vec3(crate::from_xr_vec3(view.pose.position) + delta);
         }
     }
 
@@ -1256,7 +1259,13 @@ pub fn get_head_data(
         .distance(last_view_params[1].pose.position);
     let current_ipd_m = crate::from_xr_vec3(views[1].pose.position)
         .distance(crate::from_xr_vec3(views[0].pose.position));
-    let view_params = if f32::abs(current_ipd_m - last_ipd_m) > IPD_CHANGE_EPS {
+    // HVR reports both eyes at the same point (mono panel) and its view poses are corrected by the
+    // head delta above, so the IPD never changes and the server would never receive the eye offsets
+    // or the FOVs. It then projects with degenerate values (measured: a view pose of
+    // `(-5.7e20, 1.33, 5.2e19)`), which renders the whole layer black. Send them every frame on HVR.
+    let view_params = if platform == Platform::Hvr
+        || f32::abs(current_ipd_m - last_ipd_m) > IPD_CHANGE_EPS
+    {
         Some([
             ViewParams {
                 pose: motion.pose.inverse() * crate::from_xr_pose(views[0].pose),

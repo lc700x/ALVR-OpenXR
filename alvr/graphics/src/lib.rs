@@ -20,6 +20,11 @@ use wgpu::{
 
 pub const SDR_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
 pub const SDR_FORMAT_GL: u32 = gl::RGBA8;
+
+/// Whether a swapchain format stores sRGB-encoded values (so the hardware converts on write).
+pub fn gl_format_is_srgb(format: u32) -> bool {
+    format == gl::SRGB8_ALPHA8
+}
 pub const GL_TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
 pub const MAX_PUSH_CONSTANTS_SIZE: u32 = 128;
 

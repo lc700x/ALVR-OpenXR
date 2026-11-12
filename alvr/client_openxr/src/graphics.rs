@@ -130,7 +130,7 @@ pub fn create_swapchain(
 
     if is_hvr {
         if let Ok(formats) = session.enumerate_swapchain_formats() {
-            alvr_common::info!(
+            alvr_common::error!(
                 "[HVR-DIAG] create_swapchain: requested format {format:#x} ({}x{}); \
                  runtime-supported formats: {formats:x?}",
                 resolution.x,
