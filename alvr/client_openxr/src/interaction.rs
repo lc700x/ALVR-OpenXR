@@ -1144,24 +1144,13 @@ pub fn get_reference_space(
         .unwrap()
 }
 
-// Huawei VR only exposes a LOCAL reference space, whose origin sits at the headset's initial
-// (eye-level) pose rather than the floor. ALVR's lobby and world assume a floor-level origin
-// (STAGE / LOCAL_FLOOR semantics), so without compensation the ground is drawn at eye height.
-// Push the origin down by an average standing eye height so the floor lands under the user's feet.
-const HVR_EYE_HEIGHT_METERS: f32 = 1.5;
-
+// Huawei's runtime supports STAGE, which is floor-anchored and carries the head's 6DoF pose (the
+// eye reads its real 1.46-1.50 m height and translates with the headset). LOCAL is anchored at the
+// head, so the head never translates there — that is what made the hands look attached to the
+// headset. Use STAGE and take the poses as they come.
 pub fn get_hvr_floor_reference_space(xr_session: &xr::Session<xr::OpenGlEs>) -> xr::Space {
-    let floor_pose = xr::Posef {
-        orientation: xr::Quaternionf::IDENTITY,
-        position: xr::Vector3f {
-            x: 0.0,
-            y: -HVR_EYE_HEIGHT_METERS,
-            z: 0.0,
-        },
-    };
-
     xr_session
-        .create_reference_space(xr::ReferenceSpaceType::LOCAL, floor_pose)
+        .create_reference_space(xr::ReferenceSpaceType::STAGE, xr::Posef::IDENTITY)
         .unwrap()
 }
 
@@ -1199,6 +1188,16 @@ pub fn get_head_data(
         || !view_flags.contains(xr::ViewStateFlags::ORIENTATION_VALID)
     {
         return None;
+    }
+
+    // Huawei's xrLocateViews ignores the requested reference space and returns the head at the
+    // origin, while the VIEW space relation carries the real floor-relative pose. Use that pose for
+    // the eyes so the reported view offsets match the head.
+    let mut views = views;
+    if platform == Platform::Hvr {
+        for view in &mut views {
+            view.pose = head_location.pose;
+        }
     }
 
     let mut motion = DeviceMotion {

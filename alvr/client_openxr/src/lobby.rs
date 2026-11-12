@@ -18,12 +18,12 @@ pub struct Lobby {
     platform: Platform,
     reference_space: Arc<xr::Space>,
     hvr_reference_space: Option<Arc<xr::Space>>,
+    hvr_view_space: Option<xr::Space>,
     hvr_swapchains_primed: bool,
     swapchains: [xr::Swapchain<xr::OpenGlEs>; 2],
     view_resolution: UVec2,
     reference_space_type: xr::ReferenceSpaceType,
     next_hvr_pose_log: Duration,
-    hvr_controller_y_calibrations: [Option<(f32, f32)>; 2],
     renderer: LobbyRenderer,
 }
 
@@ -101,18 +101,29 @@ impl Lobby {
             platform,
             reference_space,
             hvr_reference_space,
+            hvr_view_space: None,
             hvr_swapchains_primed: false,
             swapchains,
             view_resolution,
             reference_space_type,
             next_hvr_pose_log: Duration::ZERO,
-            hvr_controller_y_calibrations: [None, None],
             renderer,
         }
     }
 
-    pub fn update_reference_space(&mut self) {
-        // Recreating the Huawei space would re-anchor it to the current head pose and desync it
+    /// Huawei only produces a floor-anchored STAGE space once the session is running, so the space
+    /// is created on the first running frame and installed here.
+    pub fn set_hvr_reference_space(&mut self, space: Arc<xr::Space>) {
+        self.reference_space_type = xr::ReferenceSpaceType::STAGE;
+        self.reference_space = Arc::clone(&space);
+        self.hvr_view_space = Some(interaction::get_reference_space(
+            &self.xr_session,
+            xr::ReferenceSpaceType::VIEW,
+        ));
+        self.hvr_reference_space = Some(space);
+    }
+
+    pub fn update_reference_space(&mut self) {        // Recreating the Huawei space would re-anchor it to the current head pose and desync it
         // from the stream, which shares the same space.
         if self.hvr_reference_space.is_some() {
             return;
@@ -144,11 +155,21 @@ impl Lobby {
             )
             .unwrap();
 
-        let views = if flags.contains(xr::ViewStateFlags::ORIENTATION_VALID) {
+        let mut views = if flags.contains(xr::ViewStateFlags::ORIENTATION_VALID) {
             maybe_views
         } else {
             vec![crate::default_view(), crate::default_view()]
         };
+
+        // Huawei's xrLocateViews ignores the requested reference space and returns the head at the
+        // origin; the VIEW space relation carries the real floor-relative pose.
+        if let Some(view_space) = &self.hvr_view_space {
+            if let Ok((location, _)) = view_space.relate(&self.reference_space, xr_vsync_time) {
+                for view in &mut views {
+                    view.pose = location.pose;
+                }
+            }
+        }
 
         self.xr_session
             .sync_actions(&[(&self.interaction_ctx.read().action_set).into()])
@@ -176,37 +197,6 @@ impl Lobby {
             &mut Pose::default(),
             &mut Pose::default(),
         );
-
-        if self.platform == Platform::Hvr {
-            let head_y = (views[0].pose.position.y + views[1].pose.position.y) * 0.5;
-            for (calibration, (hand_name, hand_data)) in
-                self.hvr_controller_y_calibrations.iter_mut().zip([
-                    ("left", &mut left_hand_data),
-                    ("right", &mut right_hand_data),
-                ])
-            {
-                if let Some(motion) = &mut hand_data.0 {
-                    let raw_controller_y = motion.pose.position.y;
-                    let newly_calibrated = calibration.is_none();
-                    let (initial_head_y, initial_controller_y) =
-                        *calibration.get_or_insert((head_y, raw_controller_y));
-                    motion.pose.position.y = crate::stream::hvr_corrected_controller_y(
-                        initial_head_y,
-                        initial_controller_y,
-                        raw_controller_y,
-                    );
-
-                    if newly_calibrated {
-                        alvr_common::info!(
-                            "[HVR-DIAG] reflected lobby {hand_name} controller height: \
-                             head_y={initial_head_y:.3}, raw_y={initial_controller_y:.3}, \
-                             corrected_y={:.3}",
-                            motion.pose.position.y
-                        );
-                    }
-                }
-            }
-        }
 
         if self.platform == Platform::Hvr && vsync_time >= self.next_hvr_pose_log {
             alvr_common::info!(

@@ -67,12 +67,10 @@ fn supports_alpha_blend(xr_instance: &xr::Instance, xr_system: xr::SystemId) -> 
     }
 }
 
-fn tracking_reference_space_type(platform: Platform) -> xr::ReferenceSpaceType {
-    if platform == Platform::Hvr {
-        xr::ReferenceSpaceType::LOCAL
-    } else {
-        xr::ReferenceSpaceType::STAGE
-    }
+fn tracking_reference_space_type(_platform: Platform) -> xr::ReferenceSpaceType {
+    // Huawei supports STAGE and it carries the head's 6DoF pose; its LOCAL space is anchored at the
+    // head and hides the translation. Every other platform uses STAGE as well.
+    xr::ReferenceSpaceType::STAGE
 }
 
 #[cfg(test)]
@@ -99,7 +97,7 @@ mod tests {
         );
         assert_eq!(
             tracking_reference_space_type(Platform::Hvr),
-            xr::ReferenceSpaceType::LOCAL
+            xr::ReferenceSpaceType::STAGE
         );
         assert_eq!(
             environment_blend_mode(Platform::Quest2),
@@ -422,14 +420,11 @@ pub fn entry_point() {
         let mut session_running = false;
         let mut passthrough_layer = None;
 
-        // Huawei re-anchors LOCAL to the current head pose every time the space is created, so a
-        // space created when streaming starts points wherever the user happened to be looking.
-        // HVRSDK_XrDemo creates its LOCAL space once at session setup and reuses it; do the same
-        // and hand the one space to both the lobby and the stream so they share an origin.
-        let hvr_reference_space = (platform == Platform::Hvr).then(|| {
-            Arc::new(interaction::get_hvr_floor_reference_space(&xr_session))
-        });
-
+        // Huawei anchors a reference space to the head pose in effect when it is created, and only
+        // produces a floor-anchored STAGE space once the session is actually running. Create it
+        // lazily on the first running frame (below) and hand the one space to both the lobby and the
+        // stream so they share an origin.
+        let mut hvr_reference_space: Option<Arc<xr::Space>> = None;
         let mut lobby = Lobby::new(
             xr_session.clone(),
             Rc::clone(&graphics_context),
@@ -558,6 +553,12 @@ pub fn entry_point() {
             if !session_running {
                 thread::sleep(Duration::from_millis(100));
                 continue;
+            }
+
+            if is_hvr && hvr_reference_space.is_none() {
+                let space = Arc::new(interaction::get_hvr_floor_reference_space(&xr_session));
+                hvr_reference_space = Some(Arc::clone(&space));
+                lobby.set_hvr_reference_space(space);
             }
 
             while let Some(event) = core_context.poll_event() {
