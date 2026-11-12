@@ -143,6 +143,27 @@ Releases: `v1.0.2` (source only) and `v1.0.3` (source + client APK) on
 
 ## 8. Debugging playbook
 
+## 9. Update history
+
+**2026-11-13 — upstream v20.14.1 applied** (`c2c76bee`). Ported from `alvr-org/ALVR` tag `v20.14.1`
+(`a9f6542f`) as a patch on top of the fork, not a git merge: upstream history is unrelated to this
+branch and the object store is shallow, so there is no merge base to use.
+
+- Files: dashboard settings + presets, audio (`lib.rs`, `windows.rs`), events, packets,
+  `server_core/web_server.rs`, `server_io`, `session/settings.rs`, installation guide, `Cargo.lock`,
+  CI workflows. 16 files, +119/−216.
+- The update touches **neither `client_openxr` nor `server_openxr`**, so the QiYu and HVR client
+  paths and the OpenXR/Vulkan server work are untouched by it.
+- `Cargo.toml` was deliberately excluded: upstream bumps the version to 20.14.1, this fork stays
+  pinned at **20.14.0** per `AGENTS.md`. If a future upstream patch is ported the same way, keep
+  the same exclusion or the pin silently moves.
+- The dirty worktree was checkpointed first (`wip: checkpoint before the v20.14.1 update`), so the
+  port could be applied and reviewed on its own commit.
+- `alvr_code/ALVR-OpenXR` is a nested checkout and must not be tracked. It is excluded via
+  `.git/info/exclude`; `git add -A` will otherwise re-add it as an embedded repository.
+
+
+
 - Capture the client's own process only — the vendor SLAM/camera logs overflow the ring buffer in
   seconds: `adb logcat --pid=$(adb shell pidof alvr.client.stable)`.
 - `logcat TAG:S '*:V'` does not filter (the trailing `*:V` wins); use `--pid` or `-s`.
