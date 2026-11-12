@@ -32,7 +32,32 @@ symptoms below come from that, not from ALVR's renderer.
 | Stream swapchain format | Plain `RGBA8`, not sRGB | sRGB linearisation must be disabled for it |
 | `logd` | Drops `info`/`warn` while the vendor SDK floods the buffer | HVR diagnostics must be logged at `error` level |
 
-## 3. Changes
+## 3. Divergence from upstream ALVR
+
+Checked against `alvr-org/ALVR` tag `v20.14.0` (commit `d7921382`):
+
+- Upstream has **no HVR platform at all** — zero occurrences of `Platform::Hvr`, no Huawei
+  interaction profile, no HVR reference-space handling. Everything in §4 that is gated on
+  `Platform::Hvr` is fork-only code, not a modification of upstream logic.
+- Upstream `client_openxr/src/interaction.rs` is 1181 lines; this fork's is ~1500 before the HVR
+  additions, because the fork also carries the QiYu path.
+- This fork's own `main` already contains HVR code, so it is not a clean upstream baseline either;
+  use the upstream tag if a three-way comparison is ever needed.
+
+The changes that touch code paths shared with other headsets, and why they are inert for them:
+
+| Change | Shared-path effect |
+|---|---|
+| `get_hand_data` gained `head_pose` and `is_left_hand` | Signature change only; the 3DoF seeding it enables is gated on `Platform::Hvr` |
+| View parameters sent every frame | Condition is `platform == Hvr \|\| eye separation changed`, so other platforms keep the old behaviour |
+| sRGB correction gated on the swapchain format | New `gl_format_is_srgb` helper; the HVR clause is additive, other platforms keep their previous setting |
+| `request_display_refresh_rate` no longer unwrapped | Generic robustness; success path identical |
+| Degenerate view-params guard (client and server) | Generic, fires only on non-finite or absurd values |
+| `tracking_reference_space_type` returns `STAGE` for every platform | Only HVR changed (it used `LOCAL`); other platforms already returned `STAGE` |
+
+
+
+## 4. Changes
 
 ### Tracking (`4b51a25d`)
 - HVR uses `STAGE` instead of `LOCAL` shifted down 1.5 m. The space is created on the first
@@ -65,7 +90,7 @@ symptoms below come from that, not from ALVR's renderer.
 - `70640cf0`: a refused display refresh rate no longer panics the client (72 Hz on a 90 Hz panel
   used to kill it).
 
-## 4. Verification
+## 5. Verification
 
 Measured on device, same frame, `STAGE` as the app space:
 
@@ -83,7 +108,7 @@ left aim pose           = (-0.278, 0.952, -0.403) <- floor-referenced, same fram
 - Client tests: `cargo test -p alvr_client_openxr --lib` → 7 passed.
 - Server: `cargo check -p alvr_server_openxr` (needs `LIBCLANG_PATH` set to the NDK's `libclang.dll`).
 
-## 5. Build, install, release
+## 6. Build, install, release
 
 ```powershell
 $env:ANDROID_NDK_HOME="C:\Users\<user>\AppData\Local\Android\Sdk\ndk\29.0.14206865"
@@ -102,7 +127,7 @@ adb -s <ip>:5555 shell am start -a com.huawei.android.vr.action.MAIN -n alvr.cli
 Releases: `v1.0.2` (source only) and `v1.0.3` (source + client APK) on
 `https://github.com/lc700x/ALVR-OpenXR`, branch `qiyu-vractivity-wip`.
 
-## 6. Known limits and next steps
+## 7. Known limits and next steps
 
 - **Client frame rate**: the loop runs at roughly 30–40 fps against a 90 Hz panel. It is decode- or
   swapchain-bound on the phone; not yet profiled. The `hvr_wait_image` path waits with an infinite
@@ -116,7 +141,7 @@ Releases: `v1.0.2` (source only) and `v1.0.3` (source + client APK) on
   `StreamingStopped`; observed to stay black once, not yet captured.
 - **Stopping the streamer**: the client keeps the last stream state until the server disconnects.
 
-## 7. Debugging playbook
+## 8. Debugging playbook
 
 - Capture the client's own process only — the vendor SLAM/camera logs overflow the ring buffer in
   seconds: `adb logcat --pid=$(adb shell pidof alvr.client.stable)`.
