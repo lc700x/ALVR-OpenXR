@@ -185,6 +185,8 @@ impl Lobby {
             &self.interaction_ctx.read().hands_interaction[0],
             &mut Pose::default(),
             &mut Pose::default(),
+            &crate::from_xr_pose(views[0].pose),
+            true,
         );
         let mut right_hand_data = interaction::get_hand_data(
             &self.xr_session,
@@ -195,6 +197,8 @@ impl Lobby {
             &self.interaction_ctx.read().hands_interaction[1],
             &mut Pose::default(),
             &mut Pose::default(),
+            &crate::from_xr_pose(views[0].pose),
+            false,
         );
 
         if self.platform == Platform::Hvr && vsync_time >= self.next_hvr_pose_log {

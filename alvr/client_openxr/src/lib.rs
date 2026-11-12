@@ -226,7 +226,9 @@ pub fn entry_point() {
         | Platform::Pico4Pro
         | Platform::Pico4Enterprise => "_pico_old",
         p if p.is_yvr() => "_yvr",
-        Platform::Lynx => "_lynx",
+        // The checkout does not package a Lynx-specific loader; use the standard Android
+        // loader so it can discover the active runtime through the Khronos runtime broker.
+        Platform::Lynx => "",
         Platform::Hvr => "_hvr",
         // QiYu SDK v1 is SXR, not an OpenXR loader. Newer firmware can expose
         // the Android generic OpenXR loader; native SXR libraries are packaged
@@ -272,6 +274,10 @@ pub fn entry_point() {
     exts.fb_foveation_configuration = available_extensions.fb_foveation_configuration;
     exts.fb_passthrough = available_extensions.fb_passthrough;
     exts.fb_swapchain_update_state = available_extensions.fb_swapchain_update_state;
+    if platform.is_quest() {
+        exts.fb_touch_controller_pro = available_extensions.fb_touch_controller_pro;
+        exts.meta_touch_controller_plus = available_extensions.meta_touch_controller_plus;
+    }
     exts.htc_facial_tracking = available_extensions.htc_facial_tracking;
     exts.htc_passthrough = available_extensions.htc_passthrough;
     exts.htc_vive_focus3_controller_interaction =
@@ -391,9 +397,12 @@ pub fn entry_point() {
         let capabilities = ClientCapabilities {
             default_view_resolution,
             refresh_rates,
-            foveated_encoding: platform != Platform::Unknown,
-            encoder_high_profile: platform != Platform::Unknown,
-            encoder_10_bits: platform != Platform::Unknown,
+            // HVR decodes on the phone and is the throughput limit here: 10-bit HEVC, high profile
+            // and foveated encoding all cost more than they buy on this panel, which has no
+            // foveation-aware path. Keep the lighter profile for HVR only.
+            foveated_encoding: platform != Platform::Unknown && !is_hvr,
+            encoder_high_profile: platform != Platform::Unknown && !is_hvr,
+            encoder_10_bits: platform != Platform::Unknown && !is_hvr,
             encoder_av1: matches!(
                 platform,
                 Platform::Quest3 | Platform::Quest3S | Platform::Pico4Ultra
@@ -410,6 +419,8 @@ pub fn entry_point() {
             exts.other.clone(),
             xr_system,
             platform,
+            exts.fb_touch_controller_pro,
+            exts.meta_touch_controller_plus,
         )));
 
         // Session lifecycle state. Populated by the SessionState::READY event in the render loop
@@ -420,11 +431,13 @@ pub fn entry_point() {
         let mut session_running = false;
         let mut passthrough_layer = None;
 
+        // Huawei re-anchors LOCAL to the current head pose every time the space is created, so a
         // Huawei anchors a reference space to the head pose in effect when it is created, and only
         // produces a floor-anchored STAGE space once the session is actually running. Create it
         // lazily on the first running frame (below) and hand the one space to both the lobby and the
         // stream so they share an origin.
         let mut hvr_reference_space: Option<Arc<xr::Space>> = None;
+
         let mut lobby = Lobby::new(
             xr_session.clone(),
             Rc::clone(&graphics_context),
@@ -881,8 +894,8 @@ fn android_main(app: android_activity::AndroidApp) {
     // official Java VRActivity architecture (custom Activity + SurfaceView + HandlerThread),
     // which this NativeActivity-based client does not provide. Confirmed by tombstone:
     //   #00 QVR_Init+200 libqiyivrsdkcore.so (null deref)  #01 qiyu_Init libqiyuapi.so
-    // So only legacy SXR headsets (A5/A6-B) use the native backend; A091 falls through to the
-    // working OpenXR path (video + ray-following controller via khr/simple_controller).
+    // So only legacy SXR headsets (A5/A6-B) use the native backend; A091 uses OpenXR for display
+    // and poses, with its full Native SDK button state overlaid by interaction.rs.
     if platform == Platform::Qiyu && alvr_system_info::qiyu_uses_native_sxr() {
         qiyu::entry_point(app);
         return;

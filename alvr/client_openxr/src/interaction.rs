@@ -23,13 +23,11 @@ use xr::SpaceLocationFlags;
 
 const IPD_CHANGE_EPS: f32 = 0.001;
 const HVR_CONTROLLER_PROFILE_PATH: &str = "/interaction_profiles/huawei/6dof_controller";
-
-// Probe flag: when true, QiYu suggests only the Oculus Touch profile. log_qiyu44 settled this —
-// the runtime accepts the Touch suggestion but never activates it, leaving both hands at
-// '<unknown>' with no input at all, while khr/simple_controller does get activated. Keep this
-// false; the QiYu OpenXR runtime supports no vendor controller profile, matching its docs, which
-// describe controllers only through the Native SDK and UnityXR.
-const QIYU_FORCE_TOUCH_PROFILE: bool = false;
+const QUEST_TOUCH_PRO_CONTROLLER_PROFILE_PATH: &str =
+    "/interaction_profiles/facebook/touch_controller_pro";
+const QUEST_TOUCH_PLUS_CONTROLLER_PROFILE_PATH: &str =
+    "/interaction_profiles/meta/touch_controller_plus";
+const QIYU_SIMPLE_CONTROLLER_PROFILE_PATH: &str = "/interaction_profiles/khr/simple_controller";
 
 // QiYu native controller bridge.
 //
@@ -253,7 +251,9 @@ fn hvr_binding_path(standard_path: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{adjust_hvr_thumbsticks, hvr_binding_path};
+    use super::{
+        adjust_hvr_thumbsticks, hvr_binding_path, hvr_controller_location_is_valid, xr,
+    };
 
     use alvr_common::{
         LEFT_THUMBSTICK_X_ID, LEFT_THUMBSTICK_Y_ID, RIGHT_THUMBSTICK_X_ID, RIGHT_THUMBSTICK_Y_ID,
@@ -276,6 +276,24 @@ mod tests {
             Some("/user/hand/left/input/trigger/value")
         );
         assert!(hvr_binding_path("/user/hand/left/input/thumbrest/touch").is_none());
+    }
+
+    #[test]
+    fn hvr_controller_location_accepts_3dof_and_6dof() {
+        let orientation_valid = xr::SpaceLocationFlags::ORIENTATION_VALID;
+        let position_valid = xr::SpaceLocationFlags::POSITION_VALID;
+        let valid_pose = orientation_valid | position_valid;
+
+        assert!(!hvr_controller_location_is_valid(
+            xr::SpaceLocationFlags::from_raw(0)
+        ));
+        // A 3DoF controller reports orientation only and still needs a hand.
+        assert!(hvr_controller_location_is_valid(orientation_valid));
+        assert!(!hvr_controller_location_is_valid(position_valid));
+        assert!(hvr_controller_location_is_valid(valid_pose));
+        assert!(hvr_controller_location_is_valid(
+            valid_pose | xr::SpaceLocationFlags::POSITION_TRACKED
+        ));
     }
 
     #[test]
@@ -397,12 +415,12 @@ pub struct HandInteraction {
     pub subaction_path: xr::Path,
 
     pub grip_action: xr::Action<xr::Posef>,
-    pub grip_space: xr::Space,
+    pub grip_space: Option<xr::Space>,
 
     #[expect(dead_code)]
     pub aim_action: xr::Action<xr::Posef>,
     #[expect(dead_code)]
-    pub aim_space: xr::Space,
+    pub aim_space: Option<xr::Space>,
 
     pub vibration_action: xr::Action<xr::Haptic>,
     pub skeleton_tracker: Option<xr::HandTracker>,
@@ -476,6 +494,8 @@ impl InteractionContext {
         extra_extensions: Vec<String>,
         xr_system: xr::SystemId,
         platform: Platform,
+        quest_touch_pro_enabled: bool,
+        quest_touch_plus_enabled: bool,
     ) -> Self {
         let xr_instance = xr_session.instance();
 
@@ -512,7 +532,8 @@ impl InteractionContext {
         }
 
         let controllers_profile_path = match platform {
-            p if p.is_quest() => QUEST_CONTROLLER_PROFILE_PATH, // todo: create new controller profile for quest pro and 3
+            // Keep ALVR's Oculus Touch button IDs for server-side input mapping.
+            p if p.is_quest() => QUEST_CONTROLLER_PROFILE_PATH,
             Platform::PicoG3 => PICO_G3_CONTROLLER_PROFILE_PATH,
             Platform::PicoNeo3 => PICO_NEO3_CONTROLLER_PROFILE_PATH,
             Platform::Pico4Ultra => PICO4S_CONTROLLER_PROFILE_PATH,
@@ -531,10 +552,16 @@ impl InteractionContext {
             Platform::Qiyu => QUEST_CONTROLLER_PROFILE_PATH,
             _ => QUEST_CONTROLLER_PROFILE_PATH,
         };
-        let interaction_profile_path = if platform == Platform::Hvr {
-            HVR_CONTROLLER_PROFILE_PATH
-        } else {
-            controllers_profile_path
+        let interaction_profile_path = match platform {
+            Platform::Hvr => HVR_CONTROLLER_PROFILE_PATH,
+            Platform::Qiyu => QIYU_SIMPLE_CONTROLLER_PROFILE_PATH,
+            Platform::Quest3 | Platform::Quest3S if quest_touch_plus_enabled => {
+                QUEST_TOUCH_PLUS_CONTROLLER_PROFILE_PATH
+            }
+            Platform::QuestPro if quest_touch_pro_enabled => {
+                QUEST_TOUCH_PRO_CONTROLLER_PROFILE_PATH
+            }
+            _ => controllers_profile_path,
         };
         let controllers_profile_id = alvr_common::hash_string(controllers_profile_path);
 
@@ -653,11 +680,13 @@ impl InteractionContext {
         bindings.push(binding(&left_grip_action, left_grip_path));
         bindings.push(binding(&right_grip_action, right_grip_path));
 
-        bindings.push(binding(&left_aim_action, "/user/hand/left/input/aim/pose"));
-        bindings.push(binding(
-            &right_aim_action,
-            "/user/hand/right/input/aim/pose",
-        ));
+        if platform != Platform::Hvr {
+            bindings.push(binding(&left_aim_action, "/user/hand/left/input/aim/pose"));
+            bindings.push(binding(
+                &right_aim_action,
+                "/user/hand/right/input/aim/pose",
+            ));
+        }
 
         bindings.push(binding(
             &left_vibration_action,
@@ -705,12 +734,17 @@ impl InteractionContext {
         }
 
         // Apply bindings:
-        let bindings_result = xr_instance.suggest_interaction_profile_bindings(
-            xr_instance
-                .string_to_path(interaction_profile_path)
-                .unwrap(),
-            &bindings,
-        );
+        let bindings_result = if platform == Platform::Qiyu {
+            info!("[QIYU] skipping unsupported Oculus Touch profile suggestion; native bridge supplies Touch button ids");
+            Ok(())
+        } else {
+            xr_instance.suggest_interaction_profile_bindings(
+                xr_instance
+                    .string_to_path(interaction_profile_path)
+                    .unwrap(),
+                &bindings,
+            )
+        };
         if platform == Platform::Hvr {
             if let Err(error) = bindings_result {
                 // Huawei's legacy runtime rejects the whole suggestion atomically if any single
@@ -723,8 +757,6 @@ impl InteractionContext {
                 let pose_only_bindings = [
                     binding(&left_grip_action, left_grip_path),
                     binding(&right_grip_action, right_grip_path),
-                    binding(&left_aim_action, "/user/hand/left/input/aim/pose"),
-                    binding(&right_aim_action, "/user/hand/right/input/aim/pose"),
                 ];
                 let pose_result = xr_instance.suggest_interaction_profile_bindings(
                     xr_instance
@@ -738,31 +770,28 @@ impl InteractionContext {
                     info!("[HVR-DIAG] pose-only bindings accepted");
                 }
             }
-        } else {
-            bindings_result.unwrap();
+        } else if let Err(error) = bindings_result {
+            if platform.is_quest() && interaction_profile_path != controllers_profile_path {
+                warn!(
+                    "[PROFILE-DIAG] {interaction_profile_path} bindings rejected: {error}; \
+                     retrying with {controllers_profile_path}"
+                );
+                xr_instance
+                    .suggest_interaction_profile_bindings(
+                        xr_instance.string_to_path(controllers_profile_path).unwrap(),
+                        &bindings,
+                    )
+                    .unwrap();
+            } else {
+                panic!("{error}");
+            }
+        } else if platform.is_quest() && interaction_profile_path != controllers_profile_path {
+            info!("[PROFILE-DIAG] Quest controller bindings accepted: {interaction_profile_path}");
         }
 
-        // QiYu's OpenXR runtime (Monado-based) does not activate the Oculus Touch
-        // profile for its physical controllers and exposes no vendor controller
-        // interaction extension, so the suggestion above yields no controller input.
-        // Every conformant runtime must support the Khronos simple controller, which
-        // Monado maps real controllers onto, so additionally suggest those bindings to
-        // recover controller pose, trigger (select) and menu input.
-        //
-        // Set QIYU_FORCE_TOUCH_PROFILE to skip the simple-controller fallback. With both
-        // profiles suggested the runtime always picks the simple one, so this is the only way
-        // to observe whether it would ever activate Touch and expose the full button set.
+        // QiYu uses simple_controller only for OpenXR poses and basic select/menu actions; the
+        // Native SDK bridge supplies the full Touch button inventory below.
         if platform == Platform::Qiyu {
-            match &bindings_result {
-                Ok(()) => info!(
-                    "[QIYU] oculus/touch_controller bindings accepted (profile: {interaction_profile_path})"
-                ),
-                Err(error) => {
-                    warn!("[QIYU] oculus/touch_controller bindings rejected: {error}")
-                }
-            }
-        }
-        if platform == Platform::Qiyu && !QIYU_FORCE_TOUCH_PROFILE {
             let mut simple_bindings = vec![
                 binding(&left_grip_action, "/user/hand/left/input/grip/pose"),
                 binding(&right_grip_action, "/user/hand/right/input/grip/pose"),
@@ -771,13 +800,11 @@ impl InteractionContext {
                 binding(&left_vibration_action, "/user/hand/left/output/haptic"),
                 binding(&right_vibration_action, "/user/hand/right/output/haptic"),
             ];
-            if let Some(ButtonAction::Scalar(action)) =
-                button_actions.get(&*LEFT_TRIGGER_VALUE_ID)
+            if let Some(ButtonAction::Scalar(action)) = button_actions.get(&*LEFT_TRIGGER_VALUE_ID)
             {
                 simple_bindings.push(binding(action, "/user/hand/left/input/select/click"));
             }
-            if let Some(ButtonAction::Scalar(action)) =
-                button_actions.get(&*RIGHT_TRIGGER_VALUE_ID)
+            if let Some(ButtonAction::Scalar(action)) = button_actions.get(&*RIGHT_TRIGGER_VALUE_ID)
             {
                 simple_bindings.push(binding(action, "/user/hand/right/input/select/click"));
             }
@@ -791,7 +818,7 @@ impl InteractionContext {
 
             let res = xr_instance.suggest_interaction_profile_bindings(
                 xr_instance
-                    .string_to_path("/interaction_profiles/khr/simple_controller")
+                    .string_to_path(QIYU_SIMPLE_CONTROLLER_PROFILE_PATH)
                     .unwrap(),
                 &simple_bindings,
             );
@@ -855,8 +882,7 @@ impl InteractionContext {
         xr_session.attach_action_sets(&[&action_set]).unwrap();
 
         // Diagnostic: log the interaction profile the runtime actually activated for each hand.
-        // On QiYu this reveals the real /interaction_profiles/... path (if any) so controller
-        // bindings can be tailored precisely instead of relying on khr/simple_controller.
+        // QiYu uses simple_controller for poses/basic actions and the Native SDK for full buttons.
         for (hand_name, hand_path) in [
             ("left", "/user/hand/left"),
             ("right", "/user/hand/right"),
@@ -879,23 +905,20 @@ impl InteractionContext {
         }
 
         // Huawei's legacy runtime can reject controller interaction bindings entirely, which then
-        // makes xrCreateActionSpace fail with ERROR_PATH_INVALID and crashes startup (dark screen).
-        // To keep the lobby rendering, fall back to a LOCAL reference space placeholder when the
-        // controller action space cannot be created. This preserves head tracking / rendering; real
-        // controller tracking is unavailable until Huawei accepts the bindings.
+        // makes xrCreateActionSpace fail with ERROR_PATH_INVALID. Keep rendering, but do not treat a
+        // LOCAL reference space placeholder as a controller pose: its valid flags place the hand at
+        // the headset origin.
         let create_pose_space = |action: &xr::Action<xr::Posef>,
                                  subaction_path: xr::Path|
-         -> xr::Space {
+         -> Option<xr::Space> {
             match action.create_space(xr_session.clone(), subaction_path, xr::Posef::IDENTITY) {
-                Ok(space) => space,
+                Ok(space) => Some(space),
                 Err(error) if platform == Platform::Hvr => {
                     warn!(
                         "[HVR-DIAG] controller action space rejected: {error}; \
-                         using LOCAL reference space placeholder"
+                         omitting controller motion"
                     );
-                    xr_session
-                        .create_reference_space(xr::ReferenceSpaceType::LOCAL, xr::Posef::IDENTITY)
-                        .unwrap()
+                    None
                 }
                 Err(error) => panic!("{error}"),
             }
@@ -910,8 +933,15 @@ impl InteractionContext {
         let left_grip_space = create_pose_space(&left_grip_action, left_subaction_path);
         let right_grip_space = create_pose_space(&right_grip_action, right_subaction_path);
 
-        let left_aim_space = create_pose_space(&left_aim_action, left_subaction_path);
-        let right_aim_space = create_pose_space(&right_aim_action, right_subaction_path);
+        // Huawei exposes one AimPose action for each controller, with no separate aim space.
+        let (left_aim_space, right_aim_space) = if platform == Platform::Hvr {
+            (None, None)
+        } else {
+            (
+                create_pose_space(&left_aim_action, left_subaction_path),
+                create_pose_space(&right_aim_action, right_subaction_path),
+            )
+        };
 
         let left_hand_tracker = create_ext_object("HandTracker (left)", Some(true), || {
             xr_session.create_hand_tracker(xr::Hand::LEFT)
@@ -1281,6 +1311,12 @@ pub fn get_head_data(
     Some((motion, view_params))
 }
 
+fn hvr_controller_location_is_valid(location_flags: SpaceLocationFlags) -> bool {
+    // HVR can report a 3DoF controller: orientation only. Accept it and let get_hand_data place
+    // the hand, instead of dropping the controller entirely.
+    location_flags.contains(SpaceLocationFlags::ORIENTATION_VALID)
+}
+
 #[expect(clippy::too_many_arguments)]
 pub fn get_hand_data(
     xr_session: &xr::Session<xr::OpenGlEs>,
@@ -1291,6 +1327,8 @@ pub fn get_hand_data(
     hand_source: &HandInteraction,
     last_controller_pose: &mut Pose,
     last_palm_pose: &mut Pose,
+    head_pose: &Pose,
+    is_left_hand: bool,
 ) -> (Option<DeviceMotion>, Option<[Pose; 26]>) {
     let xr_time = crate::to_xr_time(time);
 
@@ -1307,7 +1345,15 @@ pub fn get_hand_data(
             .is_active(xr_session, hand_source.subaction_path)
             .unwrap_or(false);
     let controller_motion = if pose_active {
-        if let Ok((location, velocity)) = hand_source.grip_space.relate(reference_space, xr_time) {
+        if let Some((location, velocity)) = hand_source
+            .grip_space
+            .as_ref()
+            .and_then(|space| space.relate(reference_space, xr_time).ok())
+            .filter(|(location, _)| {
+                platform != Platform::Hvr
+                    || hvr_controller_location_is_valid(location.location_flags)
+            })
+        {
             let orientation_valid = location
                 .location_flags
                 .contains(xr::SpaceLocationFlags::ORIENTATION_VALID);
@@ -1323,6 +1369,18 @@ pub fn get_hand_data(
                 last_controller_pose.position = crate::from_xr_vec3(location.pose.position);
             }
 
+            // A 3DoF controller never reports a position, so the hand would sit at the origin. Put it
+            // where a hand would be, in front of the head, and leave it there while orientation
+            // tracks.
+            if platform == Platform::Hvr
+                && !position_valid
+                && last_controller_pose.position == Vec3::ZERO
+            {
+                let offset = Vec3::new(if is_left_hand { -0.2 } else { 0.2 }, -0.35, -0.35);
+                last_controller_pose.position = head_pose.position
+                    + alvr_common::glam::Mat3::from_quat(head_pose.orientation) * offset;
+            }
+
             let pose = *last_controller_pose * hand_source.pose_offset;
 
             let mut linear_velocity = crate::from_xr_vec3(velocity.linear_velocity);
@@ -1334,9 +1392,10 @@ pub fn get_hand_data(
 
                 let maybe_future_location = hand_source
                     .grip_space
-                    .locate(reference_space, xr_future_time);
+                    .as_ref()
+                    .and_then(|space| space.locate(reference_space, xr_future_time).ok());
 
-                if let Ok(future_location) = maybe_future_location {
+                if let Some(future_location) = maybe_future_location {
                     if future_location.location_flags.contains(
                         xr::SpaceLocationFlags::ORIENTATION_VALID
                             | xr::SpaceLocationFlags::POSITION_VALID,

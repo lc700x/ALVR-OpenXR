@@ -32,8 +32,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DECODER_MAX_TIMEOUT_MULTIPLIER: f32 = 0.8;
-
 fn uses_custom_reprojection(platform: Platform) -> bool {
     platform.is_yvr() || platform == Platform::Hvr
 }
@@ -285,7 +283,12 @@ impl StreamContext {
             ],
             format,
             config.foveated_encoding_config.clone(),
-            platform != Platform::Lynx && !((platform.is_pico()) && config.enable_hdr),
+            // The shader linearises the decoded image because an sRGB-encoded swapchain converts it
+            // back on write. HVR's swapchain is a plain RGBA8 one, so linearising there and letting
+            // the compositor treat the result as sRGB renders the whole stream dark.
+            platform != Platform::Lynx
+                && !((platform.is_pico()) && config.enable_hdr)
+                && (platform != Platform::Hvr || alvr_graphics::gl_format_is_srgb(format)),
             config.use_full_range && !config.enable_hdr, // TODO: figure out why HDR doesn't need the limited range hackfix in staging?
             config.encoding_gamma,
             config.upscaling.clone(),
@@ -406,14 +409,12 @@ impl StreamContext {
             #[cfg(target_os = "android")]
             let platform = self.platform;
             move || {
-                // Huawei's OpenXR runtime performs JNI calls (e.g. inside xrSyncActions) on the
-                // calling thread. Unlike the render thread (attached in android_main), this input
-                // thread is not attached to the JVM, so those JNI calls dereference a null
-                // JNIEnv/array and crash in libvrsdk (art::JNI::GetArrayLength). Attach the thread
-                // for the lifetime of the loop; `vm` and `_env` must both stay alive because the
-                // attach guard borrows the vm.
+                // Huawei's OpenXR runtime and QiYu's Native SDK may call JNI from this input
+                // thread. Unlike the render thread (attached in android_main), this thread is not
+                // attached to the JVM by default. Keep it attached for the loop; `vm` and `_env`
+                // must both stay alive because the attach guard borrows the vm.
                 #[cfg(target_os = "android")]
-                let vm = (platform == Platform::Hvr)
+                let vm = (platform == Platform::Hvr || platform == Platform::Qiyu)
                     .then(|| {
                         let context = ndk_context::android_context();
                         unsafe { jni::JavaVM::from_raw(context.vm().cast()) }.ok()
@@ -421,9 +422,22 @@ impl StreamContext {
                     .flatten();
                 #[cfg(target_os = "android")]
                 let _env = vm.as_ref().and_then(|vm| match vm.attach_current_thread() {
-                    Ok(env) => Some(env),
+                    Ok(env) => {
+                        if platform == Platform::Qiyu {
+                            alvr_common::info!("[CTRL-BRIDGE] input thread attached to JVM");
+                        }
+                        Some(env)
+                    }
                     Err(e) => {
-                        alvr_common::error!("[HVR-DIAG] failed to attach input thread to JVM: {e}");
+                        if platform == Platform::Hvr {
+                            alvr_common::error!(
+                                "[HVR-DIAG] failed to attach input thread to JVM: {e}"
+                            );
+                        } else {
+                            alvr_common::error!(
+                                "[CTRL-BRIDGE] failed to attach input thread to JVM: {e}"
+                            );
+                        }
                         None
                     }
                 });
@@ -484,20 +498,24 @@ impl StreamContext {
         vsync_time: Duration,
     ) -> (ProjectionLayerBuilder, Duration) {
         let xr_vsync_time = xr::Time::from_nanos(vsync_time.as_nanos() as _);
-        let frame_poll_deadline = Instant::now()
-            + Duration::from_secs_f32(
-                frame_interval.as_secs_f32() * DECODER_MAX_TIMEOUT_MULTIPLIER,
-            );
+        let deadline = Instant::now() + frame_interval.mul_f32(0.8);
         let mut frame_result = None;
         if let Some((_, source)) = &mut self.decoder {
-            while frame_result.is_none() && Instant::now() < frame_poll_deadline {
+            loop {
                 frame_result = source.get_frame();
-                thread::sleep(Duration::from_micros(500));
+                if frame_result.is_some() || Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(
+                    Duration::from_micros(500)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
             }
         }
 
         let (timestamp, view_params, buffer_ptr) =
             if let Some((timestamp, buffer_ptr)) = frame_result {
+                video_decoder::report_video_perf(true);
                 let view_params = self.core_context.report_compositor_start(timestamp);
 
                 self.last_good_view_params = view_params;
@@ -511,8 +529,7 @@ impl StreamContext {
 
         if !buffer_ptr.is_null() {
             self.hvr_video_frame_count += 1;
-            if is_hvr
-                && (self.hvr_video_frame_count <= 2 || self.hvr_video_frame_count % 300 == 0)
+            if is_hvr && (self.hvr_video_frame_count <= 2 || self.hvr_video_frame_count % 300 == 0)
             {
                 alvr_common::error!(
                     "[HVR-DIAG] decoded video frame {}: timestamp={timestamp:?}, vsync={vsync_time:?}",
@@ -593,8 +610,7 @@ impl StreamContext {
                     // a frozen image. Report the progression (the lobby fills one handle per
                     // acquired image) so a capture distinguishes "still filling" from "stuck".
                     self.hvr_target_wait_frames += 1;
-                    if self.hvr_target_wait_frames <= 8 || self.hvr_target_wait_frames % 300 == 0
-                    {
+                    if self.hvr_target_wait_frames <= 8 || self.hvr_target_wait_frames % 300 == 0 {
                         alvr_common::error!(
                             "[HVR-DIAG] stream targets not ready after \
                              {} frames: acquired idx L={left_swapchain_idx} R={right_swapchain_idx}, \
@@ -893,6 +909,8 @@ fn stream_input_loop(
             &int_ctx.hands_interaction[0],
             &mut last_controller_poses[0],
             &mut last_palm_poses[0],
+            &head_motion.pose,
+            true,
         );
         let (mut right_hand_motion, right_hand_skeleton) = crate::interaction::get_hand_data(
             &xr_session,
@@ -903,8 +921,9 @@ fn stream_input_loop(
             &int_ctx.hands_interaction[1],
             &mut last_controller_poses[1],
             &mut last_palm_poses[1],
+            &head_motion.pose,
+            false,
         );
-
 
         if platform == Platform::Hvr && Instant::now() >= next_hvr_controller_log {
             alvr_common::info!(
