@@ -455,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "alvr_server_openxr"
-version = "20.14.0"
+version = "20.14.1"
 dependencies = [
  "alvr_common",
  "alvr_filesystem",

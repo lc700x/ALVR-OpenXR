@@ -4,8 +4,8 @@ This is a fork of [ALVR](https://github.com/alvr-org/ALVR), streaming VR from PC
 
 ## Hard constraints
 
-- Version is pinned to **20.14.0** in [Cargo.toml](Cargo.toml) (`workspace.package.version`). Do not bump it.
-- Build and test only within this checkout. Do not touch or reference other local ALVR checkouts (e.g. a v21 tree) — this repo is intentionally frozen at 20.14.0.
+- Version is pinned to **20.14.1** in [Cargo.toml](Cargo.toml) (`workspace.package.version`). Do not bump it.
+- Build and test only within this checkout. Do not touch or reference other local ALVR checkouts (e.g. a v21 tree) — this repo is intentionally frozen at 20.14.1.
 - Never build/copy artifacts to network deploy paths; the user deploys manually.
 - Do not modify Desktop2Stereo integration code if present.
 - The Android APK must keep working for both HVR and QiYuVR hardware paths.
