@@ -164,7 +164,11 @@ amf::AMFComponentPtr VideoEncoderAMF::MakeEncoder(
             amfEncoder->SetProperty(AMF_VIDEO_ENCODER_PROFILE, AMF_VIDEO_ENCODER_PROFILE_HIGH);
             break;
         }
-        amfEncoder->SetProperty(AMF_VIDEO_ENCODER_PROFILE_LEVEL, 42);
+        // Do not pin the H.264 level. Level 4.2 caps a frame at 8704 macroblocks (1920x1088), and
+        // ALVR encodes far larger frames (2592x2592 is 26244 macroblocks), so AMF rejects the
+        // property with AMF_OUT_OF_RANGE and no encoder starts. NVENC ignores the value, which is
+        // why this only breaks on AMD. Let AMF derive the level from the frame size.
+        // amfEncoder->SetProperty(AMF_VIDEO_ENCODER_PROFILE_LEVEL, 42);
         switch (Settings::Instance().m_rateControlMode) {
         case ALVR_CBR:
             amfEncoder->SetProperty(
